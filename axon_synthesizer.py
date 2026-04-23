@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import builtins
+import argparse
+import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from itertools import combinations, permutations
@@ -3616,19 +3618,17 @@ def run_all_tests() -> None:
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(description="Axon synthesizer tracing and in-file test runner")
     parser.add_argument(
         "--run-tests",
         action="store_true",
-        help="Run in-file nu-graph tests instead of tracing demo kernels",
+        help="Run in-file nuGraph tests instead of tracing demo kernels",
     )
     args = parser.parse_args()
 
     if args.run_tests:
         run_all_tests()
-        raise SystemExit(0)
+        sys.exit(0)
 
     kernels: list[tuple[str, Callable[[int, int, int], nuGraph]]] = [
         ("kernel_matmul_red_div", build_kernel_matmul_red_div_graph),
