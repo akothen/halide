@@ -3626,10 +3626,10 @@ def _test_rmsnorm_matmul_graph() -> None:
     variants = nu_graph_generation_z3(G, verbose=False)
     norm_pos = _position_by_id(G, "norm")
     out_pos = _position_by_id(G, "out")
-    assert norm_pos is not None, "Internal test error: RMSNorm test graph missing norm node"
-    assert out_pos is not None, "Internal test error: RMSNorm test graph missing out node"
+    assert norm_pos is not None, "Internal test error: rmsnorm_matmul test graph missing norm node"
+    assert out_pos is not None, "Internal test error: rmsnorm_matmul test graph missing out node"
     swapped = _swap_with_successor_variants(G, norm_pos, out_pos, {"x"})
-    assert len(swapped) == 1, "rmsnorm_matmul should have exactly one legal div<->matmul swap"
+    assert len(swapped) == 1, "rmsnorm_matmul should have exactly one legal div/matmul swap"
     expected_sigs = {graph_signature(G), graph_signature(swapped[0][0])}
     got_sigs = {graph_signature(variant) for variant in variants}
     assert len(variants) == 2, f"rmsnorm_matmul should emit original + swapped div/matmul variants, got {len(variants)}"
