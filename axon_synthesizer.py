@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import builtins
 import argparse
+import concurrent.futures
 import sys
 import io
 from contextlib import redirect_stdout
 from dataclasses import dataclass, field
 from enum import Enum
-from itertools import combinations, permutations
+from itertools import combinations, permutations, product as _iproduct
 from threading import Lock
 from typing import Any, Callable, Optional, List
 
@@ -42,6 +43,7 @@ _ID_LOCK = Lock()
 _BODY_LOCK = Lock()
 _UF_LOCK = Lock()
 _SEMANTICS_LOCK = Lock()
+_VERBOSE_LOCK = Lock()   # serialises verbose prints from concurrent synthesis threads
 
 
 def _gen_id(prefix: Optional[str] = None) -> str:
@@ -3889,6 +3891,111 @@ def _synthesize_from_pool(
     return None
 
 
+def _synthesize_all_from_pool(
+    target_sym: SymTensor,
+    pool: list[SketchNode],
+    max_hw_size: int = 2,
+    timeout: int = 3000,
+    verbose: bool = False,
+    max_workers: int = 4,
+) -> list[SketchNode]:
+    """Like _synthesize_from_pool but returns ALL equivalent sketches.
+
+    Phase 1 runs the same DFS worklist as _synthesize_from_pool to enumerate
+    every complete, evaluatable candidate sketch.  Phase 2 dispatches the
+    equivalence check for each candidate to a ThreadPoolExecutor so
+    independent candidates are evaluated concurrently.
+
+    Returns every sketch that passes equivalence (empty list if none).
+    When *verbose* is True all sketches and their results are printed in
+    original DFS order after the parallel phase, holding _VERBOSE_LOCK so
+    output from concurrent node-level threads does not interleave.
+    """
+    initial = SketchNode.make_hole()
+    worklist: list[SketchNode] = [initial]
+    seen: set[SketchNode] = {initial}
+    candidates: list[tuple[SketchNode, SymTensor]] = []
+
+    # Phase 1: expand worklist, collect all complete evaluatable candidates
+    while worklist:
+        sketch = worklist.pop()
+
+        if not sketch.has_hole():
+            if sketch.hw_size() > max_hw_size:
+                if verbose:
+                    with _VERBOSE_LOCK:
+                        print(f"    sketch {_format_sketch(sketch)!s:60s}  [exceeds depth {max_hw_size}]")
+                continue
+            candidate_sym = _eval_sketch(sketch)
+            if candidate_sym is None:
+                if verbose:
+                    with _VERBOSE_LOCK:
+                        print(f"    sketch {_format_sketch(sketch)!s:60s}  [eval failed]")
+                continue
+            candidates.append((sketch, candidate_sym))
+            continue
+
+        can_add_hw_op = sketch.hw_size() < max_hw_size
+        for pool_entry in pool:
+            if pool_entry.op not in ("INPUT", "HOLE"):
+                if not can_add_hw_op:
+                    continue
+            filled = _fill_first_hole(sketch, pool_entry)
+            if filled is None:
+                continue
+            if filled in seen:
+                continue
+            seen.add(filled)
+            worklist.append(filled)
+
+    if not candidates:
+        return []
+
+    # Phase 2: check all candidates in parallel.
+    # check_equivalent is called without verbose (its default is False) so it
+    # never prints, making it safe to call from multiple threads without
+    # redirect_stdout.
+    def _check_one(item: tuple[SketchNode, SymTensor]) -> tuple[SketchNode, bool]:
+        sketch, cand_sym = item
+        try:
+            return sketch, check_equivalent(target_sym, cand_sym, timeout=timeout)
+        except Exception:
+            return sketch, False
+
+    ordered: dict[int, tuple[SketchNode, bool]] = {}
+    if max_workers > 1 and len(candidates) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            fs = {executor.submit(_check_one, item): idx
+                  for idx, item in enumerate(candidates)}
+            for future in concurrent.futures.as_completed(fs):
+                idx = fs[future]
+                try:
+                    ordered[idx] = future.result()
+                except Exception:
+                    ordered[idx] = (candidates[idx][0], False)
+    else:
+        for idx, item in enumerate(candidates):
+            ordered[idx] = _check_one(item)
+
+    # Phase 3: collect results and emit verbose output in original DFS order
+    valid: list[SketchNode] = []
+    if verbose:
+        with _VERBOSE_LOCK:
+            for idx in range(len(candidates)):
+                sketch, equiv = ordered[idx]
+                status = "EQUIVALENT ✓" if equiv else "not equivalent"
+                print(f"    sketch {_format_sketch(sketch)!s:60s}  [{status}]")
+                if equiv:
+                    valid.append(sketch)
+    else:
+        for idx in range(len(candidates)):
+            sketch, equiv = ordered[idx]
+            if equiv:
+                valid.append(sketch)
+
+    return valid
+
+
 # ---------------------------------------------------------------------------
 # Convert a found sketch to graph Nodes
 # ---------------------------------------------------------------------------
@@ -3988,6 +4095,70 @@ def _lower_node(
     return new_nodes, output_id, output_sym
 
 
+def _lower_node_all(
+    node: Node,
+    target_sym: SymTensor,
+    hw_input_pairs: list[tuple[SymTensor, str]],
+    max_hw_size: int,
+    timeout: int,
+    verbose: bool = False,
+) -> list[tuple[list[Node], str, SymTensor]]:
+    """Synthesize ALL valid hw-only replacements for *node*.
+
+    Like _lower_node but uses _synthesize_all_from_pool so every equivalent
+    sketch is found (with sketch-level parallelism) rather than stopping at
+    the first.  Returns a (possibly empty) list of
+    (new_nodes, output_hw_id, output_hw_sym) triples – one per valid sketch.
+    """
+    input_syms = [sym for sym, _ in hw_input_pairs]
+
+    local_target: Optional[SymTensor] = None
+    try:
+        local_target = _sym_expr_from_graph_node(node, input_syms)
+    except (KeyError, Exception):
+        pass
+    effective_target = local_target if local_target is not None else target_sym
+
+    pool = _build_synthesis_pool(node.op, node.attrs, input_syms)
+
+    if verbose:
+        input_names = [(s.expr.name if s.expr is not None else "?") for s in input_syms]
+        with _VERBOSE_LOCK:
+            print(f"  Synthesizing node '{node.id}' op={node.op}  inputs={input_names}"
+                  f"  pool_size={len(pool)}  max_hw_size={max_hw_size}")
+
+    found_sketches = _synthesize_all_from_pool(
+        effective_target, pool,
+        max_hw_size=max_hw_size, timeout=timeout, verbose=verbose,
+    )
+
+    if not found_sketches:
+        if verbose:
+            with _VERBOSE_LOCK:
+                print(f"  => FAILED: no hw equivalent found for '{node.id}' op={node.op}")
+        return []
+
+    sym_to_node_id: dict[int, str] = {
+        id(sym): node_id for sym, node_id in hw_input_pairs
+    }
+
+    results: list[tuple[list[Node], str, SymTensor]] = []
+    for sketch in found_sketches:
+        if verbose:
+            with _VERBOSE_LOCK:
+                print(f"  => FOUND: {_format_sketch(sketch)}")
+        new_nodes: list[Node] = []
+        output_id = _sketch_to_graph_nodes(sketch, sym_to_node_id, new_nodes)
+        if output_id is None:
+            continue
+        output_sym = _eval_sketch(sketch)
+        if output_sym is None:
+            continue
+        results.append((new_nodes, output_id, output_sym))
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Full-graph lowering
 # ---------------------------------------------------------------------------
@@ -4080,6 +4251,236 @@ def lower_nu_graph_variants(
     Returns a list of the same length; entries that could not be lowered are None.
     """
     return [lower_nu_graph(v, max_hw_size=max_hw_size, timeout=timeout, verbose=verbose) for v in variants]
+
+
+def _build_dag_levels(G: nuGraph) -> list[list[Node]]:
+    """Group *G*'s nodes into topological levels.
+
+    Level 0 holds nodes with no predecessors (input nodes).  Level k holds
+    nodes whose every input is at a level strictly less than k.  All nodes
+    within the same level are mutually independent and can be synthesised
+    in parallel.
+    """
+    if not G.nodes:
+        return []
+    level_of: dict[str, int] = {}
+    for node in G.nodes:
+        if not node.inputs or node.op == "input":
+            level_of[node.id] = 0
+        else:
+            # G.nodes is in topological order so all inputs are already in
+            # level_of; .get(..., 0) is a safety fallback.
+            level_of[node.id] = builtins.max(
+                level_of.get(inp, 0) for inp in node.inputs
+            ) + 1
+
+    max_level = builtins.max(level_of.values())
+    levels: list[list[Node]] = [[] for _ in range(max_level + 1)]
+    for node in G.nodes:
+        levels[level_of[node.id]].append(node)
+    return levels
+
+
+def lower_nu_graph_all_variants(
+    G: nuGraph,
+    max_hw_size: int = 2,
+    timeout: int = 3000,
+    verbose: bool = False,
+    max_workers: int = 4,
+    max_variants: int = 256,
+) -> list[nuGraph]:
+    """Lower *G* to hardware discovering every valid sketch choice per node.
+
+    Two levels of parallelism are used:
+
+    1. **Node-level**: nodes that sit at the same DAG level (no data
+       dependency between them) are synthesised concurrently via a
+       ThreadPoolExecutor.
+    2. **Sketch-level**: within each node, the equivalence check for every
+       complete candidate sketch is dispatched concurrently through
+       _synthesize_all_from_pool.
+
+    After synthesis the Cartesian product of per-node alternatives is taken.
+    Because all valid sketches for a node are semantically equivalent to the
+    target, downstream nodes are synthesised against the canonical (first)
+    alternative, and the remaining combinations are produced by substituting
+    the canonical output IDs with the IDs of the chosen alternatives.
+
+    **Complexity note**: the Cartesian product can grow exponentially – if
+    every synthesis node has M valid sketches and the graph has N synthesis
+    nodes, up to M^N combinations are explored.  *max_variants* caps the
+    number of distinct lowered graphs that are returned (default 256); once
+    the cap is reached the remaining combinations are skipped and a warning
+    is printed.
+
+    Returns a de-duplicated list of lowered nuGraphs (by graph signature).
+    Returns an empty list if any synthesis node cannot be lowered at all.
+    """
+    orig_syms: dict[str, SymTensor] = {}
+    try:
+        orig_syms = _graph_symbolic_tensors(G)
+    except (KeyError, Exception):
+        return []
+
+    if verbose:
+        print(f"[lower_nu_graph_all_variants] graph has {len(G.nodes)} nodes")
+
+    levels = _build_dag_levels(G)
+
+    # Canonical lowering state (uses first alt for synthesis nodes)
+    hw_syms_can: dict[str, SymTensor] = {}    # canonical hw_id → sym
+    node_id_map_can: dict[str, str] = {}       # orig_id → canonical hw_id
+
+    # Per-node alternatives: each entry is a triple
+    #   (new_nodes, canonical_hw_id, actual_hw_id)
+    # where:
+    #   new_nodes       – hw Node objects contributed by this original node
+    #   canonical_hw_id – output id of the FIRST valid alt (used as the
+    #                     reference id that downstream nodes were synthesised
+    #                     against); same for all entries of the same orig node
+    #   actual_hw_id    – output id of this specific alternative
+    # Deterministic nodes have exactly one entry with canonical_hw_id == actual_hw_id.
+    # Synthesis nodes may have multiple entries.
+    _NodeEntry = tuple[list[Node], str, str]
+    per_node_entries: dict[str, list[_NodeEntry]] = {}  # orig_id → choices
+
+    for level_nodes in levels:
+        deterministic: list[Node] = []
+        synthesis: list[Node] = []
+        for node in level_nodes:
+            if node.op == "input" or node.op in _PUBLIC_PASSTHROUGH_OPS:
+                deterministic.append(node)
+            else:
+                synthesis.append(node)
+
+        # Deterministic nodes: process immediately, no synthesis required
+        for node in deterministic:
+            if node.op == "input":
+                n_copy = Node(node.id, node.op, list(node.inputs),
+                              dict(node.attrs), node.shape)
+                hw_syms_can[node.id] = orig_syms[node.id]
+                node_id_map_can[node.id] = node.id
+                per_node_entries[node.id] = [([n_copy], node.id, node.id)]
+            else:  # passthrough
+                new_inputs = [node_id_map_can.get(inp, inp) for inp in node.inputs]
+                out_sym = hw_syms_can.get(new_inputs[0]) if new_inputs else None
+                if out_sym is None:
+                    if verbose:
+                        print(f"[lower_nu_graph_all_variants] passthrough node "
+                              f"'{node.id}' op={node.op}: hw sym for first input "
+                              f"not found; cannot lower graph")
+                    return []
+                new_id = _gen_id(node.op)
+                n_new = Node(new_id, node.op, new_inputs, dict(node.attrs), node.shape)
+                hw_syms_can[new_id] = out_sym
+                node_id_map_can[node.id] = new_id
+                per_node_entries[node.id] = [([n_new], new_id, new_id)]
+
+        if not synthesis:
+            continue
+
+        # Build hw_input_pairs for each synthesis node from the canonical state
+        SynthArgs = tuple[Node, SymTensor, list[tuple[SymTensor, str]]]
+        synthesis_args: list[SynthArgs] = []
+        for node in synthesis:
+            hw_input_pairs: list[tuple[SymTensor, str]] = []
+            for inp_id in node.inputs:
+                hw_id = node_id_map_can.get(inp_id, inp_id)
+                hw_sym = hw_syms_can.get(hw_id)
+                if hw_sym is None:
+                    return []
+                hw_input_pairs.append((hw_sym, hw_id))
+            t_sym = orig_syms.get(node.id)
+            if t_sym is None:
+                return []
+            synthesis_args.append((node, t_sym, hw_input_pairs))
+
+        # Synthesise all nodes at this level in parallel (node-level parallelism)
+        def _synth(args: SynthArgs) -> list[tuple[list[Node], str, SymTensor]]:
+            nd, tgt, pairs = args
+            return _lower_node_all(nd, tgt, pairs,
+                                   max_hw_size=max_hw_size, timeout=timeout,
+                                   verbose=verbose)
+
+        node_alts_list: list[list[tuple[list[Node], str, SymTensor]]]
+        if max_workers > 1 and len(synthesis) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(_synth, args) for args in synthesis_args]
+                node_alts_list_tmp: list[list[tuple[list[Node], str, SymTensor]]] = []
+                for i_f, future in enumerate(futures):
+                    try:
+                        node_alts_list_tmp.append(future.result())
+                    except Exception as exc:
+                        nd = synthesis[i_f]
+                        if verbose:
+                            print(f"[lower_nu_graph_all_variants] synthesis of "
+                                  f"'{nd.id}' op={nd.op} raised: {exc}")
+                        node_alts_list_tmp.append([])
+                node_alts_list = node_alts_list_tmp
+        else:
+            node_alts_list = [_synth(args) for args in synthesis_args]
+
+        for node, alts in zip(synthesis, node_alts_list):
+            if not alts:
+                return []  # this node cannot be lowered → whole graph fails
+            # First alt provides the canonical continuation for downstream nodes
+            _, canonical_hw_id, canonical_sym = alts[0]
+            hw_syms_can[canonical_hw_id] = canonical_sym
+            node_id_map_can[node.id] = canonical_hw_id
+            # Record all alternatives; canonical_hw_id is the same for every entry
+            per_node_entries[node.id] = [
+                (new_nodes, canonical_hw_id, actual_id)
+                for new_nodes, actual_id, _ in alts
+            ]
+
+    # Reconstruct per-node choices in original G.nodes order
+    per_node_choices: list[list[_NodeEntry]] = [
+        per_node_entries[node.id] for node in G.nodes
+    ]
+
+    # Take the Cartesian product of per-node alternatives.
+    # For each combination, build a substitution map
+    #   canonical_hw_id → actual_hw_id
+    # and apply it to every node's input list so graph wiring is correct
+    # regardless of which alternative was chosen for predecessor nodes.
+    # Results are de-duplicated by graph signature and capped at max_variants.
+    results: list[nuGraph] = []
+    seen_sigs: set[str] = set()
+    n_combos_explored = 0
+
+    for combo in _iproduct(*per_node_choices):
+        n_combos_explored += 1
+        if len(results) >= max_variants:
+            # Count remaining combinations (skip through the rest of the generator)
+            n_skipped = builtins.sum(1 for _ in _iproduct(*per_node_choices)) - n_combos_explored + 1
+            print(f"[lower_nu_graph_all_variants] variant cap ({max_variants}) reached "
+                  f"after exploring {n_combos_explored} combination(s); "
+                  f"~{n_skipped} combination(s) skipped")
+            break
+        subst: dict[str, str] = {}
+        for _, canonical_id, actual_id in combo:
+            if canonical_id != actual_id:
+                subst[canonical_id] = actual_id
+
+        hw_nodes_all: list[Node] = []
+        for new_nodes, _, _ in combo:
+            for n in new_nodes:
+                new_inputs = [subst.get(i, i) for i in n.inputs]
+                hw_nodes_all.append(
+                    Node(n.id, n.op, new_inputs, dict(n.attrs), n.shape))
+
+        G_hw = nuGraph(hw_nodes_all)
+        try:
+            annotate_shapes_concrete(G_hw)
+        except (KeyError, Exception):
+            pass
+        sig = graph_signature(G_hw)
+        if sig in seen_sigs:
+            continue
+        seen_sigs.add(sig)
+        results.append(G_hw)
+
+    return results
 
 
 def synthesize_hw_graph(
@@ -4251,6 +4652,26 @@ def _test_synthesizer_all_variants_lowered() -> None:
     for g_hw in lowered:
         assert _graph_uses_hw_only(g_hw), "A lowered variant still contains public ops"
     print(f" synthesizer: all {len(variants)} matmul_red_div variants lowered successfully")
+
+
+def _test_lower_nu_graph_all_variants() -> None:
+    """Verify that lower_nu_graph_all_variants returns at least one valid hw
+    graph for a representative kernel and that every returned graph uses only
+    hw ops.  Also checks that the result count is >= the single-lowering
+    baseline (lower_nu_graph returns exactly 1 graph per variant)."""
+    G = build_kernel_matmul_red_div_graph(4, 8, 16)
+    print(" synthesizer: lower_nu_graph_all_variants on matmul_red_div:")
+    hw_variants = lower_nu_graph_all_variants(G, max_hw_size=2, timeout=5000,
+                                              verbose=True)
+    assert hw_variants, \
+        "lower_nu_graph_all_variants returned no results for matmul_red_div"
+    for i, g_hw in enumerate(hw_variants):
+        assert _graph_uses_hw_only(g_hw), \
+            f"lower_nu_graph_all_variants: hw variant {i} still contains public ops"
+    baseline = lower_nu_graph(G, max_hw_size=2, timeout=5000)
+    assert baseline is not None, "lower_nu_graph baseline unexpectedly failed"
+    print(f" synthesizer: lower_nu_graph_all_variants produced "
+          f"{len(hw_variants)} distinct lowered hw graph(s) for matmul_red_div")
 
 
 
@@ -4595,6 +5016,7 @@ def run_all_tests() -> None:
     _test_synthesizer_relu_matmul()
     _test_synthesizer_silu_matmul()
     _test_synthesizer_all_variants_lowered()
+    _test_lower_nu_graph_all_variants()
     print("=============== ALL TESTS PASSED  =====================\n")
 
 
@@ -4636,4 +5058,17 @@ if __name__ == "__main__":
         for vi, gv in enumerate(variants):
             print(f"=== {kname} :: Variant {vi} ===")
             print_graph(gv)
+            print()
+            print(f"--- {kname} :: Variant {vi} :: Lowering to hardware "
+                  f"(all sketches, node- & sketch-level parallel) ---")
+            hw_variants = lower_nu_graph_all_variants(
+                gv, max_hw_size=2, timeout=3000, verbose=True)
+            if not hw_variants:
+                print(f"  [lowering failed for variant {vi}]")
+            else:
+                print(f"--- {kname} :: Variant {vi} :: "
+                      f"{len(hw_variants)} lowered hw graph(s) ---")
+                for hi, g_hw in enumerate(hw_variants):
+                    print(f"  +-- hw variant {hi} ---")
+                    print_graph(g_hw)
             print()
