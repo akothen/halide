@@ -3,6 +3,8 @@ from __future__ import annotations
 import builtins
 import argparse
 import sys
+import io
+from contextlib import redirect_stdout
 from dataclasses import dataclass, field
 from enum import Enum
 from itertools import combinations, permutations
@@ -2955,7 +2957,7 @@ class AxonArray:
     def __init__(self, node_id: str, shape: tuple[int, ...], nodes: Optional[list[Any]] = None):
         self.node_id = node_id
         self.shape = shape
-        self.nodes = list(nodes) if nodes is not None else [Node(id=node_id, op="input", inputs=[], attrs={"shape": shape})]
+        self.nodes = list(nodes) if nodes is not None else [_make_input_node(node_id, shape)]
 
     @staticmethod
     def _merge_nodes(inputs: list["AxonArray"]) -> list[Any]:
@@ -3053,6 +3055,10 @@ class Node:
 
     def sig(self) -> NodeSig:
         return NodeSig(self.id, self.op, tuple(self.inputs), tuple(sorted(self.attrs.items())))
+
+
+def _make_input_node(node_id: str, shape: tuple[int, ...]) -> Node:
+    return Node(id=node_id, op="input", inputs=[], attrs={"shape": shape})
 
 
 @dataclass
@@ -3562,7 +3568,9 @@ def _test_no_illegal_reduce_sqrt_swap() -> None:
 def _test_rmsnorm_matmul_graph() -> None:
     G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
 
-    yy = next(n for n in _nodes_by_op(G, "mul") if len(n.inputs) == 2 and n.inputs[0] == n.inputs[1])
+    # Find y*y node where both inputs reference the same tensor id.
+    yy = next((n for n in _nodes_by_op(G, "mul") if len(n.inputs) == 2 and n.inputs[0] == n.inputs[1]), None)
+    assert yy is not None, "Internal test error: rmsnorm_matmul graph missing y*y node"
     rec = _nodes_by_op(G, "reduce_sum")[0]
     rms = _nodes_by_op(G, "sqrt")[0]
     norm = _nodes_by_op(G, "div")[0]
@@ -3661,9 +3669,6 @@ def _test_silu_matmul_graph() -> None:
 
 
 def _test_print_graph_includes_symbolic_shapes() -> None:
-    import io
-    from contextlib import redirect_stdout
-
     G = build_kernel_relu_matmul_graph(4, 8, 16)
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -3671,8 +3676,10 @@ def _test_print_graph_includes_symbolic_shapes() -> None:
     out = buf.getvalue()
     assert "sym_shape=" in out
     lines = out.splitlines()
-    x_line = next(line for line in lines if "id=x" in line and "op=input" in line)
-    out_line = next(line for line in lines if "op=matmul" in line)
+    x_line = next((line for line in lines if "id=x" in line and "op=input" in line), None)
+    out_line = next((line for line in lines if "op=matmul" in line), None)
+    assert x_line is not None, "Expected print_graph output line for input node x"
+    assert out_line is not None, "Expected print_graph output line for matmul node"
     assert "shape=(4, 8)" in x_line
     assert "sym_shape=(x_d0, x_d1)" in x_line
     assert "shape=(4, 16)" in out_line
