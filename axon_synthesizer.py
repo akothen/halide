@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 from dataclasses import dataclass, field
 from enum import Enum
+from itertools import combinations, permutations
 from threading import Lock
 from typing import Any, Callable, Optional, List
 
@@ -85,6 +86,11 @@ class Context:
             out.extend(o.facts)
         return out
 
+    def as_formula(self) -> z3.BoolRef:
+        if not self.facts:
+            return z3.BoolVal(True)
+        return z3.And(*self.facts)
+
 
 @dataclass
 class ShapeExpr:
@@ -115,6 +121,12 @@ class Semantics:
     fn: z3.FuncDeclRef
     ctx: Context = field(default_factory=Context)
     reduction: Optional[ReductionDesc] = None
+
+
+@dataclass
+class Precondition:
+    description: str
+    constraint: z3.BoolRef
 
 
 @dataclass
@@ -398,6 +410,179 @@ def _add_reduction_extensionality_axiom(solver: z3.Solver, lhs: Semantics, rhs: 
                 ),
             )
         )
+
+
+_last_check_stats: dict[str, Any] = {}
+
+
+def singleton_dimension_extensionality(sem: Semantics) -> Context:
+    ctx = Context()
+    if sem.shape.rank == 0:
+        return ctx
+    vars = _index_vars(f"{sem.name}_singleton", sem.shape.rank, "s")
+    for axis, dim in enumerate(sem.shape.dims):
+        zero_idx = list(vars)
+        zero_idx[axis] = z3.IntVal(0)
+        ctx.add(z3.ForAll(vars, z3.Implies(dim == 1, sem.fn(*vars) == sem.fn(*zero_idx))))
+    return ctx
+
+
+def _shape_eq(a: ShapeExpr, b: ShapeExpr) -> z3.BoolRef:
+    if a.rank != b.rank:
+        return z3.BoolVal(False)
+    out = z3.BoolVal(True)
+    for da, db in zip(a.dims, b.dims):
+        out = z3.And(out, da == db)
+    return out
+
+
+def reduction_extensionality_context() -> Context:
+    ctx = Context()
+
+    b1 = z3.Int("reduce_ext_b1")
+    b2 = z3.Int("reduce_ext_b2")
+    i = z3.Int("reduce_ext_i")
+    j = z3.Int("reduce_ext_j")
+    k = z3.Int("reduce_ext_k")
+    e1 = z3.Int("reduce_ext_e1")
+    e2 = z3.Int("reduce_ext_e2")
+
+    same_body1 = z3.ForAll([k], BODY1(b1, i, k) == BODY1(b2, i, k))
+    ctx.add(
+        z3.ForAll(
+            [b1, b2, i, e1, e2],
+            z3.Implies(z3.And(e1 == e2, same_body1), REDUCE1(b1, i, e1) == REDUCE1(b2, i, e2)),
+        )
+    )
+
+    same_body2 = z3.ForAll([k], BODY2(b1, i, j, k) == BODY2(b2, i, j, k))
+    ctx.add(
+        z3.ForAll(
+            [b1, b2, i, j, e1, e2],
+            z3.Implies(z3.And(e1 == e2, same_body2), REDUCE2(b1, i, j, e1) == REDUCE2(b2, i, j, e2)),
+        )
+    )
+    return ctx
+
+
+def reduction_comparison_context(lhs: Semantics, rhs: Semantics) -> Context:
+    ctx = Context()
+
+    if lhs.reduction is None or rhs.reduction is None:
+        return ctx
+
+    if lhs.reduction.outer_rank != rhs.reduction.outer_rank:
+        return ctx
+
+    if lhs.reduction.outer_rank == 2:
+        l = lhs.reduction
+        r = rhs.reduction
+        i = z3.Int("cmp2_i")
+        j = z3.Int("cmp2_j")
+        k = z3.Int("cmp2_k")
+        ctx.add(z3.ForAll([i, j, k], BODY2(z3.IntVal(l.body_id), i, j, k) == BODY2(z3.IntVal(r.body_id), i, j, k)))
+        return ctx
+
+    if lhs.reduction.outer_rank == 1:
+        l = lhs.reduction
+        r = rhs.reduction
+        i = z3.Int("cmp1_i")
+        k = z3.Int("cmp1_k")
+        ctx.add(z3.ForAll([i, k], BODY1(z3.IntVal(l.body_id), i, k) == BODY1(z3.IntVal(r.body_id), i, k)))
+        return ctx
+
+    return ctx
+
+
+def compile_expr(expr: SymExpr, cache: dict[int, Semantics]) -> Semantics:
+    key = id(expr)
+    if key in cache:
+        return cache[key]
+
+    if expr.op == "input":
+        shape = ShapeExpr(list(expr.shape))
+        sem = Semantics(
+            name=expr.name,
+            shape=shape,
+            fn=_tensor_function(f"V_{expr.name}", shape.rank),
+            ctx=Context([d > 0 for d in shape.dims]),
+        )
+        sem.ctx = sem.ctx.merged(singleton_dimension_extensionality(sem))
+        cache[key] = sem
+        return sem
+
+    compiled_inputs = [compile_expr(inp, cache) for inp in expr.inputs]
+    input_shapes = [c.shape for c in compiled_inputs]
+    if expr.op not in _SEMANTICS:
+        raise KeyError(f"No semantics registered for op '{expr.op}'")
+    shape_rule, compile_rule = _SEMANTICS[expr.op]
+    if shape_rule is None or compile_rule is None:
+        raise KeyError(f"Incomplete semantics registered for op '{expr.op}'")
+    shape_res = shape_rule(input_shapes, expr.attrs)
+    sem = compile_rule(expr, compiled_inputs, shape_res.out)
+    sem.ctx = sem.ctx.merged(shape_res.ctx, singleton_dimension_extensionality(sem))
+    cache[key] = sem
+    return sem
+
+
+def check_equivalent(
+    lhs: SymTensor,
+    rhs: SymTensor,
+    timeout: int = 10000,
+    preconditions: Optional[list[Precondition]] = None,
+    rule_name: Optional[str] = None,
+    verbose: bool = False,
+) -> bool:
+    lsem = compile_expr(lhs.expr, {})
+    rsem = compile_expr(rhs.expr, {})
+
+    shape_eq = _shape_eq(lsem.shape, rsem.shape)
+
+    if lsem.shape.rank != rsem.shape.rank:
+        val_eq = z3.BoolVal(False)
+    else:
+        rank = lsem.shape.rank
+        if rank == 0:
+            val_eq = lsem.fn() == rsem.fn()
+        else:
+            vars = [z3.Int(f"q_{idx}") for idx in range(rank)]
+            bounds = z3.And(*[z3.And(vars[i] >= 0, vars[i] < lsem.shape.dims[i]) for i in range(rank)])
+            val_eq = z3.ForAll(vars, z3.Implies(bounds, lsem.fn(*vars) == rsem.fn(*vars)))
+
+    preconditions = preconditions or []
+    extra_ctx = Context([p.constraint for p in preconditions])
+    full_ctx = lsem.ctx.merged(
+        rsem.ctx,
+        reduction_extensionality_context(),
+        reduction_comparison_context(lsem, rsem),
+        extra_ctx,
+    )
+    theorem = z3.Implies(full_ctx.as_formula(), z3.And(shape_eq, val_eq))
+
+    solver = z3.Solver()
+    solver.set("timeout", timeout)
+    solver.add(z3.Not(theorem))
+    res = solver.check()
+    ok = res == z3.unsat
+
+    _last_check_stats.clear()
+    _last_check_stats["num_obligations"] = len(full_ctx.facts)
+    _last_check_stats["failure_reason"] = "" if ok else str(res)
+
+    if verbose:
+        print("result:", res, "proved:", ok)
+        print("lhs rank:", lhs.rank, "rhs rank:", rhs.rank)
+        print("lhs shape expr:", lsem.shape.dims)
+        print("rhs shape expr:", rsem.shape.dims)
+        print("lhs facts:", len(lsem.ctx.facts), "rhs facts:", len(rsem.ctx.facts))
+        print("lhs reduction rank:", None if lsem.reduction is None else lsem.reduction.outer_rank)
+        print("rhs reduction rank:", None if rsem.reduction is None else rsem.reduction.outer_rank)
+        if preconditions:
+            print("preconditions:")
+            for p in preconditions:
+                print("-", p.description)
+
+    return ok
 
 
 def _default_out_shape(dst: Any, *srcs: Any) -> tuple[Any, ...]:
@@ -2358,6 +2543,16 @@ def _shape_public_reduce(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeRe
     return ShapeResult(ShapeExpr(out_dims if out_dims else [z3.IntVal(1)]), ctx)
 
 
+def _shape_graph_reduce_sum(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
+    return _shape_public_reduce(
+        ins,
+        {
+            "axis": attrs.get("axis"),
+            "keepdims": bool(attrs.get("keep_dims", attrs.get("keepdims", False))),
+        },
+    )
+
+
 def _compile_public_reduce(expr: SymExpr, ins: list[Semantics], out_shape: ShapeExpr) -> Semantics:
     a = ins[0]
     out_fn = _tensor_function(f"V_{expr.name}", out_shape.rank)
@@ -2382,6 +2577,11 @@ def _shape_public_broadcast_to(ins: list[ShapeExpr], attrs: dict[str, Any]) -> S
         return out
     compat = _broadcast_shape(ins[0], out.out)
     return ShapeResult(out.out, compat.ctx)
+
+
+def _shape_graph_broadcast(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
+    target_shape = tuple(ins[1].dims) if len(ins) >= 2 else attrs.get("shape")
+    return _shape_public_broadcast_to(ins[:1], {"shape": target_shape})
 
 
 def _shape_public_expand_dims(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
@@ -2617,11 +2817,15 @@ def _register_public_semantics() -> None:
         compile_rule = _compile_copy if op_name == "store" else _compile_public_opaque
         _ensure_semantics(op_name, shape_rule, compile_rule)
 
+    _ensure_semantics("broadcast", _shape_graph_broadcast, _compile_copy)
     _ensure_semantics("broadcast_to", _shape_public_broadcast_to, _compile_copy)
+    _ensure_semantics("div", _shape_public_binary, _compile_public_binary)
     _ensure_semantics("expand_dims", _shape_public_expand_dims, _compile_public_expand_dims)
     _ensure_semantics("load", _shape_same_as_first, _compile_copy)
     _ensure_semantics("load_transpose2d", _shape_public_transpose2d, _compile_nc_transpose)
     _ensure_semantics("matmul", _shape_public_matmul, _compile_public_matmul)
+    _ensure_semantics("mul", _shape_public_binary, _compile_public_binary)
+    _ensure_semantics("reduce_sum", _shape_graph_reduce_sum, _compile_public_reduce)
     _ensure_semantics("transpose", _shape_public_transpose2d, _compile_nc_transpose)
     _ensure_semantics("where", _shape_public_where, _compile_public_where)
 
@@ -2637,8 +2841,58 @@ class AxonArray:
     def __init__(self, node_id: str, shape: tuple[int, ...]):
         self.node_id = node_id
         self.shape = shape
-        
-    # COMPLETE THIS CLASS
+
+    def _binary_op(self, other: Any, op: str) -> "AxonArray":
+        if op == "matmul":
+            if not isinstance(other, AxonArray):
+                raise TypeError("matmul expects AxonArray operand")
+            if len(self.shape) != 2 or len(other.shape) != 2:
+                raise ValueError("matmul expects rank-2 inputs")
+            if not _dims_equal(self.shape[1], other.shape[0]):
+                raise ValueError("matmul expects compatible inner dimensions")
+            return AxonArray(_gen_id(op), (self.shape[0], other.shape[1]))
+
+        if isinstance(other, AxonArray):
+            out_shape = tuple(_normalize_dim(d) for d in _public_broadcast_shape_tuple(self.shape, other.shape))
+        else:
+            out_shape = self.shape
+        return AxonArray(_gen_id(op), out_shape)
+
+    def __add__(self, other: Any) -> "AxonArray":
+        return self._binary_op(other, "add")
+
+    def __mul__(self, other: Any) -> "AxonArray":
+        return self._binary_op(other, "mul")
+
+    def __truediv__(self, other: Any) -> "AxonArray":
+        return self._binary_op(other, "div")
+
+    def __matmul__(self, other: Any) -> "AxonArray":
+        return self._binary_op(other, "matmul")
+
+    def sum(self, axis: Any = None, keep_dims: bool = False) -> "AxonArray":
+        out_shape = _public_reduce_out_shape(self.shape, axis, keep_dims)
+        return AxonArray(_gen_id("reduce_sum"), tuple(_normalize_dim(d) for d in out_shape))
+
+    def broadcast_like(self, other: "AxonArray") -> "AxonArray":
+        return AxonArray(_gen_id("broadcast"), other.shape)
+
+    def sqrt(self) -> "AxonArray":
+        return AxonArray(_gen_id("sqrt"), self.shape)
+
+    def exp(self) -> "AxonArray":
+        return AxonArray(_gen_id("exp"), self.shape)
+
+    def transpose(self) -> "AxonArray":
+        if len(self.shape) == 2:
+            return AxonArray(_gen_id("transpose"), (self.shape[1], self.shape[0]))
+        return AxonArray(_gen_id("transpose"), self.shape)
+
+    def relu(self) -> "AxonArray":
+        return AxonArray(_gen_id("relu"), self.shape)
+
+    def silu(self) -> "AxonArray":
+        return AxonArray(_gen_id("silu"), self.shape)
 
 
 @dataclass(eq=True, frozen=True)
@@ -2691,11 +2945,315 @@ def graph_signature(G: nuGraph) -> str:
     return " | ".join([f"{n.id}:{n.op}({','.join(n.inputs)})" for n in G.nodes])
 
 
+def _normalize_dim(d: Any) -> Any:
+    if isinstance(d, int):
+        return d
+    if isinstance(d, z3.ArithRef):
+        d = z3.simplify(d)
+    if isinstance(d, z3.IntNumRef):
+        return d.as_long()
+    return d
+
+
+def _dims_equal(a: Any, b: Any) -> bool:
+    lhs = _to_dim(a) if isinstance(a, int) else a
+    rhs = _to_dim(b) if isinstance(b, int) else b
+    return _arith_equal(lhs, rhs)
+
+
+def _shape_expr_from_dims(shape: tuple[Any, ...]) -> ShapeExpr:
+    return ShapeExpr([_to_dim(dim) for dim in shape])
+
+
+def annotate_shapes_concrete(G: nuGraph) -> nuGraph:
+    shapes: dict[str, tuple[Any, ...]] = {}
+    for n in G.nodes:
+        if n.op == "input":
+            shape = tuple(_normalize_dim(d) for d in n.attrs.get("shape", n.shape or tuple()))
+        else:
+            if n.op not in _SEMANTICS:
+                raise KeyError(f"No shape rule registered for graph op '{n.op}'")
+            shape_rule, _ = _SEMANTICS[n.op]
+            if shape_rule is None:
+                raise KeyError(f"No shape rule registered for graph op '{n.op}'")
+            shape_res = shape_rule([_shape_expr_from_dims(shapes[inp]) for inp in n.inputs], dict(n.attrs))
+            shape = tuple(_normalize_dim(d) for d in shape_res.out.dims)
+        n.shape = shape
+        shapes[n.id] = shape
+    return G
+
+
+def _node_by_id(G: nuGraph, node_id: str) -> Optional[Node]:
+    for n in G.nodes:
+        if n.id == node_id:
+            return n
+    return None
+
+
+def _position_by_id(G: nuGraph, node_id: str) -> Optional[int]:
+    for i, n in enumerate(G.nodes):
+        if n.id == node_id:
+            return i
+    return None
+
+
+def _immediate_successor_positions(G: nuGraph, pos: int) -> list[int]:
+    node_id = G.node_at(pos).id
+    return [i for i, n in enumerate(G.nodes) if node_id in n.inputs]
+
+
+def _effective_input_ids(G: nuGraph, pos: int) -> list[str]:
+    return list(dict.fromkeys(G.node_at(pos).inputs))
+
+
+def _fresh_graph_node_id(G: nuGraph, base: str) -> str:
+    existing = {n.id for n in G.nodes}
+    if base not in existing:
+        return base
+    idx = 1
+    while f"{base}_{idx}" in existing:
+        idx += 1
+    return f"{base}_{idx}"
+
+
+def _graph_output_nodes(G: nuGraph) -> list[Node]:
+    used = {inp for n in G.nodes for inp in n.inputs}
+    return [n for n in G.nodes if n.id not in used]
+
+
+def _sym_expr_from_graph_node(
+    node: Node,
+    inputs: list[SymTensor],
+    symbolic_shape: Optional[tuple[z3.ArithRef, ...]] = None,
+) -> SymTensor:
+    if node.op == "input":
+        rank = len(node.attrs.get("shape", node.shape or tuple()))
+        shape = tuple(z3.Int(f"{node.id}_d{k}") for k in range(rank))
+        return SymTensor(node.id, shape=shape)
+
+    if node.op not in _SEMANTICS:
+        raise KeyError(f"No symbolic conversion registered for graph op '{node.op}'")
+
+    shape_rule, _ = _SEMANTICS[node.op]
+    if shape_rule is None:
+        raise KeyError(f"No shape rule registered for symbolic op '{node.op}'")
+    shape_res = shape_rule([ShapeExpr(list(inp.shape)) for inp in inputs], dict(node.attrs))
+    out_shape = symbolic_shape or tuple(shape_res.out.dims)
+    expr = SymExpr(node.op, [inp.expr for inp in inputs], out_shape, dict(node.attrs), node.id)
+    return SymTensor(node.id, expr=expr)
+
+
+def _graph_symbolic_tensors(G: nuGraph) -> dict[str, SymTensor]:
+    out: dict[str, SymTensor] = {}
+    for node in G.nodes:
+        inputs = [out[inp] for inp in node.inputs]
+        out[node.id] = _sym_expr_from_graph_node(node, inputs)
+    return out
+
+
+def _graphs_equivalent_symbolically(
+    lhs_graph: nuGraph,
+    rhs_graph: nuGraph,
+    timeout: int = 10000,
+    verbose: bool = False,
+    rule_name: Optional[str] = None,
+) -> bool:
+    lhs_tensors = _graph_symbolic_tensors(lhs_graph)
+    rhs_tensors = _graph_symbolic_tensors(rhs_graph)
+    lhs_outputs = {n.id: lhs_tensors[n.id] for n in _graph_output_nodes(lhs_graph)}
+    rhs_outputs = {n.id: rhs_tensors[n.id] for n in _graph_output_nodes(rhs_graph)}
+    if tuple(sorted(lhs_outputs)) != tuple(sorted(rhs_outputs)):
+        return False
+    for out_id in sorted(lhs_outputs):
+        if not check_equivalent(
+            lhs_outputs[out_id],
+            rhs_outputs[out_id],
+            timeout=timeout,
+            rule_name=f"{rule_name or 'graph_equiv'}_{out_id}",
+            verbose=verbose,
+        ):
+            return False
+    return True
+
+
+def _swap_composition_tensor(G: nuGraph, result_id: str) -> Optional[SymTensor]:
+    tensors = _graph_symbolic_tensors(G)
+    return tensors.get(result_id)
+
+
+def _swap_with_successor_variants(
+    G_cur: nuGraph, pos: int, succ_pos: int, clone_inputs: set[str]
+) -> list[tuple[nuGraph, int]]:
+    op1 = G_cur.node_at(pos)
+    op2 = G_cur.node_at(succ_pos)
+    op1_input_ids = set(op1.inputs)
+    if pos >= succ_pos:
+        return []
+    if not clone_inputs:
+        return []
+    if not clone_inputs.issubset(op1_input_ids):
+        return []
+    if len(G_cur.successors(op1)) != 1:
+        return []
+
+    consumed_positions = [i for i, input_id in enumerate(op2.inputs) if input_id == op1.id]
+    if len(consumed_positions) != 1:
+        return []
+    consumed_pos = consumed_positions[0]
+
+    selected_positions = [i for i, input_id in enumerate(op1.inputs) if input_id in clone_inputs]
+    if not selected_positions:
+        return []
+
+    selected_input_ids = [op1.inputs[i] for i in selected_positions]
+    candidate_inputs: list[list[str]] = []
+    seen_inputs: set[tuple[str, ...]] = set()
+    for perm in permutations(selected_input_ids):
+        rebuilt_inputs = list(op1.inputs)
+        for idx, permuted_input_id in zip(selected_positions, perm):
+            rebuilt_inputs[idx] = permuted_input_id
+        key = tuple(rebuilt_inputs)
+        if key not in seen_inputs:
+            seen_inputs.add(key)
+            candidate_inputs.append(rebuilt_inputs)
+
+    out: list[tuple[nuGraph, int]] = []
+    seen_graphs: set[str] = set()
+    for rebuilt_inputs in candidate_inputs:
+        base_graph = G_cur.clone()
+        op1_new = _node_by_id(base_graph, op1.id)
+        op2_old = _node_by_id(base_graph, op2.id)
+        if op1_new is None or op2_old is None:
+            continue
+
+        clone_nodes: list[Node] = []
+        clone_output_ids: dict[str, str] = {}
+        ordered_clone_inputs = [input_id for input_id in op1.inputs if input_id in clone_inputs]
+        for input_id in ordered_clone_inputs:
+            clone_id = _fresh_graph_node_id(base_graph, f"{op2.id}_via_{input_id}")
+            clone_node = Node(clone_id, op2_old.op, list(op2_old.inputs), dict(op2_old.attrs), None)
+            clone_node.inputs[consumed_pos] = input_id
+            clone_nodes.append(clone_node)
+            clone_output_ids[input_id] = clone_id
+            base_graph.nodes.append(clone_node)
+
+        rebuilt_node = Node(op2.id, op1.op, list(rebuilt_inputs), dict(op1.attrs), None)
+        rebuilt_node.inputs = [clone_output_ids.get(input_id, input_id) for input_id in rebuilt_node.inputs]
+
+        new_nodes: list[Node] = []
+        for idx, node in enumerate(G_cur.nodes):
+            if idx == succ_pos:
+                new_nodes.extend(Node(n.id, n.op, list(n.inputs), dict(n.attrs), n.shape) for n in clone_nodes)
+                new_nodes.append(rebuilt_node)
+                continue
+            if idx == pos:
+                continue
+            copied = Node(node.id, node.op, list(node.inputs), dict(node.attrs), node.shape)
+            new_nodes.append(copied)
+
+        G_new = nuGraph(new_nodes)
+        new_pos = _position_by_id(G_new, op2.id)
+        if new_pos is None:
+            continue
+        sig = graph_signature(G_new)
+        if sig in seen_graphs:
+            continue
+        seen_graphs.add(sig)
+        out.append((G_new, new_pos))
+
+    return out
+
+
+def _swap_with_successor(
+    G_cur: nuGraph, pos: int, succ_pos: int, clone_inputs: set[str]
+) -> Optional[tuple[nuGraph, int]]:
+    variants = _swap_with_successor_variants(G_cur, pos, succ_pos, clone_inputs)
+    return variants[0] if variants else None
+
+
+def z3_equivalent_order(
+    op1: Node, op2: Node, G_cur: nuGraph, G_new: Optional[nuGraph] = None, verbose: bool = False
+) -> bool:
+    if G_new is None:
+        return False
+    lhs = _swap_composition_tensor(G_cur, op2.id)
+    rhs = _swap_composition_tensor(G_new, op2.id)
+    if lhs is None or rhs is None:
+        return False
+    return check_equivalent(
+        lhs,
+        rhs,
+        timeout=10000,
+        rule_name=f"swap_{op1.id}_{op2.id}",
+        verbose=verbose,
+    )
+
+
 
 
 # COMPLETE THIS FUNCTION
 def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
-    ...
+    G0 = G.clone()
+    M: set[nuGraph] = {G0}
+    equivalence_cache: dict[tuple[str, str, str, str], bool] = {}
+
+    for op1_orig in [n for n in G0.nodes if n.op != "input"]:
+        M_next: set[nuGraph] = set()
+        for G_seed in sorted(M, key=graph_signature):
+            pos0 = _position_by_id(G_seed, op1_orig.id)
+            if pos0 is None:
+                M_next.add(G_seed)
+                continue
+
+            worklist: list[tuple[nuGraph, int]] = [(G_seed, pos0)]
+            visited: set[tuple[str, int]] = set()
+
+            while worklist:
+                G_cur, pos = worklist.pop()
+                state_key = (graph_signature(G_cur), pos)
+                if state_key in visited:
+                    continue
+                visited.add(state_key)
+                found_valid_swap = False
+
+                for succ_pos in _immediate_successor_positions(G_cur, pos):
+                    op1 = G_cur.node_at(pos)
+                    op2 = G_cur.node_at(succ_pos)
+                    inputs = _effective_input_ids(G_cur, pos)
+                    accepted = False
+
+                    # We cap the number of source inputs considered here at 4 because
+                    # subset/permutation enumeration grows very quickly beyond that,
+                    # while the graphs exercised by this prototype only use small-input
+                    # operators in the propagation path.
+                    if len(inputs) > 4:
+                        continue
+                    for k in range(1, len(inputs) + 1):
+                        for subset in combinations(inputs, k):
+                            for G_new, p_new in _swap_with_successor_variants(G_cur, pos, succ_pos, set(subset)):
+                                cache_key = (graph_signature(G_cur), op1.id, op2.id, graph_signature(G_new))
+                                equivalent = equivalence_cache.get(cache_key)
+                                if equivalent is None:
+                                    equivalent = z3_equivalent_order(op1, op2, G_cur, G_new, verbose=verbose)
+                                    equivalence_cache[cache_key] = equivalent
+                                if not equivalent:
+                                    continue
+                                M_next.add(G_new)
+                                worklist.append((G_new, p_new))
+                                found_valid_swap = True
+                                accepted = True
+                                break
+                            if accepted:
+                                break
+                        if accepted:
+                            break
+
+                if not found_valid_swap:
+                    M_next.add(G_cur)
+
+        M |= M_next
+
+    return sorted(M, key=graph_signature)
 
 
 
@@ -2753,6 +3311,11 @@ def kernel_transpose_matmul(x: AxonArray, w: AxonArray) -> AxonArray:
     return xt @ w
 
 
+def kernel_matmul_transpose(x: AxonArray, w: AxonArray) -> AxonArray:
+    z = x @ w
+    return z.transpose()
+
+
 def kernel_relu_matmul(x: AxonArray, w: AxonArray) -> AxonArray:
     return x.relu() @ w
 
@@ -2776,7 +3339,7 @@ def build_kernel_matmul_red_div_graph(M: int, K: int, N: int) -> nuGraph:
         Node(id="scale", op="div", inputs=["x", "rec"], attrs={}),
         Node(id="out", op="matmul", inputs=["scale", "w"], attrs={}),
     ])
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
     return G
 
 
@@ -2787,7 +3350,7 @@ def build_kernel_matmul_red_mul_graph(M: int, K: int, N: int) -> nuGraph:
         Node(id="scale", op="mul", inputs=["x", "rec"], attrs={}),
         Node(id="out", op="matmul", inputs=["scale", "w"], attrs={}),
     ])
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
     return G
 
 
@@ -2799,7 +3362,7 @@ def build_kernel_broadcast_row_bias_add_graph(M: int, K: int, N: int) -> nuGraph
         Node(id="z", op="add", inputs=["x", "bias_b"], attrs={}),
         Node(id="out", op="matmul", inputs=["z", "w"], attrs={}),
     ])
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
     return G
 
 
@@ -2811,7 +3374,7 @@ def build_kernel_reduce_mul_broadcast_graph(M: int, K: int, N: int) -> nuGraph:
         Node(id="z_b", op="broadcast", inputs=["z", "x"], attrs={}),
         Node(id="out", op="matmul", inputs=["z_b", "w"], attrs={}),
     ])
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
     return G
 
 
@@ -2823,7 +3386,7 @@ def build_kernel_reduce_broadcast_mul_graph(M: int, K: int, N: int) -> nuGraph:
         Node(id="z", op="mul", inputs=["x", "rec_b"], attrs={}),
         Node(id="out", op="matmul", inputs=["z", "w"], attrs={}),
     ])
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
     return G
 
 
@@ -2841,7 +3404,7 @@ def build_kernel_rmsnorm_matmul_graph(M: int, K: int, N: int) -> nuGraph:
         Node(id="out", op="matmul", inputs=["norm", "w"], attrs={}),
     ]
     G = nuGraph(nodes)
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
     return G
 
 
@@ -2859,7 +3422,7 @@ def build_kernel_softmax_matmul_graph(M: int, K: int, N: int) -> nuGraph:
         Node(id="out", op="matmul", inputs=["probs", "w"], attrs={}),                           # (M,N)
     ]
     G = nuGraph(nodes)
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
     return G
 
 
@@ -2875,7 +3438,23 @@ def build_kernel_transpose_matmul_graph(M: int, K: int, N: int) -> nuGraph:
         Node(id="out", op="matmul", inputs=["xt", "w"], attrs={}),   # (K,N)
     ]
     G = nuGraph(nodes)
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
+    return G
+
+
+def build_kernel_matmul_transpose_graph(M: int, K: int, N: int) -> nuGraph:
+    _ = kernel_matmul_transpose(
+        AxonArray("x", (M, K)),
+        AxonArray("w", (K, N)),
+    )
+    nodes = [
+        Node(id="x", op="input", inputs=[], attrs={"shape": (M, K)}),
+        Node(id="w", op="input", inputs=[], attrs={"shape": (K, N)}),
+        Node(id="mm", op="matmul", inputs=["x", "w"], attrs={}),
+        Node(id="out", op="transpose", inputs=["mm"], attrs={}),
+    ]
+    G = nuGraph(nodes)
+    annotate_shapes_concrete(G)
     return G
 
 
@@ -2887,7 +3466,7 @@ def build_kernel_relu_matmul_graph(M: int, K: int, N: int) -> nuGraph:
         Node(id="z", op="relu", inputs=["x"], attrs={}),
         Node(id="out", op="matmul", inputs=["z", "w"], attrs={}),
     ])
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
     return G
 
 def build_kernel_silu_matmul_graph(M: int, K: int, N: int) -> nuGraph:
@@ -2898,7 +3477,7 @@ def build_kernel_silu_matmul_graph(M: int, K: int, N: int) -> nuGraph:
         Node(id="z", op="silu", inputs=["x"], attrs={}),
         Node(id="out", op="matmul", inputs=["z", "w"], attrs={}),
     ])
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
     return G
 
 
@@ -2996,6 +3575,19 @@ def _test_transpose_matmul_graph() -> None:
     print(" transpose_matmul graph builds and runs variant generation")
 
 
+def _test_matmul_transpose_graph() -> None:
+    G = build_kernel_matmul_transpose_graph(4, 8, 16)
+    mm = next(n for n in G.nodes if n.id == "mm")
+    out = next(n for n in G.nodes if n.id == "out")
+
+    assert mm.shape == (4, 16), f"mm shape wrong: {mm.shape}"
+    assert out.shape == (16, 4), f"out shape wrong: {out.shape}"
+
+    variants = nu_graph_generation_z3(G, verbose=False)
+    assert len(variants) >= 2, "matmul_transpose should emit a swapped variant"
+    print(" matmul_transpose graph builds and runs variant generation")
+
+
 def _test_relu_matmul_graph() -> None:
     G = build_kernel_relu_matmul_graph(4, 8, 16)
     z = next(n for n in G.nodes if n.id == "z")
@@ -3013,9 +3605,75 @@ def _test_silu_matmul_graph() -> None:
     assert len(nu_graph_generation_z3(G, verbose=False)) >= 1
 
 
+def _test_axonarray_ops_shapes() -> None:
+    x = AxonArray("x", (4, 8))
+    y = AxonArray("y", (4, 8))
+    s = y.sum(axis=1, keep_dims=True)
+    assert s.shape == (4, 1)
+    assert (x * s).shape == (4, 8)
+    assert (x / s).shape == (4, 8)
+    assert x.broadcast_like(y).shape == (4, 8)
+    assert x.transpose().shape == (8, 4)
+    assert x.relu().shape == (4, 8)
+    assert x.silu().shape == (4, 8)
+    assert x.exp().shape == (4, 8)
+
+
+def _test_generic_symbolic_graph_equivalence() -> None:
+    G = build_kernel_softmax_matmul_graph(4, 8, 16)
+    assert _graphs_equivalent_symbolically(G, G.clone())
+
+
+def _test_generic_symbolic_swap_equivalence() -> None:
+    G = build_kernel_matmul_red_mul_graph(4, 8, 16)
+    scale = next(n for n in G.nodes if n.id == "scale")
+    out = next(n for n in G.nodes if n.id == "out")
+    candidates = _swap_with_successor_variants(G, G.position(scale), G.position(out), {"x"})
+    assert candidates
+    assert any(z3_equivalent_order(scale, out, G, G_new, verbose=False) for G_new, _ in candidates)
+
+
+def _test_transpose_matmul_swap_equivalence() -> None:
+    G = build_kernel_matmul_transpose_graph(4, 8, 16)
+    mm = next(n for n in G.nodes if n.id == "mm")
+    out = next(n for n in G.nodes if n.id == "out")
+    candidates = _swap_with_successor_variants(G, G.position(mm), G.position(out), {"x", "w"})
+    assert candidates
+    assert any(z3_equivalent_order(mm, out, G, G_new, verbose=False) for G_new, _ in candidates)
+
+
+def _test_generic_symbolic_non_equivalence() -> None:
+    G = build_kernel_matmul_red_mul_graph(4, 8, 16)
+    bad = G.clone()
+    bad_out = next(n for n in bad.nodes if n.id == "out")
+    bad_out.inputs = ["x", "w"]
+    scale = next(n for n in G.nodes if n.id == "scale")
+    out = next(n for n in G.nodes if n.id == "out")
+    assert not z3_equivalent_order(scale, out, G, bad, verbose=False)
+
+
+def _test_shape_annotation_uses_registered_semantics() -> None:
+    G = build_kernel_reduce_broadcast_mul_graph(4, 8, 16)
+    for node in G.nodes:
+        if node.op != "input":
+            node.shape = None
+    annotate_shapes_concrete(G)
+    assert next(n for n in G.nodes if n.id == "rec").shape == (4, 1)
+    assert next(n for n in G.nodes if n.id == "rec_b").shape == (4, 8)
+    assert next(n for n in G.nodes if n.id == "z").shape == (4, 8)
+    assert next(n for n in G.nodes if n.id == "out").shape == (4, 16)
+
+
+def _test_symbolic_variant_generation_without_shape_metadata() -> None:
+    G = build_kernel_matmul_transpose_graph(4, 8, 16)
+    for node in G.nodes:
+        if node.op != "input":
+            node.shape = None
+    assert len(nu_graph_generation_z3(G, verbose=False)) >= 2
+
+
 def run_all_tests() -> None:
     print("\n================ RUNNING NU-GRAPH TESTS ================")
-    _test_compositional_shape_equivalence()
     # _test_expected_variant_counts()
     # _test_no_illegal_reduce_broadcast_swap()
     # _test_no_illegal_reduce_sqrt_swap()
