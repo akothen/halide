@@ -560,7 +560,6 @@ def check_equivalent(
     theorem = z3.Implies(full_ctx.as_formula(), z3.And(shape_eq, val_eq))
 
     solver = z3.Solver()
-    z3.set_option(proof=True)
     solver.set("timeout", timeout)
     solver.add(z3.Not(theorem))
     res = solver.check()
@@ -2824,7 +2823,7 @@ class AxonArray:
         self.node_id = node_id
         self.shape = shape
 
-    def _binary(self, other: Any, op: str) -> "AxonArray":
+    def _binary_op(self, other: Any, op: str) -> "AxonArray":
         if op == "matmul":
             if not isinstance(other, AxonArray):
                 raise TypeError("matmul expects AxonArray operand")
@@ -2835,26 +2834,26 @@ class AxonArray:
             return AxonArray(_gen_id(op), (self.shape[0], other.shape[1]))
 
         if isinstance(other, AxonArray):
-            out_shape = tuple(_to_int_dim(d) for d in _public_broadcast_shape_tuple(self.shape, other.shape))
+            out_shape = tuple(_normalize_dim(d) for d in _public_broadcast_shape_tuple(self.shape, other.shape))
         else:
             out_shape = self.shape
         return AxonArray(_gen_id(op), out_shape)
 
     def __add__(self, other: Any) -> "AxonArray":
-        return self._binary(other, "add")
+        return self._binary_op(other, "add")
 
     def __mul__(self, other: Any) -> "AxonArray":
-        return self._binary(other, "mul")
+        return self._binary_op(other, "mul")
 
     def __truediv__(self, other: Any) -> "AxonArray":
-        return self._binary(other, "div")
+        return self._binary_op(other, "div")
 
     def __matmul__(self, other: Any) -> "AxonArray":
-        return self._binary(other, "matmul")
+        return self._binary_op(other, "matmul")
 
     def sum(self, axis: Any = None, keep_dims: bool = False) -> "AxonArray":
         out_shape = _public_reduce_out_shape(self.shape, axis, keep_dims)
-        return AxonArray(_gen_id("reduce_sum"), tuple(_to_int_dim(d) for d in out_shape))
+        return AxonArray(_gen_id("reduce_sum"), tuple(_normalize_dim(d) for d in out_shape))
 
     def broadcast_like(self, other: "AxonArray") -> "AxonArray":
         return AxonArray(_gen_id("broadcast"), other.shape)
@@ -2927,7 +2926,7 @@ def graph_signature(G: nuGraph) -> str:
     return " | ".join([f"{n.id}:{n.op}({','.join(n.inputs)})" for n in G.nodes])
 
 
-def _to_int_dim(d: Any) -> Any:
+def _normalize_dim(d: Any) -> Any:
     if isinstance(d, int):
         return d
     if isinstance(d, z3.IntNumRef):
@@ -2945,36 +2944,36 @@ def annotate_shapes_concrete(G: nuGraph) -> nuGraph:
     shapes: dict[str, tuple[Any, ...]] = {}
     for n in G.nodes:
         if n.op == "input":
-            shape = tuple(_to_int_dim(d) for d in n.attrs.get("shape", n.shape or tuple()))
+            shape = tuple(_normalize_dim(d) for d in n.attrs.get("shape", n.shape or tuple()))
         elif n.op == "reduce_sum" and n.inputs:
             in_shape = shapes.get(n.inputs[0], tuple())
             keep_dims = bool(n.attrs.get("keep_dims", n.attrs.get("keepdims", False)))
-            shape = tuple(_to_int_dim(d) for d in _public_reduce_out_shape(in_shape, n.attrs.get("axis"), keep_dims))
+            shape = tuple(_normalize_dim(d) for d in _public_reduce_out_shape(in_shape, n.attrs.get("axis"), keep_dims))
         elif n.op in {"add", "mul", "div"} and len(n.inputs) >= 2:
             a_shape = shapes.get(n.inputs[0], tuple())
             b_shape = shapes.get(n.inputs[1], tuple())
-            shape = tuple(_to_int_dim(d) for d in _public_broadcast_shape_tuple(a_shape, b_shape))
+            shape = tuple(_normalize_dim(d) for d in _public_broadcast_shape_tuple(a_shape, b_shape))
         elif n.op == "broadcast" and len(n.inputs) >= 2:
-            shape = tuple(_to_int_dim(d) for d in shapes.get(n.inputs[1], tuple()))
+            shape = tuple(_normalize_dim(d) for d in shapes.get(n.inputs[1], tuple()))
         elif n.op == "matmul" and len(n.inputs) >= 2:
             a_shape = shapes.get(n.inputs[0], tuple())
             b_shape = shapes.get(n.inputs[1], tuple())
             if len(a_shape) == 2 and len(b_shape) == 2:
-                shape = (_to_int_dim(a_shape[0]), _to_int_dim(b_shape[1]))
+                shape = (_normalize_dim(a_shape[0]), _normalize_dim(b_shape[1]))
             else:
                 shape = tuple()
         elif n.op == "transpose" and n.inputs:
             in_shape = shapes.get(n.inputs[0], tuple())
             if len(in_shape) == 2:
-                shape = (_to_int_dim(in_shape[1]), _to_int_dim(in_shape[0]))
+                shape = (_normalize_dim(in_shape[1]), _normalize_dim(in_shape[0]))
             else:
-                shape = tuple(_to_int_dim(d) for d in in_shape)
+                shape = tuple(_normalize_dim(d) for d in in_shape)
         elif n.op in {"sqrt", "exp", "relu", "silu"} and n.inputs:
-            shape = tuple(_to_int_dim(d) for d in shapes.get(n.inputs[0], tuple()))
+            shape = tuple(_normalize_dim(d) for d in shapes.get(n.inputs[0], tuple()))
         elif n.inputs:
-            shape = tuple(_to_int_dim(d) for d in shapes.get(n.inputs[0], tuple()))
+            shape = tuple(_normalize_dim(d) for d in shapes.get(n.inputs[0], tuple()))
         else:
-            shape = tuple(_to_int_dim(d) for d in n.attrs.get("shape", n.shape or tuple()))
+            shape = tuple(_normalize_dim(d) for d in n.attrs.get("shape", n.shape or tuple()))
         n.shape = shape
         shapes[n.id] = shape
     return G
@@ -3096,6 +3095,10 @@ def _swap_with_successor(
         return None
     if len(G_cur.successors(op1)) != 1:
         return None
+    # This local rewrite only supports cloning the pointwise op's primary data input:
+    # the first operand is the value stream that can feed the rewritten matmul,
+    # while the second operand remains outside the matrix-multiplication reduction
+    # and is re-applied afterward.
     if clone_inputs != {op1.inputs[0]}:
         return None
 
@@ -3158,7 +3161,7 @@ def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
                 if state_key in visited:
                     continue
                 visited.add(state_key)
-                advanced = False
+                found_valid_swap = False
 
                 for succ_pos in _immediate_successor_positions(G_cur, pos):
                     op1 = G_cur.node_at(pos)
@@ -3166,6 +3169,11 @@ def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
                     inputs = _effective_input_ids(G_cur, pos)
                     accepted = False
 
+                    # The kernel graphs in this file only exercise low-arity operators,
+                    # and we cap the search to avoid exponential blowups if
+                    # higher-arity operators are introduced later.
+                    if len(inputs) > 4:
+                        continue
                     for k in range(1, len(inputs) + 1):
                         for subset in combinations(inputs, k):
                             swapped = _swap_with_successor(G_cur, pos, succ_pos, set(subset))
@@ -3176,13 +3184,13 @@ def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
                                 continue
                             M_next.add(G_new)
                             worklist.append((G_new, p_new))
-                            advanced = True
+                            found_valid_swap = True
                             accepted = True
                             break
                         if accepted:
                             break
 
-                if not advanced:
+                if not found_valid_swap:
                     M_next.add(G_cur)
 
         M |= M_next
@@ -3535,6 +3543,17 @@ def _test_generic_symbolic_swap_equivalence() -> None:
     assert swapped is not None
     G_new, _ = swapped
     assert z3_equivalent_order(scale, out, G, G_new, verbose=False)
+
+
+def _test_generic_symbolic_non_equivalence() -> None:
+    G = build_kernel_matmul_red_mul_graph(4, 8, 16)
+    bad = G.clone()
+    bad_out = next(n for n in bad.nodes if n.id == "out")
+    bad_out.inputs = ["x", "w"]
+    annotate_shapes_concrete(bad)
+    scale = next(n for n in G.nodes if n.id == "scale")
+    out = next(n for n in G.nodes if n.id == "out")
+    assert not z3_equivalent_order(scale, out, G, bad, verbose=False)
 
 
 def run_all_tests() -> None:
