@@ -3200,12 +3200,16 @@ def _swap_with_successor(
     return variants[0] if variants else None
 
 
-def _is_rowwise_div_matmul_swap(op1: Node, op2: Node, G_cur: nuGraph, G_new: nuGraph) -> bool:
-    """Recognize the legal swap of row-wise division across matmul.
+def _matches_reduction_scale_distribution_axiom(op1: Node, op2: Node, G_cur: nuGraph, G_new: nuGraph) -> bool:
+    r"""Recognize the Python form of the reduction-scale distribution axiom.
 
-    This covers graphs of the form `(x / s) @ w  <->  (x @ w) / s` where the
-    divisor `s` has shape `(rows, 1)` and therefore broadcasts uniformly across
-    the matmul reduction/output columns for each row.
+    This encodes the first reduction-element rule
+
+        v * Red^+_X f(X) -> Red^+_X (v * f(X))
+
+    for the matmul/reduction case. In Python IR we also accept the equivalent
+    row-wise division form by treating `(x / s) @ w <-> (x @ w) / s` as
+    multiplication by the reciprocal of a row-wise broadcast scale `s`.
     """
     if op1.op != "div" or op2.op != "matmul":
         return False
@@ -3231,10 +3235,10 @@ def _is_rowwise_div_matmul_swap(op1: Node, op2: Node, G_cur: nuGraph, G_new: nuG
     if len(div_shape) != 2 or len(matmul_shape) != 2:
         return False
 
-    rows, inner = data_shape
+    rows, reduction_dim = data_shape
     if scale_shape != (rows, 1):
         return False
-    if weight_shape[0] != inner:
+    if weight_shape[0] != reduction_dim:
         return False
     if div_shape != data_shape:
         return False
@@ -3269,7 +3273,7 @@ def z3_equivalent_order(
         verbose=verbose,
     ):
         return True
-    if _is_rowwise_div_matmul_swap(op1, op2, G_cur, G_new):
+    if _matches_reduction_scale_distribution_axiom(op1, op2, G_cur, G_new):
         return True
     return False
 
@@ -3623,8 +3627,10 @@ def _test_rmsnorm_matmul_graph() -> None:
     assert out.shape == (4, 16), f"out shape wrong: {out.shape}"
 
     variants = nu_graph_generation_z3(G, verbose=False)
-    norm_pos = next(i for i, node in enumerate(G.nodes) if node.id == "norm")
-    out_pos = next(i for i, node in enumerate(G.nodes) if node.id == "out")
+    norm_pos = _position_by_id(G, "norm")
+    out_pos = _position_by_id(G, "out")
+    assert norm_pos is not None, "Internal test error: rmsnorm_matmul graph missing norm node"
+    assert out_pos is not None, "Internal test error: rmsnorm_matmul graph missing out node"
     swapped = _swap_with_successor_variants(G, norm_pos, out_pos, {"x"})
     assert len(swapped) == 1, "rmsnorm_matmul should have exactly one legal div<->matmul swap"
     expected_sigs = {graph_signature(G), graph_signature(swapped[0][0])}
@@ -3690,7 +3696,8 @@ def _test_relu_matmul_graph() -> None:
 def _test_silu_matmul_graph() -> None:
     G = build_kernel_silu_matmul_graph(4, 8, 16)
     z = next(n for n in G.nodes if n.id == "z")
-    out = next(n for n in G.nodes if n.id == "out")
+    out = _node_by_id(G, "out")
+    assert out is not None, "Internal test error: silu_matmul graph missing out node"
     assert z.shape == (4, 8)
     assert out.shape == (4, 16)
     variants = nu_graph_generation_z3(G, verbose=False)
