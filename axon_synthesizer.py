@@ -43,8 +43,8 @@ _ID_LOCK = Lock()
 _BODY_LOCK = Lock()
 _UF_LOCK = Lock()
 _SEMANTICS_LOCK = Lock()
-_VERBOSE_LOCK = Lock()   # serialises verbose prints from concurrent synthesis threads
-_Z3_LOCK = RLock()       # serialises z3 formula construction (z3.main_ctx is not thread-safe)
+_VERBOSE_LOCK = Lock()   # serializes verbose prints from concurrent synthesis threads
+_Z3_LOCK = RLock()       # serializes z3 formula construction (z3.main_ctx is not thread-safe)
 
 
 def _gen_id(prefix: Optional[str] = None) -> str:
@@ -3845,7 +3845,7 @@ def _check_equivalent_quiet(
     rhs: SymTensor,
     timeout: int = 3000,
 ) -> bool:
-    """Wrapper around quiet-by-default check_equivalent."""
+    """Run a quiet, thread-safe equivalence check under the shared Z3 lock."""
     try:
         with _Z3_LOCK:
             return check_equivalent(lhs, rhs, timeout=timeout)
@@ -4074,6 +4074,8 @@ def _sketch_to_graph_nodes(
         child_ids.append(cid)
 
     clean_attrs = {k: v for k, v in sketch.attrs.items() if k != "name"}
+    # The synthesis pool uses an abstract transpose so search does not branch
+    # over multiple concrete layout ops; materialize it here as nc_transpose.
     materialized_op = "nc_transpose" if sketch.op == "transpose" else sketch.op
     new_id = _gen_id(materialized_op)
     new_nodes.append(Node(id=new_id, op=materialized_op, inputs=child_ids, attrs=clean_attrs))
@@ -4362,7 +4364,7 @@ def _build_dag_levels(G: nuGraph) -> list[list[Node]]:
 
     Level 0 holds nodes with no predecessors (input nodes).  Level k holds
     nodes whose every input is at a level strictly less than k.  All nodes
-    within the same level are mutually independent and can be synthesised
+    within the same level are mutually independent and can be synthesized
     in parallel.
     """
     if not G.nodes:
@@ -4398,14 +4400,14 @@ def lower_nu_graph_all_variants(
     Two levels of parallelism are used:
 
     1. **Node-level**: nodes that sit at the same DAG level (no data
-        dependency between them) are synthesised concurrently via a
+        dependency between them) are synthesized concurrently via a
         ThreadPoolExecutor.
     2. **Sketch-level**: within each node, candidate equivalence checks are
        dispatched through _synthesize_all_from_pool.
 
      After synthesis the Cartesian product of per-node alternatives is taken.
     Because all valid sketches for a node are semantically equivalent to the
-    target, downstream nodes are synthesised against the canonical (first)
+    target, downstream nodes are synthesized against the canonical (first)
     alternative, and the remaining combinations are produced by substituting
     the canonical output IDs with the IDs of the chosen alternatives.
 
@@ -4439,7 +4441,7 @@ def lower_nu_graph_all_variants(
     # where:
     #   new_nodes       – hw Node objects contributed by this original node
     #   canonical_hw_id – output id of the FIRST valid alt (used as the
-    #                     reference id that downstream nodes were synthesised
+    #                     reference id that downstream nodes were synthesized
     #                     against); same for all entries of the same orig node
     #   actual_hw_id    – output id of this specific alternative
     # Deterministic nodes have exactly one entry with canonical_hw_id == actual_hw_id.
