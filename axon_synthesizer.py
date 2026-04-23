@@ -5,6 +5,7 @@ import argparse
 import concurrent.futures
 import sys
 import io
+import time
 from contextlib import redirect_stdout
 from dataclasses import dataclass, field
 from enum import Enum
@@ -3954,9 +3955,9 @@ def _synthesize_all_from_pool(
     serialising the z3 work under _Z3_LOCK.
 
     Returns every sketch that passes equivalence (empty list if none).
-    When *verbose* is True all sketches and their results are printed in
-    original DFS order after the parallel phase, holding _VERBOSE_LOCK so
-    output from concurrent node-level threads does not interleave.
+    When *verbose* is True each sketch is printed as soon as its equivalence
+    check completes, holding _VERBOSE_LOCK so output from concurrent node-level
+    threads does not interleave.
     """
     initial = SketchNode.make_hole()
     worklist: list[SketchNode] = [initial]
@@ -4005,14 +4006,28 @@ def _synthesize_all_from_pool(
     # Phase 2: check all candidates, optionally dispatching sketches through a
     # thread pool.  z3.main_ctx() is not thread-safe, so every actual solver
     # call must still hold _Z3_LOCK.
-    def _check_one(item: tuple[SketchNode, SymTensor]) -> tuple[SketchNode, bool]:
+    def _check_one(item: tuple[SketchNode, SymTensor]) -> tuple[SketchNode, bool, float]:
         sketch, cand_sym = item
+        started_at = time.perf_counter()
         try:
-            return sketch, _check_equivalent_quiet(target_sym, cand_sym, timeout=timeout)
+            equiv = _check_equivalent_quiet(target_sym, cand_sym, timeout=timeout)
         except Exception:
-            return sketch, False
+            equiv = False
+        return sketch, equiv, time.perf_counter() - started_at
 
-    ordered: dict[int, tuple[SketchNode, bool]] = {}
+    def _emit_check_result(idx: int, result: tuple[SketchNode, bool, float]) -> None:
+        if not verbose:
+            return
+        sketch, equiv, elapsed = result
+        status = "EQUIVALENT ✓" if equiv else "not equivalent"
+        with _VERBOSE_LOCK:
+            print(
+                f"    sketch {idx + 1:>3d}/{len(candidates):<3d} "
+                f"{_format_sketch(sketch)!s:60s}  [{status} in {elapsed:.3f}s]",
+                flush=True,
+            )
+
+    ordered: dict[int, tuple[SketchNode, bool, float]] = {}
     if max_workers > 1 and len(candidates) > 1:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             fs = {executor.submit(_check_one, item): idx
@@ -4022,26 +4037,19 @@ def _synthesize_all_from_pool(
                 try:
                     ordered[idx] = future.result()
                 except Exception:
-                    ordered[idx] = (candidates[idx][0], False)
+                    ordered[idx] = (candidates[idx][0], False, 0.0)
+                _emit_check_result(idx, ordered[idx])
     else:
         for idx, item in enumerate(candidates):
             ordered[idx] = _check_one(item)
+            _emit_check_result(idx, ordered[idx])
 
-    # Phase 3: collect results and emit verbose output in original DFS order
+    # Phase 3: collect results in original DFS order
     valid: list[SketchNode] = []
-    if verbose:
-        with _VERBOSE_LOCK:
-            for idx in range(len(candidates)):
-                sketch, equiv = ordered[idx]
-                status = "EQUIVALENT ✓" if equiv else "not equivalent"
-                print(f"    sketch {_format_sketch(sketch)!s:60s}  [{status}]")
-                if equiv:
-                    valid.append(sketch)
-    else:
-        for idx in range(len(candidates)):
-            sketch, equiv = ordered[idx]
-            if equiv:
-                valid.append(sketch)
+    for idx in range(len(candidates)):
+        sketch, equiv, _ = ordered[idx]
+        if equiv:
+            valid.append(sketch)
 
     return valid
 
@@ -5196,10 +5204,12 @@ def _test_synthesis_verbose_reports_candidate_count() -> None:
             max_hw_size=2,
             timeout=100,
             verbose=True,
-            max_workers=1,
+            max_workers=2,
         )
     out = buf.getvalue()
     assert "candidate_count=" in out, "Expected verbose synthesis output to report candidate_count"
+    assert "sketch " in out and " in " in out, \
+        "Expected verbose synthesis output to print each sketch as its check finishes"
     print(" synthesis: verbose output reports candidate_count")
 
 
