@@ -3533,8 +3533,9 @@ def _variants_for(builder: Callable[[int, int, int], nuGraph], M: int = 4, K: in
 
 def _test_expected_variant_counts() -> None:
     cases: list[tuple[str, Callable[[int, int, int], nuGraph], int]] = [
-        ("kernel_matmul_red_div", build_kernel_matmul_red_div_graph, 1),
+        ("kernel_matmul_red_div", build_kernel_matmul_red_div_graph, 2),
         ("kernel_matmul_red_mul", build_kernel_matmul_red_mul_graph, 1),
+        ("kernel_rmsnorm_matmul", build_kernel_rmsnorm_matmul_graph, 2),
         ("kernel_broadcast_row_bias_add", build_kernel_broadcast_row_bias_add_graph, 1),
         ("kernel_reduce_mul_broadcast", build_kernel_reduce_mul_broadcast_graph, 1),
         ("kernel_reduce_broadcast_mul", build_kernel_reduce_broadcast_mul_graph, 1),
@@ -3545,6 +3546,28 @@ def _test_expected_variant_counts() -> None:
         got = len(vs)
         assert got >= expected_min, f"{name}: expected >= {expected_min} variants, got {got}"
         print(f" {name}: variants={got} (expected >= {expected_min})")
+
+
+def _test_matmul_red_div_graph() -> None:
+    G = build_kernel_matmul_red_div_graph(4, 8, 16)
+    norm = _nodes_by_op(G, "div")[0]
+    out = _nodes_by_op(G, "matmul")[0]
+    assert norm.shape == (4, 8), f"norm shape wrong: {norm.shape}"
+    assert out.shape == (4, 16), f"out shape wrong: {out.shape}"
+
+    variants = nu_graph_generation_z3(G, verbose=False)
+    norm_pos = _position_by_id(G, norm.id)
+    out_pos = _position_by_id(G, out.id)
+    assert norm_pos is not None, "Internal test error: matmul_red_div test graph missing norm node"
+    assert out_pos is not None, "Internal test error: matmul_red_div test graph missing out node"
+    swapped = _swap_with_successor_variants(G, norm_pos, out_pos, {"x"})
+    assert len(swapped) == 1, "matmul_red_div should have exactly one legal div/matmul swap"
+    assert z3_equivalent_order(G.node_at(norm_pos), G.node_at(out_pos), G, swapped[0][0], verbose=False)
+    expected_sigs = {graph_signature(G), graph_signature(swapped[0][0])}
+    got_sigs = {graph_signature(variant) for variant in variants}
+    assert len(variants) == 2, f"matmul_red_div should emit original + swapped div/matmul variants, got {len(variants)}"
+    assert got_sigs == expected_sigs, "matmul_red_div emitted an unexpected variant"
+    print(" matmul_red_div graph builds and runs variant generation")
 
 
 def _test_no_illegal_reduce_broadcast_swap() -> None:
@@ -3689,6 +3712,7 @@ def _test_print_graph_includes_symbolic_shapes() -> None:
 def run_all_tests() -> None:
     print("\n================ RUNNING NU-GRAPH TESTS ================")
     _test_expected_variant_counts()
+    _test_matmul_red_div_graph()
     _test_no_illegal_reduce_broadcast_swap()
     _test_no_illegal_reduce_sqrt_swap()
     _test_rmsnorm_matmul_graph()
