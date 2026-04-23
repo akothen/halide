@@ -199,61 +199,53 @@ def _new_sym_tensor(op: str, inputs: list[SymTensor], attrs: dict[str, Any], out
 
 
 def _public_pointwise_binary(x: Any, y: Any, op: _OpRef) -> Any:
+    assert _is_sym_tensor(x) or _is_sym_tensor(y)
     if _is_sym_tensor(x) and _is_sym_tensor(y):
         return tensor_tensor(dst=None, data1=x, data2=y, op=op)
     if _is_sym_tensor(x):
         return tensor_scalar(dst=None, data=x, op0=op, operand0=y)
-    if _is_sym_tensor(y):
-        return tensor_scalar(dst=None, data=y, op0=op, operand0=x, reverse0=True)
-    return ...
+    return tensor_scalar(dst=None, data=y, op0=op, operand0=x, reverse0=True)
 
 
 def _public_unary(op_name: str, x: Any, **attrs: Any) -> Any:
-    if not _is_sym_tensor(x):
-        return ...
+    assert _is_sym_tensor(x)
     return _new_sym_tensor(op_name, [x], attrs, x.shape)
 
 
 def _public_binary(op_name: str, x: Any, y: Any, **attrs: Any) -> Any:
+    assert _is_sym_tensor(x) or _is_sym_tensor(y)
     if _is_sym_tensor(x) and _is_sym_tensor(y):
         return _new_sym_tensor(op_name, [x, y], attrs, _public_broadcast_shape_tuple(x.shape, y.shape))
     if _is_sym_tensor(x):
         return _new_sym_tensor(op_name, [x], {"scalar": y, **attrs}, x.shape)
-    if _is_sym_tensor(y):
-        return _new_sym_tensor(op_name, [y], {"scalar": x, "reverse": True, **attrs}, y.shape)
-    return ...
+    return _new_sym_tensor(op_name, [y], {"scalar": x, "reverse": True, **attrs}, y.shape)
 
 
 def _public_reduce(op_name: str, x: Any, axis: Any, *, keepdims: bool = False, **attrs: Any) -> Any:
-    if not _is_sym_tensor(x):
-        return ...
+    assert _is_sym_tensor(x)
     out_shape = _public_reduce_out_shape(x.shape, axis, keepdims)
     return _new_sym_tensor(op_name, [x], {"axis": axis, "keepdims": keepdims, **attrs}, out_shape)
 
 
 def _public_dynamic_slice(start: Any, size: Any) -> Any:
-    if isinstance(start, int) and isinstance(size, int):
-        return slice(start, start + size)
-    return ...
+    assert isinstance(start, int) and isinstance(size, int)
+    return slice(start, start + size)
 
 
 def _public_gather_flattened(data: Any, indices: Any, axis: Any) -> Any:
-    if not (_is_sym_tensor(data) and _is_sym_tensor(indices)):
-        return ...
+    assert (_is_sym_tensor(data) and _is_sym_tensor(indices))
     out_shape = (data.shape[0], *indices.shape[1:])
     return _new_sym_tensor("gather_flattened", [data, indices], {"axis": axis}, out_shape)
 
 
 def _public_rms_norm(x: Any, w: Any) -> Any:
-    if not _is_sym_tensor(x):
-        return ...
+    assert _is_sym_tensor(x)
     inputs = [value for value in (x, w) if _is_sym_tensor(value)]
     return _new_sym_tensor("rms_norm", inputs, {}, x.shape)
 
 
 def _public_store(dst: Any, value: Any) -> Any:
-    if not _is_sym_tensor(value):
-        return ...
+    assert _is_sym_tensor(value)
     out_shape = _default_out_shape(dst, value)
     return _new_sym_tensor("store", [value], {"out_shape": out_shape}, out_shape)
 
@@ -631,8 +623,7 @@ def bitwise_xor(x, y, dtype=None):
 
 @semantics()
 def broadcast_to(x, shape, dtype=None):
-    if not _is_sym_tensor(x):
-        return ...
+    assert _is_sym_tensor(x)
     return _new_sym_tensor("broadcast_to", [x], tuple(shape), out_shape=tuple(shape))
 
 
@@ -658,8 +649,7 @@ def divide(x, y, dtype=None):
 
 @semantics()
 def dropout(x, rate, dtype=None):
-    if not _is_sym_tensor(x):
-        return ...
+    assert _is_sym_tensor(x)
     inputs = [x]
     if _is_sym_tensor(rate):
         inputs.append(rate)
@@ -804,8 +794,7 @@ def logical_xor(x, y, dtype=None):
 @semantics()
 def matmul(x, y, transpose_x=False):
     stationary = x if transpose_x else nc_transpose(dst=None, data=x)
-    if not (_is_sym_tensor(stationary) and _is_sym_tensor(y)):
-        return ...
+    assert (_is_sym_tensor(stationary) and _is_sym_tensor(y))
     return nc_matmul(dst=None, stationary=stationary, moving=y)
 
 
@@ -982,8 +971,7 @@ def var(x, axis, dtype=None, keepdims=False):
 
 @semantics()
 def where(condition, x, y, dtype=None):
-    if not (_is_sym_tensor(condition) and _is_sym_tensor(x) and _is_sym_tensor(y)):
-        return ...
+    assert (_is_sym_tensor(condition) and _is_sym_tensor(x) and _is_sym_tensor(y))
     xy_shape = _public_broadcast_shape_tuple(x.shape, y.shape)
     out_shape = _public_broadcast_shape_tuple(condition.shape, xy_shape)
     return _new_sym_tensor("where", [condition, x, y], {}, out_shape)
@@ -999,8 +987,7 @@ def activation(dst, op, data, bias=None, scale=1.0, reduce_op=None, reduce_res=N
 
     _ensure_semantics("activation", shape_rule, value_rule)
 
-    if not _is_sym_tensor(data):
-        return ...
+    assert _is_sym_tensor(data)
     inputs = [data]
     attrs: dict[str, Any] = {
         "op": op,
@@ -1031,8 +1018,7 @@ def activation_reduce(dst, op, data, reduce_op, reduce_res, bias=None, scale=1.0
 
     _ensure_semantics("activation_reduce", shape_rule, value_rule)
 
-    if not _is_sym_tensor(data):
-        return ...
+    assert _is_sym_tensor(data)
     inputs = [data]
     attrs: dict[str, Any] = {"op": op, "reduce_op": reduce_op, "scale": scale, "name": name}
     if _is_sym_tensor(bias):
@@ -1071,8 +1057,7 @@ def affine_select(dst, pattern, channel_multiplier, on_true_tile, on_false_value
 
     _ensure_semantics("affine_select", shape_rule, value_rule)
 
-    if not _is_sym_tensor(on_true_tile):
-        return ...
+    assert _is_sym_tensor(on_true_tile)
     return _new_sym_tensor(
         "affine_select",
         [on_true_tile],
@@ -1103,8 +1088,7 @@ def bn_aggr(dst, data, name=None):
 
     _ensure_semantics("bn_aggr", shape_rule, value_rule)
 
-    if not _is_sym_tensor(data):
-        return ...
+    assert _is_sym_tensor(data)
     out_shape = _default_out_shape(dst, data)
     if out_shape == data.shape:
         out_shape = (data.shape[0], z3.IntVal(2))
@@ -1122,8 +1106,7 @@ def bn_stats(dst, data, name=None):
 
     _ensure_semantics("bn_stats", shape_rule, value_rule)
 
-    if not _is_sym_tensor(data):
-        return ...
+    assert _is_sym_tensor(data)
     out_shape = _default_out_shape(dst, data)
     if out_shape == data.shape:
         out_shape = (data.shape[0], z3.IntVal(6))
@@ -1157,8 +1140,7 @@ def dma_compute(dst, srcs, reduce_op, scales=None, unique_indices=True, name=Non
     _ensure_semantics("dma_compute", shape_rule, value_rule)
 
     sym_srcs = [src for src in srcs if _is_sym_tensor(src)]
-    if not sym_srcs:
-        return ...
+    assert sym_srcs
     resolved_scales = list(scales) if scales is not None else [1.0] * len(srcs)
     return _new_sym_tensor(
         "dma_compute",
@@ -1184,8 +1166,7 @@ def dma_copy(dst, src, oob_mode=oob_mode.error, dge_mode=dge_mode.unknown, engin
 
     _ensure_semantics("dma_copy", shape_rule, value_rule)
 
-    if not _is_sym_tensor(src):
-        return ...
+    assert _is_sym_tensor(src)
     return _new_sym_tensor(
         "dma_copy",
         [src],
@@ -1220,8 +1201,7 @@ def dma_transpose(dst, src, axes=None, dge_mode=dge_mode.unknown, oob_mode=oob_m
 
     _ensure_semantics("dma_transpose", shape_rule, value_rule)
 
-    if not _is_sym_tensor(src):
-        return ...
+    assert _is_sym_tensor(src)
     resolved_axes = tuple(axes) if axes is not None else None
     out_shape = _default_out_shape(dst, src)
     if resolved_axes is not None:
@@ -1269,8 +1249,7 @@ def dropout(dst, data, prob, name=None):
 
     _ensure_semantics("dropout", shape_rule, value_rule)
 
-    if not _is_sym_tensor(data):
-        return ...
+    assert _is_sym_tensor(data)
     inputs = [data]
     attrs: dict[str, Any] = {"name": name}
     if _is_sym_tensor(prob):
@@ -1291,8 +1270,7 @@ def exponential(dst, src, max_value=0.0, reduce_res=None, reduce_cmd=reduce_cmd.
 
     _ensure_semantics("exponential", shape_rule, value_rule)
 
-    if not _is_sym_tensor(src):
-        return ...
+    assert _is_sym_tensor(src)
     inputs = [src]
     attrs: dict[str, Any] = {
         "max_value": max_value,
@@ -1340,8 +1318,7 @@ def iota(dst, pattern, offset=0, channel_multiplier=0, name=None):
     )
 
     out_shape = _default_out_shape(dst)
-    if not out_shape:
-        return ...
+    assert out_shape
     return _new_sym_tensor(
         "iota",
         [],
@@ -1360,8 +1337,7 @@ def local_gather(dst, src_buffer, index, num_elem_per_idx=1, num_valid_indices=N
 
     _ensure_semantics("local_gather", shape_rule, value_rule)
 
-    if not (_is_sym_tensor(src_buffer) and _is_sym_tensor(index)):
-        return ...
+    assert (_is_sym_tensor(src_buffer) and _is_sym_tensor(index))
     return _new_sym_tensor(
         "local_gather",
         [src_buffer, index],
@@ -1381,8 +1357,7 @@ def max8(dst, src, name=None):
 
     _ensure_semantics("max8", shape_rule, value_rule)
 
-    if not _is_sym_tensor(src):
-        return ...
+    assert _is_sym_tensor(src)
     out_shape = _default_out_shape(dst, src)
     if out_shape == src.shape:
         out_shape = (src.shape[0], z3.IntVal(8))
@@ -1404,8 +1379,7 @@ def memset(dst, value, engine=engine.unknown, name=None):
     _ensure_semantics("memset", shape_rule, value_rule)
 
     out_shape = _default_out_shape(dst)
-    if not out_shape:
-        return ...
+    assert out_shape
     return _new_sym_tensor("memset", [], {"value": value, "engine": engine, "out_shape": out_shape, "name": name}, out_shape)
 
 
@@ -1421,8 +1395,7 @@ def nc_find_index8(dst, data, vals, name=None):
 
     _ensure_semantics("nc_find_index8", shape_rule, value_rule)
 
-    if not (_is_sym_tensor(data) and _is_sym_tensor(vals)):
-        return ...
+    assert (_is_sym_tensor(data) and _is_sym_tensor(vals))
     out_shape = _default_out_shape(dst, data)
     if out_shape == data.shape:
         out_shape = (data.shape[0], z3.IntVal(8))
@@ -1441,8 +1414,7 @@ def nc_match_replace8(dst, data, vals, imm, dst_idx=None, name=None):
 
     _ensure_semantics("nc_match_replace8", shape_rule, value_rule)
 
-    if not (_is_sym_tensor(data) and _is_sym_tensor(vals)):
-        return ...
+    assert (_is_sym_tensor(data) and _is_sym_tensor(vals))
     return _new_sym_tensor("nc_match_replace8", [data, vals], {"imm": imm, "name": name}, _default_out_shape(dst, data))
 
 
@@ -1479,8 +1451,7 @@ def nc_matmul(dst, stationary, moving, is_stationary_onezero=False, is_moving_on
 
     _ensure_semantics("nc_matmul", shape_rule, value_rule)
 
-    if not (_is_sym_tensor(stationary) and _is_sym_tensor(moving)):
-        return ...
+    assert (_is_sym_tensor(stationary) and _is_sym_tensor(moving))
     out_shape = _default_out_shape(dst, stationary)
     if out_shape == stationary.shape and stationary.rank >= 2 and moving.rank >= 2:
         out_shape = (stationary.shape[-1], moving.shape[-1])
@@ -1526,8 +1497,7 @@ def nc_n_gather(dst, data, indices, name=None):
 
     _ensure_semantics("nc_n_gather", shape_rule, value_rule)
 
-    if not (_is_sym_tensor(data) and _is_sym_tensor(indices)):
-        return ...
+    assert (_is_sym_tensor(data) and _is_sym_tensor(indices))
     out_shape = _default_out_shape(dst, indices)
     if out_shape == indices.shape:
         out_shape = (data.shape[0], *indices.shape[1:])
@@ -1562,8 +1532,7 @@ def nc_stream_shuffle(dst, src, shuffle_mask, name=None):
 
     _ensure_semantics("nc_stream_shuffle", shape_rule, value_rule)
 
-    if not _is_sym_tensor(src):
-        return ...
+    assert _is_sym_tensor(src)
     return _new_sym_tensor("nc_stream_shuffle", [src], {"shuffle_mask": list(shuffle_mask), "name": name}, _default_out_shape(dst, src))
 
 
@@ -1577,8 +1546,7 @@ def nc_transpose(dst, data, engine=engine.unknown, name=None):
 
     _ensure_semantics("nc_transpose", shape_rule, value_rule)
 
-    if not _is_sym_tensor(data):
-        return ...
+    assert _is_sym_tensor(data)
     out_shape = _default_out_shape(dst, data)
     if len(out_shape) >= 2:
         out_shape = (out_shape[1], out_shape[0], *out_shape[2:])
@@ -1595,8 +1563,7 @@ def reciprocal(dst, data, name=None):
 
     _ensure_semantics("reciprocal", shape_rule, value_rule)
 
-    if not _is_sym_tensor(data):
-        return ...
+    assert _is_sym_tensor(data)
     return _new_sym_tensor("reciprocal", [data], {"name": name}, _default_out_shape(dst, data))
 
 
@@ -1627,8 +1594,7 @@ def scalar_tensor_tensor(dst, data, op0, operand0, op1, operand1, reverse0=False
 
     _ensure_semantics("scalar_tensor_tensor", shape_rule, value_rule)
 
-    if not (_is_sym_tensor(data) and _is_sym_tensor(operand1)):
-        return ...
+    assert (_is_sym_tensor(data) and _is_sym_tensor(operand1))
     inputs = [data]
     attrs: dict[str, Any] = {"op0": op0, "op1": op1, "reverse0": reverse0, "reverse1": reverse1, "name": name}
     if _is_sym_tensor(operand0):
@@ -1651,8 +1617,7 @@ def select_reduce(dst, predicate, on_true, on_false, reduce_res=None, reduce_cmd
 
     _ensure_semantics("select_reduce", shape_rule, value_rule)
 
-    if not (_is_sym_tensor(predicate) and _is_sym_tensor(on_true)):
-        return ...
+    assert (_is_sym_tensor(predicate) and _is_sym_tensor(on_true))
     inputs = [predicate, on_true]
     attrs: dict[str, Any] = {
         "reduce_cmd": reduce_cmd,
@@ -1679,8 +1644,7 @@ def tensor_copy(dst, src, engine=engine.unknown, name=None):
 
     _ensure_semantics("tensor_copy", shape_rule, value_rule)
 
-    if not _is_sym_tensor(src):
-        return ...
+    assert _is_sym_tensor(src)
     return _new_sym_tensor("tensor_copy", [src], {"engine": engine, "name": name}, _default_out_shape(dst, src))
 
 
@@ -1710,8 +1674,7 @@ def tensor_copy_predicated(dst, src, predicate, reverse_pred=False, name=None):
 
     _ensure_semantics("tensor_copy_predicated", shape_rule, value_rule)
 
-    if not (_is_sym_tensor(src) and _is_sym_tensor(predicate)):
-        return ...
+    assert (_is_sym_tensor(src) and _is_sym_tensor(predicate))
     inputs = [src, predicate]
     if _is_sym_tensor(dst):
         inputs.append(dst)
@@ -1761,8 +1724,7 @@ def tensor_partition_reduce(dst, op, data, name=None):
 
     _ensure_semantics("tensor_partition_reduce", shape_rule, value_rule)
 
-    if not _is_sym_tensor(data):
-        return ...
+    assert _is_sym_tensor(data)
     out_shape = _default_out_shape(dst, data)
     if out_shape == data.shape:
         out_shape = (z3.IntVal(1), *data.shape[1:]) if data.rank > 1 else (z3.IntVal(1),)
@@ -1779,8 +1741,7 @@ def tensor_reduce(dst, op, data, axis, negate=False, keepdims=False, name=None):
 
     _ensure_semantics("tensor_reduce", shape_rule, value_rule)
 
-    if not _is_sym_tensor(data):
-        return ...
+    assert _is_sym_tensor(data)
     return _new_sym_tensor(
         "tensor_reduce",
         [data],
@@ -1799,8 +1760,7 @@ def tensor_scalar(dst, data, op0, operand0, reverse0=False, op1=None, operand1=N
 
     _ensure_semantics("tensor_scalar", shape_rule, value_rule)
 
-    if not _is_sym_tensor(data):
-        return ...
+    assert _is_sym_tensor(data)
     inputs = [data]
     attrs: dict[str, Any] = {
         "op0": op0,
@@ -1868,8 +1828,7 @@ def tensor_scalar_cumulative(dst, src, op0, op1, imm0, imm1=None, reduce_cmd=red
 
     _ensure_semantics("tensor_scalar_cumulative", shape_rule, value_rule)
 
-    if not _is_sym_tensor(src):
-        return ...
+    assert _is_sym_tensor(src)
     inputs = [src]
     attrs: dict[str, Any] = {"op0": op0, "op1": op1, "reverse0": False, "reverse1": False, "reduce_cmd": reduce_cmd, "name": name}
     if _is_sym_tensor(imm0):
@@ -1916,8 +1875,7 @@ def tensor_scalar_reduce(dst, data, op0, operand0, reduce_op, reduce_res, revers
 
     _ensure_semantics("tensor_scalar_reduce", shape_rule, value_rule)
 
-    if not _is_sym_tensor(data):
-        return ...
+    assert _is_sym_tensor(data)
     inputs = [data]
     attrs: dict[str, Any] = {"op0": op0, "reduce_op": reduce_op, "reverse0": reverse0, "name": name}
     if _is_sym_tensor(operand0):
@@ -1938,8 +1896,7 @@ def tensor_tensor(dst, data1, data2, op, engine=engine.unknown, name=None):
 
     _ensure_semantics("tensor_tensor", shape_rule, value_rule)
 
-    if not (_is_sym_tensor(data1) and _is_sym_tensor(data2)):
-        return ...
+    assert (_is_sym_tensor(data1) and _is_sym_tensor(data2))
     return _new_sym_tensor(
         "tensor_tensor",
         [data1, data2],
@@ -1987,8 +1944,7 @@ def tensor_tensor_scan(dst, data0, data1, initial, op0, op1, reverse0=False, rev
 
     _ensure_semantics("tensor_tensor_scan", shape_rule, value_rule)
 
-    if not (_is_sym_tensor(data0) and _is_sym_tensor(data1)):
-        return ...
+    assert (_is_sym_tensor(data0) and _is_sym_tensor(data1))
     inputs = [data0, data1]
     attrs: dict[str, Any] = {"op0": op0, "op1": op1, "reverse0": reverse0, "reverse1": reverse1, "name": name}
     if _is_sym_tensor(initial):
