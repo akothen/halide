@@ -477,6 +477,7 @@ def reduction_extensionality_context() -> Context:
 
 
 def reduction_comparison_context(lhs: Semantics, rhs: Semantics) -> Context:
+    """Kept for API compatibility; reduction equality now comes from body proofs."""
     return Context()
 
 
@@ -631,7 +632,8 @@ def _rename_expr_tree_for_equivalence(
         name = shared_names[sig]
     else:
         candidate_names = [expr.name, f"{expr.name}_{side}"]
-        name = next((candidate for candidate in candidate_names if candidate not in used_names), f"{expr.name}_{side}_{len(used_names)}")
+        fallback_name = f"{expr.name}_{side}_{len(used_names)}"
+        name = next((candidate for candidate in candidate_names if candidate not in used_names), fallback_name)
         shared_names[sig] = name
         used_names.add(name)
 
@@ -2627,6 +2629,8 @@ def _compile_public_binary(expr: SymExpr, ins: list[Semantics], out_shape: Shape
         reduction_index = next((idx for idx, sem in enumerate(ins) if sem.reduction is not None), None)
         if reduction_index is None:
             return None
+        # Only reductions in the numerator can be lifted through division:
+        # Red_X^+(f(X)) / v == Red_X^+(f(X) / v), but v / Red_X^+(f(X)) does not.
         if opn in ("div", "divide") and reduction_index != 0:
             return None
 
@@ -3710,6 +3714,7 @@ def _test_rmsnorm_matmul_graph() -> None:
     assert out_pos is not None, "Internal test error: rmsnorm_matmul test graph missing out node"
     swapped = _swap_with_successor_variants(G, norm_pos, out_pos, {"x"})
     assert len(swapped) == 1, "rmsnorm_matmul should have exactly one legal div/matmul swap"
+    assert z3_equivalent_order(G.node_at(norm_pos), G.node_at(out_pos), G, swapped[0][0], verbose=False)
     expected_sigs = {graph_signature(G), graph_signature(swapped[0][0])}
     got_sigs = {graph_signature(variant) for variant in variants}
     assert len(variants) == 2, f"rmsnorm_matmul should emit original + swapped div/matmul variants, got {len(variants)}"
@@ -3769,6 +3774,12 @@ def _test_relu_matmul_graph() -> None:
     variants = nu_graph_generation_z3(G, verbose=False)
     assert len(variants) == 1, f"relu_matmul should not push relu past matmul, got {len(variants)} variants"
     assert graph_signature(variants[0]) == graph_signature(G)
+    z_pos = _position_by_id(G, "z")
+    out_pos = _position_by_id(G, "out")
+    assert z_pos is not None and out_pos is not None
+    illegal_swaps = _swap_with_successor_variants(G, z_pos, out_pos, {"x"})
+    assert illegal_swaps, "relu_matmul should generate a candidate illegal swap for rejection testing"
+    assert not z3_equivalent_order(G.node_at(z_pos), G.node_at(out_pos), G, illegal_swaps[0][0], verbose=False)
 
 def _test_silu_matmul_graph() -> None:
     G = build_kernel_silu_matmul_graph(4, 8, 16)
