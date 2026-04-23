@@ -29,8 +29,6 @@ nl = _NLNamespace()
 
 _ID_COUNTER = 1000
 _BODY_COUNTER = 2000
-_POW_FN = z3.Function("NKI_POW", z3.RealSort(), z3.RealSort(), z3.RealSort())
-_EXP_FN = z3.Function("NKI_EXP", z3.RealSort(), z3.RealSort())
 _LARGE_POSITIVE_SENTINEL = 1e30
 _BINARY_UFS: dict[str, z3.FuncDeclRef] = {}
 _UNARY_UFS: dict[str, z3.FuncDeclRef] = {}
@@ -66,6 +64,9 @@ BODY1 = z3.Function("BODY1", z3.IntSort(), z3.IntSort(), z3.IntSort(), z3.RealSo
 REDUCE1 = z3.Function("REDUCE1", z3.IntSort(), z3.IntSort(), z3.IntSort(), z3.RealSort())
 BODY2 = z3.Function("BODY2", z3.IntSort(), z3.IntSort(), z3.IntSort(), z3.IntSort(), z3.RealSort())
 REDUCE2 = z3.Function("REDUCE2", z3.IntSort(), z3.IntSort(), z3.IntSort(), z3.IntSort(), z3.RealSort())
+
+_POW_FN = z3.Function("NKI_POW", z3.RealSort(), z3.RealSort(), z3.RealSort())
+_EXP_FN = z3.Function("NKI_EXP", z3.RealSort(), z3.RealSort())
 
 
 @dataclass
@@ -2626,3 +2627,431 @@ def _register_public_semantics() -> None:
 
 
 _register_public_semantics()
+
+
+
+
+
+
+class AxonArray:
+    def __init__(self, node_id: str, shape: tuple[int, ...]):
+        self.node_id = node_id
+        self.shape = shape
+        
+    # COMPLETE THIS CLASS
+
+
+@dataclass(eq=True, frozen=True)
+class NodeSig:
+    id: str
+    op: str
+    inputs: tuple[str, ...]
+    attrs: tuple[tuple[str, Any], ...]
+
+
+@dataclass
+class Node:
+    id: str
+    op: str
+    inputs: list[str]
+    attrs: dict[str, Any] = field(default_factory=dict)
+    shape: Optional[tuple[int, ...]] = None
+
+    def sig(self) -> NodeSig:
+        return NodeSig(self.id, self.op, tuple(self.inputs), tuple(sorted(self.attrs.items())))
+
+
+@dataclass
+class nuGraph:
+    nodes: list[Node]
+
+    def position(self, node: Node) -> int:
+        for i, n in enumerate(self.nodes):
+            if n.id == node.id:
+                return i
+        raise ValueError("node not found")
+
+    def node_at(self, pos: int) -> Node:
+        return self.nodes[pos]
+
+    def successors(self, node: Node) -> list[Node]:
+        return [n for n in self.nodes if node.id in n.inputs]
+
+    def clone(self) -> "nuGraph":
+        return nuGraph([Node(n.id, n.op, list(n.inputs), dict(n.attrs), n.shape) for n in self.nodes])
+
+    def __hash__(self):
+        return hash(tuple(n.sig() for n in self.nodes))
+
+    def __eq__(self, other):
+        return isinstance(other, nuGraph) and tuple(n.sig() for n in self.nodes) == tuple(n.sig() for n in other.nodes)
+
+
+def graph_signature(G: nuGraph) -> str:
+    return " | ".join([f"{n.id}:{n.op}({','.join(n.inputs)})" for n in G.nodes])
+
+
+
+
+# COMPLETE THIS FUNCTION
+def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
+    ...
+
+
+
+
+
+
+def kernel_matmul_red_div(x: AxonArray, y: AxonArray, w: AxonArray) -> AxonArray:
+    rec = y.sum(axis=1, keep_dims=True)
+    return (x / rec) @ w
+
+
+def kernel_matmul_red_mul(x: AxonArray, y: AxonArray, w: AxonArray) -> AxonArray:
+    rec = y.sum(axis=1, keep_dims=True)
+    return (x * rec) @ w
+
+
+def kernel_broadcast_row_bias_add(x: AxonArray, y: AxonArray, w: AxonArray) -> AxonArray:
+    bias = y.sum(axis=1, keep_dims=True)
+    bias_b = bias.broadcast_like(x)
+    z = x + bias_b
+    return z @ w
+
+
+def kernel_reduce_mul_broadcast(x: AxonArray, y: AxonArray, w: AxonArray) -> AxonArray:
+    rec = y.sum(axis=1, keep_dims=True)
+    z = x * rec
+    z_b = z.broadcast_like(x)
+    return z_b @ w
+
+
+def kernel_reduce_broadcast_mul(x: AxonArray, y: AxonArray, w: AxonArray) -> AxonArray:
+    rec = y.sum(axis=1, keep_dims=True)
+    rec_b = rec.broadcast_like(x)
+    z = x * rec_b
+    return z @ w
+
+
+def kernel_rmsnorm_matmul(x: AxonArray, y: AxonArray, w: AxonArray) -> AxonArray:
+    yy = y * y
+    rec = yy.sum(axis=1, keep_dims=True)
+    rms = rec.sqrt()
+    norm = x / rms
+    return norm @ w
+  
+
+def kernel_softmax_matmul(x: AxonArray, w: AxonArray) -> AxonArray:
+    ex = x.exp()
+    den = ex.sum(axis=1, keep_dims=True)
+    probs = ex / den
+    return probs @ w
+
+
+def kernel_transpose_matmul(x: AxonArray, w: AxonArray) -> AxonArray:
+    xt = x.transpose()
+    return xt @ w
+
+
+def kernel_relu_matmul(x: AxonArray, w: AxonArray) -> AxonArray:
+    return x.relu() @ w
+
+
+def kernel_silu_matmul(x: AxonArray, w: AxonArray) -> AxonArray:
+    return x.silu() @ w
+
+
+def _base_inputs(M: int, K: int, N: int) -> list[Node]:
+    return [
+        Node(id="x", op="input", inputs=[], attrs={"shape": (M, K)}),
+        Node(id="y", op="input", inputs=[], attrs={"shape": (M, K)}),
+        Node(id="w", op="input", inputs=[], attrs={"shape": (K, N)}),
+    ]
+
+
+def build_kernel_matmul_red_div_graph(M: int, K: int, N: int) -> nuGraph:
+    _ = kernel_matmul_red_div(AxonArray("x", (M, K)), AxonArray("y", (M, K)), AxonArray("w", (K, N)))
+    G = nuGraph(_base_inputs(M, K, N) + [
+        Node(id="rec", op="reduce_sum", inputs=["y"], attrs={"axis": 1, "keep_dims": True}),
+        Node(id="scale", op="div", inputs=["x", "rec"], attrs={}),
+        Node(id="out", op="matmul", inputs=["scale", "w"], attrs={}),
+    ])
+    #annotate_shapes_concrete(G)
+    return G
+
+
+def build_kernel_matmul_red_mul_graph(M: int, K: int, N: int) -> nuGraph:
+    _ = kernel_matmul_red_mul(AxonArray("x", (M, K)), AxonArray("y", (M, K)), AxonArray("w", (K, N)))
+    G = nuGraph(_base_inputs(M, K, N) + [
+        Node(id="rec", op="reduce_sum", inputs=["y"], attrs={"axis": 1, "keep_dims": True}),
+        Node(id="scale", op="mul", inputs=["x", "rec"], attrs={}),
+        Node(id="out", op="matmul", inputs=["scale", "w"], attrs={}),
+    ])
+    #annotate_shapes_concrete(G)
+    return G
+
+
+def build_kernel_broadcast_row_bias_add_graph(M: int, K: int, N: int) -> nuGraph:
+    _ = kernel_broadcast_row_bias_add(AxonArray("x", (M, K)), AxonArray("y", (M, K)), AxonArray("w", (K, N)))
+    G = nuGraph(_base_inputs(M, K, N) + [
+        Node(id="bias", op="reduce_sum", inputs=["y"], attrs={"axis": 1, "keep_dims": True}),
+        Node(id="bias_b", op="broadcast", inputs=["bias", "x"], attrs={}),
+        Node(id="z", op="add", inputs=["x", "bias_b"], attrs={}),
+        Node(id="out", op="matmul", inputs=["z", "w"], attrs={}),
+    ])
+    #annotate_shapes_concrete(G)
+    return G
+
+
+def build_kernel_reduce_mul_broadcast_graph(M: int, K: int, N: int) -> nuGraph:
+    _ = kernel_reduce_mul_broadcast(AxonArray("x", (M, K)), AxonArray("y", (M, K)), AxonArray("w", (K, N)))
+    G = nuGraph(_base_inputs(M, K, N) + [
+        Node(id="rec", op="reduce_sum", inputs=["y"], attrs={"axis": 1, "keep_dims": True}),
+        Node(id="z", op="mul", inputs=["x", "rec"], attrs={}),
+        Node(id="z_b", op="broadcast", inputs=["z", "x"], attrs={}),
+        Node(id="out", op="matmul", inputs=["z_b", "w"], attrs={}),
+    ])
+    #annotate_shapes_concrete(G)
+    return G
+
+
+def build_kernel_reduce_broadcast_mul_graph(M: int, K: int, N: int) -> nuGraph:
+    _ = kernel_reduce_broadcast_mul(AxonArray("x", (M, K)), AxonArray("y", (M, K)), AxonArray("w", (K, N)))
+    G = nuGraph(_base_inputs(M, K, N) + [
+        Node(id="rec", op="reduce_sum", inputs=["y"], attrs={"axis": 1, "keep_dims": True}),
+        Node(id="rec_b", op="broadcast", inputs=["rec", "x"], attrs={}),
+        Node(id="z", op="mul", inputs=["x", "rec_b"], attrs={}),
+        Node(id="out", op="matmul", inputs=["z", "w"], attrs={}),
+    ])
+    #annotate_shapes_concrete(G)
+    return G
+
+
+def build_kernel_rmsnorm_matmul_graph(M: int, K: int, N: int) -> nuGraph:
+    _ = kernel_rmsnorm_matmul(
+        AxonArray("x", (M, K)),
+        AxonArray("y", (M, K)),
+        AxonArray("w", (K, N)),
+    )
+    nodes = _base_inputs(M, K, N) + [
+        Node(id="yy", op="mul", inputs=["y", "y"], attrs={}),
+        Node(id="rec", op="reduce_sum", inputs=["yy"], attrs={"axis": 1, "keep_dims": True}),
+        Node(id="rms", op="sqrt", inputs=["rec"], attrs={}),
+        Node(id="norm", op="div", inputs=["x", "rms"], attrs={}),
+        Node(id="out", op="matmul", inputs=["norm", "w"], attrs={}),
+    ]
+    G = nuGraph(nodes)
+    #annotate_shapes_concrete(G)
+    return G
+
+
+def build_kernel_softmax_matmul_graph(M: int, K: int, N: int) -> nuGraph:
+    _ = kernel_softmax_matmul(
+        AxonArray("x", (M, K)),
+        AxonArray("w", (K, N)),
+    )
+    nodes = [
+        Node(id="x", op="input", inputs=[], attrs={"shape": (M, K)}),
+        Node(id="w", op="input", inputs=[], attrs={"shape": (K, N)}),
+        Node(id="ex", op="exp", inputs=["x"], attrs={}),                                       # (M,K)
+        Node(id="den", op="reduce_sum", inputs=["ex"], attrs={"axis": 1, "keep_dims": True}),  # (M,1)
+        Node(id="probs", op="div", inputs=["ex", "den"], attrs={}),                             # (M,K)
+        Node(id="out", op="matmul", inputs=["probs", "w"], attrs={}),                           # (M,N)
+    ]
+    G = nuGraph(nodes)
+    #annotate_shapes_concrete(G)
+    return G
+
+
+def build_kernel_transpose_matmul_graph(M: int, K: int, N: int) -> nuGraph:
+    _ = kernel_transpose_matmul(
+        AxonArray("x", (M, K)),
+        AxonArray("w", (M, N)),
+    )
+    nodes = [
+        Node(id="x", op="input", inputs=[], attrs={"shape": (M, K)}),
+        Node(id="w", op="input", inputs=[], attrs={"shape": (M, N)}),
+        Node(id="xt", op="transpose", inputs=["x"], attrs={}),       # (K,M)
+        Node(id="out", op="matmul", inputs=["xt", "w"], attrs={}),   # (K,N)
+    ]
+    G = nuGraph(nodes)
+    #annotate_shapes_concrete(G)
+    return G
+
+
+def build_kernel_relu_matmul_graph(M: int, K: int, N: int) -> nuGraph:
+    _ = kernel_relu_matmul(AxonArray("x", (M, K)), AxonArray("w", (K, N)))
+    G = nuGraph([
+        Node(id="x", op="input", inputs=[], attrs={"shape": (M, K)}),
+        Node(id="w", op="input", inputs=[], attrs={"shape": (K, N)}),
+        Node(id="z", op="relu", inputs=["x"], attrs={}),
+        Node(id="out", op="matmul", inputs=["z", "w"], attrs={}),
+    ])
+    #annotate_shapes_concrete(G)
+    return G
+
+def build_kernel_silu_matmul_graph(M: int, K: int, N: int) -> nuGraph:
+    _ = kernel_silu_matmul(AxonArray("x", (M, K)), AxonArray("w", (K, N)))
+    G = nuGraph([
+        Node(id="x", op="input", inputs=[], attrs={"shape": (M, K)}),
+        Node(id="w", op="input", inputs=[], attrs={"shape": (K, N)}),
+        Node(id="z", op="silu", inputs=["x"], attrs={}),
+        Node(id="out", op="matmul", inputs=["z", "w"], attrs={}),
+    ])
+    #annotate_shapes_concrete(G)
+    return G
+
+
+def print_graph(G: nuGraph) -> None:
+    for i, n in enumerate(G.nodes):
+        print(f"[{i}] id={n.id:12s} op={n.op:10s} inputs={n.inputs} shape={n.shape} attrs={n.attrs}")
+
+
+def _variants_for(builder: Callable[[int, int, int], nuGraph], M: int = 4, K: int = 8, N: int = 16) -> list[nuGraph]:
+    G0 = builder(M, K, N)
+    return nu_graph_generation_z3(G0, verbose=False)
+
+
+def _test_expected_variant_counts() -> None:
+    cases: list[tuple[str, Callable[[int, int, int], nuGraph], int]] = [
+        ("kernel_matmul_red_div", build_kernel_matmul_red_div_graph, 1),
+        ("kernel_matmul_red_mul", build_kernel_matmul_red_mul_graph, 1),
+        ("kernel_broadcast_row_bias_add", build_kernel_broadcast_row_bias_add_graph, 1),
+        ("kernel_reduce_mul_broadcast", build_kernel_reduce_mul_broadcast_graph, 1),
+        ("kernel_reduce_broadcast_mul", build_kernel_reduce_broadcast_mul_graph, 1),
+    ]
+
+    for name, builder, expected_min in cases:
+        vs = _variants_for(builder)
+        got = len(vs)
+        assert got >= expected_min, f"{name}: expected >= {expected_min} variants, got {got}"
+        print(f" {name}: variants={got} (expected >= {expected_min})")
+
+
+def _test_no_illegal_reduce_broadcast_swap() -> None:
+    G = build_kernel_reduce_broadcast_mul_graph(4, 8, 16)
+    rec = next(n for n in G.nodes if n.id == "rec")
+    rec_b = next(n for n in G.nodes if n.id == "rec_b")
+    ok = z3_equivalent_order(rec, rec_b, G, verbose=False)
+    assert not ok, "reduce_sum <-> broadcast must be rejected"
+    print(" reduce_sum<->broadcast illegal swap rejected")
+
+
+def _test_no_illegal_reduce_sqrt_swap() -> None:
+    G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
+    rec = next(n for n in G.nodes if n.id == "rec")
+    rms = next(n for n in G.nodes if n.id == "rms")
+    ok = z3_equivalent_order(rec, rms, G, verbose=False)
+    assert not ok, "reduce_sum <-> sqrt must be rejected by axioms"
+    print(" reduce_sum<->sqrt illegal swap rejected (axiomatic)")
+
+
+def _test_rmsnorm_matmul_graph() -> None:
+    G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
+
+    yy = next(n for n in G.nodes if n.id == "yy")
+    rec = next(n for n in G.nodes if n.id == "rec")
+    rms = next(n for n in G.nodes if n.id == "rms")
+    norm = next(n for n in G.nodes if n.id == "norm")
+    out = next(n for n in G.nodes if n.id == "out")
+
+    assert yy.shape == (4, 8), f"yy shape wrong: {yy.shape}"
+    assert rec.shape == (4, 1), f"rec shape wrong: {rec.shape}"
+    assert rms.shape == (4, 1), f"rms shape wrong: {rms.shape}"
+    assert norm.shape == (4, 8), f"norm shape wrong: {norm.shape}"
+    assert out.shape == (4, 16), f"out shape wrong: {out.shape}"
+
+    variants = nu_graph_generation_z3(G, verbose=False)
+    assert len(variants) >= 1, "rmsnorm_matmul should emit at least org variant"
+    print(" rmsnorm_matmul (+sqrt) graph builds and runs variant generation")
+
+
+def _test_softmax_matmul_graph() -> None:
+    G = build_kernel_softmax_matmul_graph(4, 8, 16)
+    ex = next(n for n in G.nodes if n.id == "ex")
+    den = next(n for n in G.nodes if n.id == "den")
+    probs = next(n for n in G.nodes if n.id == "probs")
+    out = next(n for n in G.nodes if n.id == "out")
+
+    assert ex.shape == (4, 8), f"ex shape wrong: {ex.shape}"
+    assert den.shape == (4, 1), f"den shape wrong: {den.shape}"
+    assert probs.shape == (4, 8), f"probs shape wrong: {probs.shape}"
+    assert out.shape == (4, 16), f"out shape wrong: {out.shape}"
+
+    variants = nu_graph_generation_z3(G, verbose=False)
+    assert len(variants) >= 1, "softmax_matmul should emit at least org variant"
+    print(" softmax_matmul graph builds and runs variant generation")
+
+
+def _test_transpose_matmul_graph() -> None:
+    G = build_kernel_transpose_matmul_graph(4, 8, 16)
+    xt = next(n for n in G.nodes if n.id == "xt")
+    out = next(n for n in G.nodes if n.id == "out")
+
+    assert xt.shape == (8, 4), f"xt shape wrong: {xt.shape}"
+    assert out.shape == (8, 16), f"out shape wrong: {out.shape}"
+
+    variants = nu_graph_generation_z3(G, verbose=False)
+    assert len(variants) >= 1, "transpose_matmul should emit at least org variant"
+    print(" transpose_matmul graph builds and runs variant generation")
+
+
+def _test_relu_matmul_graph() -> None:
+    G = build_kernel_relu_matmul_graph(4, 8, 16)
+    z = next(n for n in G.nodes if n.id == "z")
+    out = next(n for n in G.nodes if n.id == "out")
+    assert z.shape == (4, 8)
+    assert out.shape == (4, 16)
+    assert len(nu_graph_generation_z3(G, verbose=False)) >= 1
+
+def _test_silu_matmul_graph() -> None:
+    G = build_kernel_silu_matmul_graph(4, 8, 16)
+    z = next(n for n in G.nodes if n.id == "z")
+    out = next(n for n in G.nodes if n.id == "out")
+    assert z.shape == (4, 8)
+    assert out.shape == (4, 16)
+    assert len(nu_graph_generation_z3(G, verbose=False)) >= 1
+
+
+def run_all_tests() -> None:
+    print("\n================ RUNNING NU-GRAPH TESTS ================")
+    _test_compositional_shape_equivalence()
+    # _test_expected_variant_counts()
+    # _test_no_illegal_reduce_broadcast_swap()
+    # _test_no_illegal_reduce_sqrt_swap()
+    # _test_rmsnorm_matmul_graph()
+    # _test_softmax_matmul_graph()
+    # _test_transpose_matmul_graph()
+    _test_relu_matmul_graph()
+    _test_silu_matmul_graph()
+    print("=============== ALL TESTS PASSED  =====================\n")
+
+
+if __name__ == "__main__":
+    #run_all_tests()
+
+    kernels: list[tuple[str, Callable[[int, int, int], nuGraph]]] = [
+        ("kernel_matmul_red_div", build_kernel_matmul_red_div_graph),
+        ("kernel_matmul_red_mul", build_kernel_matmul_red_mul_graph),
+        # ("kernel_broadcast_row_bias_add", build_kernel_broadcast_row_bias_add_graph),
+        # ("kernel_reduce_mul_broadcast", build_kernel_reduce_mul_broadcast_graph),
+        # ("kernel_reduce_broadcast_mul", build_kernel_reduce_broadcast_mul_graph),
+        # ("kernel_rmsnorm_matmul", build_kernel_rmsnorm_matmul_graph),
+        # ("kernel_softmax_matmul", build_kernel_softmax_matmul_graph),
+        # ("kernel_transpose_matmul", build_kernel_transpose_matmul_graph),
+        # ("kernel_relu_matmul", build_kernel_relu_matmul_graph),
+        # ("kernel_silu_matmul", build_kernel_silu_matmul_graph),
+    ]
+
+    for kname, builder in kernels:
+        print("\n" + "=" * 80)
+        print(f"Tracing kernel: {kname}")
+        print("=" * 80)
+        G0 = builder(4, 8, 16)
+        variants = nu_graph_generation_z3(G0, verbose=True)
+
+        print(f"Found {len(variants)} variant(s) for {kname}\n")
+        for vi, gv in enumerate(variants):
+            print(f"=== {kname} :: Variant {vi} ===")
+            print_graph(gv)
+            print()
