@@ -3,7 +3,7 @@ from __future__ import annotations
 import builtins
 from dataclasses import dataclass, field
 from enum import Enum
-from itertools import combinations
+from itertools import combinations, permutations
 from threading import Lock
 from typing import Any, Callable, Optional, List
 
@@ -3002,6 +3002,16 @@ def _effective_input_ids(G: nuGraph, pos: int) -> list[str]:
     return list(dict.fromkeys(G.node_at(pos).inputs))
 
 
+def _fresh_graph_node_id(G: nuGraph, base: str) -> str:
+    existing = {n.id for n in G.nodes}
+    if base not in existing:
+        return base
+    idx = 1
+    while f"{base}_{idx}" in existing:
+        idx += 1
+    return f"{base}_{idx}"
+
+
 def _graph_output_nodes(G: nuGraph) -> list[Node]:
     used = {inp for n in G.nodes for inp in n.inputs}
     return [n for n in G.nodes if n.id not in used]
@@ -3084,43 +3094,98 @@ def _graphs_equivalent_symbolically(
     return True
 
 
+def _swap_composition_tensor(G: nuGraph, result_id: str) -> Optional[SymTensor]:
+    tensors = _graph_symbolic_tensors(G)
+    return tensors.get(result_id)
+
+
+def _swap_with_successor_variants(
+    G_cur: nuGraph, pos: int, succ_pos: int, clone_inputs: set[str]
+) -> list[tuple[nuGraph, int]]:
+    op1 = G_cur.node_at(pos)
+    op2 = G_cur.node_at(succ_pos)
+    if pos >= succ_pos:
+        return []
+    if not clone_inputs:
+        return []
+    if not clone_inputs.issubset(set(op1.inputs)):
+        return []
+    if len(G_cur.successors(op1)) != 1:
+        return []
+
+    consumed_positions = [i for i, input_id in enumerate(op2.inputs) if input_id == op1.id]
+    if len(consumed_positions) != 1:
+        return []
+    consumed_pos = consumed_positions[0]
+
+    selected_positions = [i for i, input_id in enumerate(op1.inputs) if input_id in clone_inputs]
+    if not selected_positions:
+        return []
+
+    selected_input_ids = [op1.inputs[i] for i in selected_positions]
+    candidate_inputs: list[list[str]] = []
+    seen_inputs: set[tuple[str, ...]] = set()
+    for perm in permutations(selected_input_ids):
+        rebuilt_inputs = list(op1.inputs)
+        for idx, permuted_input_id in zip(selected_positions, perm):
+            rebuilt_inputs[idx] = permuted_input_id
+        key = tuple(rebuilt_inputs)
+        if key not in seen_inputs:
+            seen_inputs.add(key)
+            candidate_inputs.append(rebuilt_inputs)
+
+    out: list[tuple[nuGraph, int]] = []
+    seen_graphs: set[str] = set()
+    for rebuilt_inputs in candidate_inputs:
+        base_graph = G_cur.clone()
+        op1_new = _node_by_id(base_graph, op1.id)
+        op2_old = _node_by_id(base_graph, op2.id)
+        if op1_new is None or op2_old is None:
+            continue
+
+        clone_nodes: list[Node] = []
+        clone_output_ids: dict[str, str] = {}
+        ordered_clone_inputs = [input_id for input_id in op1.inputs if input_id in clone_inputs]
+        for input_id in ordered_clone_inputs:
+            clone_id = _fresh_graph_node_id(base_graph, f"{op2.id}_via_{input_id}")
+            clone_node = Node(clone_id, op2_old.op, list(op2_old.inputs), dict(op2_old.attrs), None)
+            clone_node.inputs[consumed_pos] = input_id
+            clone_nodes.append(clone_node)
+            clone_output_ids[input_id] = clone_id
+            base_graph.nodes.append(clone_node)
+
+        rebuilt_node = Node(op2.id, op1.op, list(rebuilt_inputs), dict(op1.attrs), None)
+        rebuilt_node.inputs = [clone_output_ids.get(input_id, input_id) for input_id in rebuilt_node.inputs]
+
+        new_nodes: list[Node] = []
+        for idx, node in enumerate(G_cur.nodes):
+            if idx == succ_pos:
+                new_nodes.extend(Node(n.id, n.op, list(n.inputs), dict(n.attrs), n.shape) for n in clone_nodes)
+                new_nodes.append(rebuilt_node)
+                continue
+            if idx == pos:
+                continue
+            copied = Node(node.id, node.op, list(node.inputs), dict(node.attrs), node.shape)
+            new_nodes.append(copied)
+
+        G_new = annotate_shapes_concrete(nuGraph(new_nodes))
+        new_pos = _position_by_id(G_new, op2.id)
+        if new_pos is None:
+            continue
+        sig = graph_signature(G_new)
+        if sig in seen_graphs:
+            continue
+        seen_graphs.add(sig)
+        out.append((G_new, new_pos))
+
+    return out
+
+
 def _swap_with_successor(
     G_cur: nuGraph, pos: int, succ_pos: int, clone_inputs: set[str]
 ) -> Optional[tuple[nuGraph, int]]:
-    op1 = G_cur.node_at(pos)
-    op2 = G_cur.node_at(succ_pos)
-    if op1.op not in {"mul", "div"} or op2.op != "matmul":
-        return None
-    if len(op1.inputs) != 2 or len(op2.inputs) != 2 or op2.inputs[0] != op1.id:
-        return None
-    if len(G_cur.successors(op1)) != 1:
-        return None
-    # This local rewrite only supports cloning the pointwise op's primary data input:
-    # the first operand is the value stream that can feed the rewritten matmul,
-    # while the second operand remains outside the matrix-multiplication reduction
-    # and is re-applied afterward.
-    if clone_inputs != {op1.inputs[0]}:
-        return None
-
-    G_new = G_cur.clone()
-    n1 = _node_by_id(G_new, op1.id)
-    n2 = _node_by_id(G_new, op2.id)
-    if n1 is None or n2 is None:
-        return None
-
-    data_id, scale_id = n1.inputs
-    w_id = n2.inputs[1]
-    n1.op = "matmul"
-    n1.inputs = [data_id, w_id]
-    n1.attrs = {}
-    n2.op = op1.op
-    n2.inputs = [n1.id, scale_id]
-    n2.attrs = dict(op1.attrs)
-    annotate_shapes_concrete(G_new)
-    new_pos = _position_by_id(G_new, n2.id)
-    if new_pos is None:
-        return None
-    return G_new, new_pos
+    variants = _swap_with_successor_variants(G_cur, pos, succ_pos, clone_inputs)
+    return variants[0] if variants else None
 
 
 def z3_equivalent_order(
@@ -3128,12 +3193,16 @@ def z3_equivalent_order(
 ) -> bool:
     if G_new is None:
         return False
-    return _graphs_equivalent_symbolically(
-        G_cur,
-        G_new,
+    lhs = _swap_composition_tensor(G_cur, op2.id)
+    rhs = _swap_composition_tensor(G_new, op2.id)
+    if lhs is None or rhs is None:
+        return False
+    return check_equivalent(
+        lhs,
+        rhs,
         timeout=10000,
-        verbose=verbose,
         rule_name=f"swap_{op1.id}_{op2.id}",
+        verbose=verbose,
     )
 
 
@@ -3176,17 +3245,16 @@ def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
                         continue
                     for k in range(1, len(inputs) + 1):
                         for subset in combinations(inputs, k):
-                            swapped = _swap_with_successor(G_cur, pos, succ_pos, set(subset))
-                            if swapped is None:
-                                continue
-                            G_new, p_new = swapped
-                            if not z3_equivalent_order(op1, op2, G_cur, G_new, verbose=verbose):
-                                continue
-                            M_next.add(G_new)
-                            worklist.append((G_new, p_new))
-                            found_valid_swap = True
-                            accepted = True
-                            break
+                            for G_new, p_new in _swap_with_successor_variants(G_cur, pos, succ_pos, set(subset)):
+                                if not z3_equivalent_order(op1, op2, G_cur, G_new, verbose=verbose):
+                                    continue
+                                M_next.add(G_new)
+                                worklist.append((G_new, p_new))
+                                found_valid_swap = True
+                                accepted = True
+                                break
+                            if accepted:
+                                break
                         if accepted:
                             break
 
@@ -3254,6 +3322,11 @@ def kernel_softmax_matmul(x: AxonArray, w: AxonArray) -> AxonArray:
 def kernel_transpose_matmul(x: AxonArray, w: AxonArray) -> AxonArray:
     xt = x.transpose()
     return xt @ w
+
+
+def kernel_matmul_transpose(x: AxonArray, w: AxonArray) -> AxonArray:
+    z = x @ w
+    return z.transpose()
 
 
 def kernel_relu_matmul(x: AxonArray, w: AxonArray) -> AxonArray:
@@ -3382,6 +3455,22 @@ def build_kernel_transpose_matmul_graph(M: int, K: int, N: int) -> nuGraph:
     return G
 
 
+def build_kernel_matmul_transpose_graph(M: int, K: int, N: int) -> nuGraph:
+    _ = kernel_matmul_transpose(
+        AxonArray("x", (M, K)),
+        AxonArray("w", (K, N)),
+    )
+    nodes = [
+        Node(id="x", op="input", inputs=[], attrs={"shape": (M, K)}),
+        Node(id="w", op="input", inputs=[], attrs={"shape": (K, N)}),
+        Node(id="mm", op="matmul", inputs=["x", "w"], attrs={}),
+        Node(id="out", op="transpose", inputs=["mm"], attrs={}),
+    ]
+    G = nuGraph(nodes)
+    annotate_shapes_concrete(G)
+    return G
+
+
 def build_kernel_relu_matmul_graph(M: int, K: int, N: int) -> nuGraph:
     _ = kernel_relu_matmul(AxonArray("x", (M, K)), AxonArray("w", (K, N)))
     G = nuGraph([
@@ -3499,6 +3588,19 @@ def _test_transpose_matmul_graph() -> None:
     print(" transpose_matmul graph builds and runs variant generation")
 
 
+def _test_matmul_transpose_graph() -> None:
+    G = build_kernel_matmul_transpose_graph(4, 8, 16)
+    mm = next(n for n in G.nodes if n.id == "mm")
+    out = next(n for n in G.nodes if n.id == "out")
+
+    assert mm.shape == (4, 16), f"mm shape wrong: {mm.shape}"
+    assert out.shape == (16, 4), f"out shape wrong: {out.shape}"
+
+    variants = nu_graph_generation_z3(G, verbose=False)
+    assert len(variants) >= 2, "matmul_transpose should emit a swapped variant"
+    print(" matmul_transpose graph builds and runs variant generation")
+
+
 def _test_relu_matmul_graph() -> None:
     G = build_kernel_relu_matmul_graph(4, 8, 16)
     z = next(n for n in G.nodes if n.id == "z")
@@ -3539,10 +3641,18 @@ def _test_generic_symbolic_swap_equivalence() -> None:
     G = build_kernel_matmul_red_mul_graph(4, 8, 16)
     scale = next(n for n in G.nodes if n.id == "scale")
     out = next(n for n in G.nodes if n.id == "out")
-    swapped = _swap_with_successor(G, G.position(scale), G.position(out), {"x"})
-    assert swapped is not None
-    G_new, _ = swapped
-    assert z3_equivalent_order(scale, out, G, G_new, verbose=False)
+    candidates = _swap_with_successor_variants(G, G.position(scale), G.position(out), {"x"})
+    assert candidates
+    assert any(z3_equivalent_order(scale, out, G, G_new, verbose=False) for G_new, _ in candidates)
+
+
+def _test_transpose_matmul_swap_equivalence() -> None:
+    G = build_kernel_matmul_transpose_graph(4, 8, 16)
+    mm = next(n for n in G.nodes if n.id == "mm")
+    out = next(n for n in G.nodes if n.id == "out")
+    candidates = _swap_with_successor_variants(G, G.position(mm), G.position(out), {"x", "w"})
+    assert candidates
+    assert any(z3_equivalent_order(mm, out, G, G_new, verbose=False) for G_new, _ in candidates)
 
 
 def _test_generic_symbolic_non_equivalence() -> None:
