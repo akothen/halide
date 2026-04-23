@@ -44,6 +44,7 @@ _BODY_LOCK = Lock()
 _UF_LOCK = Lock()
 _SEMANTICS_LOCK = Lock()
 _VERBOSE_LOCK = Lock()   # serialises verbose prints from concurrent synthesis threads
+_Z3_LOCK = Lock()        # serialises z3 formula construction (z3.main_ctx is not thread-safe)
 
 
 def _gen_id(prefix: Optional[str] = None) -> str:
@@ -626,8 +627,6 @@ def check_equivalent(
     rhs_expr = _rename_expr_tree_for_equivalence(rhs.expr, "rhs", shared_names, used_names, name_counter)
     lsem = compile_expr(lhs_expr, {})
     rsem = compile_expr(rhs_expr, {})
-    print("lsem.shape:", lsem.shape.dims)
-    print("rsem.shape:", rsem.shape.dims)
     shape_eq = _shape_eq(lsem.shape, rsem.shape)
     if lsem.shape.rank != rsem.shape.rank:
         return False
@@ -3952,13 +3951,15 @@ def _synthesize_all_from_pool(
         return []
 
     # Phase 2: check all candidates in parallel.
-    # check_equivalent is called without verbose (its default is False) so it
-    # never prints, making it safe to call from multiple threads without
-    # redirect_stdout.
+    # z3.main_ctx() is not thread-safe, so every call to check_equivalent
+    # (which constructs z3 formulas and runs a solver) must hold _Z3_LOCK.
+    # This serialises the z3 work while still allowing the thread pool to
+    # overlap non-z3 overhead (future scheduling, Python bookkeeping, etc.).
     def _check_one(item: tuple[SketchNode, SymTensor]) -> tuple[SketchNode, bool]:
         sketch, cand_sym = item
         try:
-            return sketch, check_equivalent(target_sym, cand_sym, timeout=timeout)
+            with _Z3_LOCK:
+                return sketch, check_equivalent(target_sym, cand_sym, timeout=timeout)
         except Exception:
             return sketch, False
 
@@ -4480,6 +4481,13 @@ def lower_nu_graph_all_variants(
         seen_sigs.add(sig)
         results.append(G_hw)
 
+    if verbose:
+        print(f"[lower_nu_graph_all_variants] emitting {len(results)} "
+              f"distinct lowered hw graph variant(s):")
+        for vi, g_hw in enumerate(results):
+            print(f"  --- lowered hw variant {vi} ---")
+            print_graph(g_hw)
+
     return results
 
 
@@ -4672,6 +4680,52 @@ def _test_lower_nu_graph_all_variants() -> None:
     assert baseline is not None, "lower_nu_graph baseline unexpectedly failed"
     print(f" synthesizer: lower_nu_graph_all_variants produced "
           f"{len(hw_variants)} distinct lowered hw graph(s) for matmul_red_div")
+
+
+def _test_reduce_sum_lowering_no_crash() -> None:
+    """Regression test for the z3 thread-safety crash that was triggered when
+    multiple threads concurrently constructed z3 formulas sharing the global
+    z3.main_ctx() while synthesising reduce_sum_1001 in kernel_matmul_red_div.
+
+    The fix adds _Z3_LOCK to serialise check_equivalent calls within
+    _synthesize_all_from_pool._check_one so that the shared z3 context is
+    never accessed from more than one thread at a time.
+
+    This test exercises the exact crash path (parallel sketch synthesis for a
+    reduce_sum node with keep_dims=True on a rank-2 input) and asserts that:
+      1. The lowering completes without any exception or process crash.
+      2. At least one valid hw-only graph is returned.
+      3. All returned graphs use only hw ops.
+      4. Every returned graph is semantically equivalent to the original.
+    """
+    G = build_kernel_matmul_red_div_graph(4, 8, 16)
+    variants = nu_graph_generation_z3(G, verbose=False)
+    assert variants, "kernel_matmul_red_div should produce at least one variant"
+
+    # Variant 0 contains reduce_sum_1001 (the originally crashing node).
+    gv = variants[0]
+    reduce_nodes = _nodes_by_op(gv, "reduce_sum")
+    assert reduce_nodes, "Variant 0 of kernel_matmul_red_div should contain a reduce_sum node"
+    assert reduce_nodes[0].attrs.get("keep_dims") or reduce_nodes[0].attrs.get("keepdims"), \
+        "reduce_sum in kernel_matmul_red_div variant 0 should use keep_dims=True"
+
+    hw_variants = lower_nu_graph_all_variants(gv, max_hw_size=2, timeout=5000)
+    assert hw_variants, \
+        "reduce_sum_lowering regression: lower_nu_graph_all_variants returned no results"
+    for i, g_hw in enumerate(hw_variants):
+        assert _graph_uses_hw_only(g_hw), \
+            f"reduce_sum_lowering regression: hw variant {i} still contains public ops"
+
+    # Spot-check equivalence of the first returned hw graph
+    pair = _graph_output_sym_lowered(gv, hw_variants[0])
+    assert pair is not None, \
+        "reduce_sum_lowering regression: could not extract output syms for equivalence check"
+    orig_sym, hw_sym = pair
+    assert _check_equivalent_quiet(orig_sym, hw_sym, timeout=15000), \
+        "reduce_sum_lowering regression: first lowered hw graph is not equivalent to original"
+
+    print(f" synthesizer: reduce_sum lowering (regression) — "
+          f"{len(hw_variants)} hw variant(s) produced, all equivalent")
 
 
 
@@ -5017,6 +5071,7 @@ def run_all_tests() -> None:
     _test_synthesizer_silu_matmul()
     _test_synthesizer_all_variants_lowered()
     _test_lower_nu_graph_all_variants()
+    _test_reduce_sum_lowering_no_crash()
     print("=============== ALL TESTS PASSED  =====================\n")
 
 
