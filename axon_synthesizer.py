@@ -528,6 +528,12 @@ def compile_expr(expr: SymExpr, cache: dict[int, Semantics]) -> Semantics:
 
 
 def _rename_expr_tree(expr: SymExpr, suffix: str, cache: Optional[dict[int, SymExpr]] = None) -> SymExpr:
+    """Clone an expression tree while suffixing non-input node names.
+
+    Inputs intentionally keep their original names so both sides of an
+    equivalence check still refer to the same symbolic parameters. The cache
+    preserves DAG sharing when the same sub-expression is visited repeatedly.
+    """
     cache = {} if cache is None else cache
     key = id(expr)
     if key in cache:
