@@ -334,6 +334,7 @@ def _operand_to_expr(op: Any) -> Any:
 
 
 def _safe_divide(lhs: z3.ArithRef, rhs: z3.ArithRef) -> z3.ArithRef:
+    """Use the file-wide reciprocal convention: division by zero yields 0."""
     return z3.If(rhs == 0, z3.RealVal(0), lhs / rhs)
 
 
@@ -477,7 +478,11 @@ def reduction_extensionality_context() -> Context:
 
 
 def reduction_comparison_context(lhs: Semantics, rhs: Semantics) -> Context:
-    """Kept for API compatibility; reduction equality now comes from body proofs."""
+    """Kept for API compatibility; reduction equality now comes from body proofs.
+
+    Callers should use `_check_reduction_equivalent_by_body` for actual
+    reduction comparison instead of relying on extra comparison context.
+    """
     return Context()
 
 
@@ -563,31 +568,6 @@ def compile_expr(expr: SymExpr, cache: dict[int, Semantics]) -> Semantics:
     sem.ctx = sem.ctx.merged(shape_res.ctx, singleton_dimension_extensionality(sem))
     cache[key] = sem
     return sem
-
-
-def _rename_expr_tree(expr: SymExpr, suffix: str, cache: Optional[dict[int, SymExpr]] = None) -> SymExpr:
-    """Clone an expression tree while suffixing non-input node names.
-
-    Inputs intentionally keep their original names so both sides of an
-    equivalence check still refer to the same symbolic parameters. The cache
-    preserves DAG sharing when the same sub-expression is visited repeatedly.
-    """
-    cache = {} if cache is None else cache
-    key = id(expr)
-    if key in cache:
-        return cache[key]
-    if expr.op == "input":
-        renamed = SymExpr(expr.op, [], expr.shape, dict(expr.attrs), expr.name)
-    else:
-        renamed = SymExpr(
-            expr.op,
-            [_rename_expr_tree(inp, suffix, cache) for inp in expr.inputs],
-            expr.shape,
-            dict(expr.attrs),
-            f"{expr.name}{suffix}",
-        )
-    cache[key] = renamed
-    return renamed
 
 
 def _expr_structural_key(expr: SymExpr, cache: Optional[dict[int, Any]] = None) -> Any:
@@ -2620,6 +2600,11 @@ def _shape_public_binary(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeRe
 
 def _compile_public_binary(expr: SymExpr, ins: list[Semantics], out_shape: ShapeExpr) -> Semantics:
     def lift_binary_reduction(op_name: Any) -> Optional[ReductionDesc]:
+        """Push a binary mul/div factor into a rank-2 reduction body when legal.
+
+        Returns a new `ReductionDesc` for the lifted reduction body, or `None`
+        when the binary expression is not an axiom-supported reduction element.
+        """
         if len(ins) != 2:
             return None
         opn = _operand_to_expr(op_name)
