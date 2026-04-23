@@ -86,6 +86,11 @@ class Context:
             out.extend(o.facts)
         return out
 
+    def as_formula(self) -> z3.BoolRef:
+        if not self.facts:
+            return z3.BoolVal(True)
+        return z3.And(*self.facts)
+
 
 @dataclass
 class ShapeExpr:
@@ -116,6 +121,12 @@ class Semantics:
     fn: z3.FuncDeclRef
     ctx: Context = field(default_factory=Context)
     reduction: Optional[ReductionDesc] = None
+
+
+@dataclass
+class Precondition:
+    description: str
+    constraint: z3.BoolRef
 
 
 @dataclass
@@ -399,6 +410,180 @@ def _add_reduction_extensionality_axiom(solver: z3.Solver, lhs: Semantics, rhs: 
                 ),
             )
         )
+
+
+_last_check_stats: dict[str, Any] = {}
+
+
+def singleton_dimension_extensionality(sem: Semantics) -> Context:
+    ctx = Context()
+    if sem.shape.rank == 0:
+        return ctx
+    vars = _index_vars(f"{sem.name}_singleton", sem.shape.rank, "s")
+    for axis, dim in enumerate(sem.shape.dims):
+        zero_idx = list(vars)
+        zero_idx[axis] = z3.IntVal(0)
+        ctx.add(z3.ForAll(vars, z3.Implies(dim == 1, sem.fn(*vars) == sem.fn(*zero_idx))))
+    return ctx
+
+
+def _shape_eq(a: ShapeExpr, b: ShapeExpr) -> z3.BoolRef:
+    if a.rank != b.rank:
+        return z3.BoolVal(False)
+    out = z3.BoolVal(True)
+    for da, db in zip(a.dims, b.dims):
+        out = z3.And(out, da == db)
+    return out
+
+
+def reduction_extensionality_context() -> Context:
+    ctx = Context()
+
+    b1 = z3.Int("reduce_ext_b1")
+    b2 = z3.Int("reduce_ext_b2")
+    i = z3.Int("reduce_ext_i")
+    j = z3.Int("reduce_ext_j")
+    k = z3.Int("reduce_ext_k")
+    e1 = z3.Int("reduce_ext_e1")
+    e2 = z3.Int("reduce_ext_e2")
+
+    same_body1 = z3.ForAll([k], BODY1(b1, i, k) == BODY1(b2, i, k))
+    ctx.add(
+        z3.ForAll(
+            [b1, b2, i, e1, e2],
+            z3.Implies(z3.And(e1 == e2, same_body1), REDUCE1(b1, i, e1) == REDUCE1(b2, i, e2)),
+        )
+    )
+
+    same_body2 = z3.ForAll([k], BODY2(b1, i, j, k) == BODY2(b2, i, j, k))
+    ctx.add(
+        z3.ForAll(
+            [b1, b2, i, j, e1, e2],
+            z3.Implies(z3.And(e1 == e2, same_body2), REDUCE2(b1, i, j, e1) == REDUCE2(b2, i, j, e2)),
+        )
+    )
+    return ctx
+
+
+def reduction_comparison_context(lhs: Semantics, rhs: Semantics) -> Context:
+    ctx = Context()
+
+    if lhs.reduction is None or rhs.reduction is None:
+        return ctx
+
+    if lhs.reduction.outer_rank != rhs.reduction.outer_rank:
+        return ctx
+
+    if lhs.reduction.outer_rank == 2:
+        l = lhs.reduction
+        r = rhs.reduction
+        i = z3.Int("cmp2_i")
+        j = z3.Int("cmp2_j")
+        k = z3.Int("cmp2_k")
+        ctx.add(z3.ForAll([i, j, k], BODY2(z3.IntVal(l.body_id), i, j, k) == BODY2(z3.IntVal(r.body_id), i, j, k)))
+        return ctx
+
+    if lhs.reduction.outer_rank == 1:
+        l = lhs.reduction
+        r = rhs.reduction
+        i = z3.Int("cmp1_i")
+        k = z3.Int("cmp1_k")
+        ctx.add(z3.ForAll([i, k], BODY1(z3.IntVal(l.body_id), i, k) == BODY1(z3.IntVal(r.body_id), i, k)))
+        return ctx
+
+    return ctx
+
+
+def compile_expr(expr: SymExpr, cache: dict[int, Semantics]) -> Semantics:
+    key = id(expr)
+    if key in cache:
+        return cache[key]
+
+    if expr.op == "input":
+        shape = ShapeExpr(list(expr.shape))
+        sem = Semantics(
+            name=expr.name,
+            shape=shape,
+            fn=_tensor_function(f"V_{expr.name}", shape.rank),
+            ctx=Context([d > 0 for d in shape.dims]),
+        )
+        sem.ctx = sem.ctx.merged(singleton_dimension_extensionality(sem))
+        cache[key] = sem
+        return sem
+
+    compiled_inputs = [compile_expr(inp, cache) for inp in expr.inputs]
+    input_shapes = [c.shape for c in compiled_inputs]
+    if expr.op not in _SEMANTICS:
+        raise KeyError(f"No semantics registered for op '{expr.op}'")
+    shape_rule, compile_rule = _SEMANTICS[expr.op]
+    if shape_rule is None or compile_rule is None:
+        raise KeyError(f"Incomplete semantics registered for op '{expr.op}'")
+    shape_res = shape_rule(input_shapes, expr.attrs)
+    sem = compile_rule(expr, compiled_inputs, shape_res.out)
+    sem.ctx = sem.ctx.merged(shape_res.ctx, singleton_dimension_extensionality(sem))
+    cache[key] = sem
+    return sem
+
+
+def check_equivalent(
+    lhs: SymTensor,
+    rhs: SymTensor,
+    timeout: int = 10000,
+    preconditions: Optional[list[Precondition]] = None,
+    rule_name: Optional[str] = None,
+    verbose: bool = False,
+) -> bool:
+    lsem = compile_expr(lhs.expr, {})
+    rsem = compile_expr(rhs.expr, {})
+
+    shape_eq = _shape_eq(lsem.shape, rsem.shape)
+
+    if lsem.shape.rank != rsem.shape.rank:
+        val_eq = z3.BoolVal(False)
+    else:
+        rank = lsem.shape.rank
+        if rank == 0:
+            val_eq = lsem.fn() == rsem.fn()
+        else:
+            vars = [z3.Int(f"q_{idx}") for idx in range(rank)]
+            bounds = z3.And(*[z3.And(vars[i] >= 0, vars[i] < lsem.shape.dims[i]) for i in range(rank)])
+            val_eq = z3.ForAll(vars, z3.Implies(bounds, lsem.fn(*vars) == rsem.fn(*vars)))
+
+    preconditions = preconditions or []
+    extra_ctx = Context([p.constraint for p in preconditions])
+    full_ctx = lsem.ctx.merged(
+        rsem.ctx,
+        reduction_extensionality_context(),
+        reduction_comparison_context(lsem, rsem),
+        extra_ctx,
+    )
+    theorem = z3.Implies(full_ctx.as_formula(), z3.And(shape_eq, val_eq))
+
+    solver = z3.Solver()
+    z3.set_option(proof=True)
+    solver.set("timeout", timeout)
+    solver.add(z3.Not(theorem))
+    res = solver.check()
+    ok = res == z3.unsat
+
+    _last_check_stats.clear()
+    _last_check_stats["num_obligations"] = len(full_ctx.facts)
+    _last_check_stats["failure_reason"] = "" if ok else str(res)
+
+    if verbose:
+        print("result:", res, "proved:", ok)
+        print("lhs rank:", lhs.rank, "rhs rank:", rhs.rank)
+        print("lhs shape expr:", lsem.shape.dims)
+        print("rhs shape expr:", rsem.shape.dims)
+        print("lhs facts:", len(lsem.ctx.facts), "rhs facts:", len(rsem.ctx.facts))
+        print("lhs reduction rank:", None if lsem.reduction is None else lsem.reduction.outer_rank)
+        print("rhs reduction rank:", None if rsem.reduction is None else rsem.reduction.outer_rank)
+        if preconditions:
+            print("preconditions:")
+            for p in preconditions:
+                print("-", p.description)
+
+    return ok
 
 
 def _default_out_shape(dst: Any, *srcs: Any) -> tuple[Any, ...]:
@@ -2818,6 +3003,88 @@ def _effective_input_ids(G: nuGraph, pos: int) -> list[str]:
     return list(dict.fromkeys(G.node_at(pos).inputs))
 
 
+def _graph_output_nodes(G: nuGraph) -> list[Node]:
+    used = {inp for n in G.nodes for inp in n.inputs}
+    return [n for n in G.nodes if n.id not in used]
+
+
+def _sym_expr_from_graph_node(
+    node: Node,
+    inputs: list[SymTensor],
+    symbolic_shape: Optional[tuple[z3.ArithRef, ...]] = None,
+) -> SymTensor:
+    if node.op == "input":
+        rank = len(node.attrs.get("shape", node.shape or tuple()))
+        shape = tuple(z3.Int(f"{node.id}_d{k}") for k in range(rank))
+        return SymTensor(node.id, shape=shape)
+
+    op = node.op
+    attrs = dict(node.attrs)
+    if node.op == "reduce_sum":
+        op = "sum"
+        attrs = {
+            "axis": attrs.get("axis"),
+            "keepdims": bool(attrs.get("keep_dims", attrs.get("keepdims", False))),
+        }
+    elif node.op == "mul":
+        op = "multiply"
+        attrs = {}
+    elif node.op == "div":
+        op = "divide"
+        attrs = {}
+    elif node.op == "add":
+        op = "add"
+        attrs = {}
+    elif node.op == "broadcast":
+        op = "broadcast_to"
+        target = inputs[1]
+        attrs = {"shape": target.shape}
+
+    if op not in _SEMANTICS:
+        raise KeyError(f"No symbolic conversion registered for graph op '{node.op}'")
+
+    shape_rule, _ = _SEMANTICS[op]
+    if shape_rule is None:
+        raise KeyError(f"No shape rule registered for symbolic op '{op}'")
+    shape_res = shape_rule([ShapeExpr(list(inp.shape)) for inp in inputs], attrs)
+    out_shape = symbolic_shape or tuple(shape_res.out.dims)
+    expr = SymExpr(op, [inp.expr for inp in inputs], out_shape, attrs, node.id)
+    return SymTensor(node.id, expr=expr)
+
+
+def _graph_symbolic_tensors(G: nuGraph) -> dict[str, SymTensor]:
+    out: dict[str, SymTensor] = {}
+    for node in G.nodes:
+        inputs = [out[inp] for inp in node.inputs]
+        out[node.id] = _sym_expr_from_graph_node(node, inputs)
+    return out
+
+
+def _graphs_equivalent_symbolically(
+    lhs_graph: nuGraph,
+    rhs_graph: nuGraph,
+    timeout: int = 10000,
+    verbose: bool = False,
+    rule_name: Optional[str] = None,
+) -> bool:
+    lhs_tensors = _graph_symbolic_tensors(lhs_graph)
+    rhs_tensors = _graph_symbolic_tensors(rhs_graph)
+    lhs_outputs = {n.id: lhs_tensors[n.id] for n in _graph_output_nodes(lhs_graph)}
+    rhs_outputs = {n.id: rhs_tensors[n.id] for n in _graph_output_nodes(rhs_graph)}
+    if tuple(sorted(lhs_outputs)) != tuple(sorted(rhs_outputs)):
+        return False
+    for out_id in sorted(lhs_outputs):
+        if not check_equivalent(
+            lhs_outputs[out_id],
+            rhs_outputs[out_id],
+            timeout=timeout,
+            rule_name=f"{rule_name or 'graph_equiv'}_{out_id}",
+            verbose=verbose,
+        ):
+            return False
+    return True
+
+
 def _swap_with_successor(
     G_cur: nuGraph, pos: int, succ_pos: int, clone_inputs: set[str]
 ) -> Optional[tuple[nuGraph, int]]:
@@ -2856,33 +3123,15 @@ def _swap_with_successor(
 def z3_equivalent_order(
     op1: Node, op2: Node, G_cur: nuGraph, G_new: Optional[nuGraph] = None, verbose: bool = False
 ) -> bool:
-    forbidden = {
-        ("reduce_sum", "broadcast"),
-        ("broadcast", "reduce_sum"),
-        ("reduce_sum", "sqrt"),
-        ("sqrt", "reduce_sum"),
-    }
-    if (op1.op, op2.op) in forbidden:
+    if G_new is None:
         return False
-
-    if op1.op in {"mul", "div"} and op2.op == "matmul":
-        annotate_shapes_concrete(G_cur)
-        lhs = _node_by_id(G_cur, op1.id)
-        rhs = _node_by_id(G_cur, op2.id)
-        if lhs is None or rhs is None or len(lhs.inputs) != 2 or len(rhs.inputs) != 2:
-            return False
-        if rhs.inputs[0] != lhs.id:
-            return False
-        shape_map = {n.id: n.shape or tuple() for n in G_cur.nodes}
-        x_shape = shape_map.get(lhs.inputs[0], tuple())
-        scale_shape = shape_map.get(lhs.inputs[1], tuple())
-        if len(x_shape) != 2 or len(scale_shape) != 2:
-            return False
-        rows_match = _dims_equal(scale_shape[0], x_shape[0])
-        is_column_scale = _dims_equal(scale_shape[1], 1)
-        return rows_match and is_column_scale
-
-    return False
+    return _graphs_equivalent_symbolically(
+        G_cur,
+        G_new,
+        timeout=10000,
+        verbose=verbose,
+        rule_name=f"swap_{op1.id}_{op2.id}",
+    )
 
 
 
@@ -3273,11 +3522,19 @@ def _test_axonarray_ops_shapes() -> None:
     assert x.exp().shape == (4, 8)
 
 
-def _test_mul_div_matmul_variant_growth() -> None:
-    v_mul = _variants_for(build_kernel_matmul_red_mul_graph)
-    v_div = _variants_for(build_kernel_matmul_red_div_graph)
-    assert len(v_mul) >= 2
-    assert len(v_div) >= 2
+def _test_generic_symbolic_graph_equivalence() -> None:
+    G = build_kernel_softmax_matmul_graph(4, 8, 16)
+    assert _graphs_equivalent_symbolically(G, G.clone())
+
+
+def _test_generic_symbolic_swap_equivalence() -> None:
+    G = build_kernel_matmul_red_mul_graph(4, 8, 16)
+    scale = next(n for n in G.nodes if n.id == "scale")
+    out = next(n for n in G.nodes if n.id == "out")
+    swapped = _swap_with_successor(G, G.position(scale), G.position(out), {"x"})
+    assert swapped is not None
+    G_new, _ = swapped
+    assert z3_equivalent_order(scale, out, G, G_new, verbose=False)
 
 
 def run_all_tests() -> None:
