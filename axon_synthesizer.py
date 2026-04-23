@@ -4637,3 +4637,11 @@ if __name__ == "__main__":
             print(f"=== {kname} :: Variant {vi} ===")
             print_graph(gv)
             print()
+            print(f"--- {kname} :: Variant {vi} :: Lowering to hardware (verbose sketches) ---")
+            g_hw = lower_nu_graph(gv, max_hw_size=2, timeout=3000, verbose=True)
+            if g_hw is None:
+                print(f"  [lowering failed for variant {vi}]")
+            else:
+                print(f"--- {kname} :: Variant {vi} :: Lowered hardware graph ---")
+                print_graph(g_hw)
+            print()
