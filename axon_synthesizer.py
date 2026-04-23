@@ -178,8 +178,14 @@ def semantics():
     def _decorator(fn):
         _SEMANTICS.setdefault(fn.__name__, (None, None))
         return fn
-
     return _decorator
+
+
+def semantics_hw():
+  def _decorator(fn):
+        _SEMANTICS.setdefault(fn.__name__, (None, None))
+        return fn
+  return _decorator
 
 
 def register_semantics(
@@ -645,10 +651,10 @@ def check_equivalent(
         if lsem.shape.rank == 0:
             solver.add(lsem.fn() != rsem.fn())
         else:
-            witness_vars = [z3.Int(f"witness_{idx}") for idx in range(lsem.shape.rank)]
-            lhs_bounds = [z3.And(witness_vars[i] >= 0, witness_vars[i] < lsem.shape.dims[i]) for i in range(lsem.shape.rank)]
+            vars = [z3.Int(f"witness_{idx}") for idx in range(lsem.shape.rank)]
+            lhs_bounds = [z3.And(vars[i] >= 0, vars[i] < lsem.shape.dims[i]) for i in range(lsem.shape.rank)]
             bounds = z3.And(*lhs_bounds)
-            solver.add(bounds, lsem.fn(*witness_vars) != rsem.fn(*witness_vars))
+            solver.add(bounds, lsem.fn(*vars) != rsem.fn(*vars))
         res = solver.check()
         ok = res == z3.unsat
     if not ok and _check_reduction_equivalent_by_body(lsem, rsem, shape_eq, timeout):
@@ -1252,7 +1258,7 @@ def where(condition, x, y, dtype=None):
     return _new_sym_tensor("where", [condition, x, y], {}, out_shape)
 
 
-@semantics()
+@semantics_hw()
 def activation(dst, op, data, bias=None, scale=1.0, reduce_op=None, reduce_res=None, reduce_cmd=reduce_cmd.idle, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         return _shape_activation(ins, attrs)
@@ -1283,7 +1289,7 @@ def activation(dst, op, data, bias=None, scale=1.0, reduce_op=None, reduce_res=N
     return _new_sym_tensor("activation", inputs, attrs, _default_out_shape(dst, data))
 
 
-@semantics()
+@semantics_hw()
 def activation_reduce(dst, op, data, reduce_op, reduce_res, bias=None, scale=1.0, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         return _shape_activation(ins, attrs)
@@ -1307,7 +1313,7 @@ def activation_reduce(dst, op, data, reduce_op, reduce_res, bias=None, scale=1.0
     return _new_sym_tensor("activation_reduce", inputs, attrs, _default_out_shape(dst, data))
 
 
-@semantics()
+@semantics_hw()
 def affine_select(dst, pattern, channel_multiplier, on_true_tile, on_false_value, cmp_op=nl.equal, offset=0, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         data_shape = ins[0]
@@ -1348,7 +1354,7 @@ def affine_select(dst, pattern, channel_multiplier, on_true_tile, on_false_value
     )
 
 
-@semantics()
+@semantics_hw()
 def bn_aggr(dst, data, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         data_shape = ins[0]
@@ -1370,7 +1376,7 @@ def bn_aggr(dst, data, name=None):
     return _new_sym_tensor("bn_aggr", [data], {"name": name}, out_shape)
 
 
-@semantics()
+@semantics_hw()
 def bn_stats(dst, data, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         data_shape = ins[0]
@@ -1388,7 +1394,7 @@ def bn_stats(dst, data, name=None):
     return _new_sym_tensor("bn_stats", [data], {"name": name}, out_shape)
 
 
-@semantics()
+@semantics_hw()
 def dma_compute(dst, srcs, reduce_op, scales=None, unique_indices=True, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         out_shape = attrs.get("out_shape")
@@ -1431,7 +1437,7 @@ def dma_compute(dst, srcs, reduce_op, scales=None, unique_indices=True, name=Non
     )
 
 
-@semantics()
+@semantics_hw()
 def dma_copy(dst, src, oob_mode=oob_mode.error, dge_mode=dge_mode.unknown, engine=engine.unknown, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         return _shape_same_as_first(ins, attrs)
@@ -1450,7 +1456,7 @@ def dma_copy(dst, src, oob_mode=oob_mode.error, dge_mode=dge_mode.unknown, engin
     )
 
 
-@semantics()
+@semantics_hw()
 def dma_transpose(dst, src, axes=None, dge_mode=dge_mode.unknown, oob_mode=oob_mode.error, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         src_shape = ins[0]
@@ -1495,7 +1501,7 @@ def dma_transpose(dst, src, axes=None, dge_mode=dge_mode.unknown, oob_mode=oob_m
     )
 
 
-@semantics()
+@semantics_hw()
 def dropout(dst, data, prob, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         data_shape = ins[0]
@@ -1535,7 +1541,7 @@ def dropout(dst, data, prob, name=None):
     return _new_sym_tensor("dropout", inputs, attrs, _default_out_shape(dst, data))
 
 
-@semantics()
+@semantics_hw()
 def exponential(dst, src, max_value=0.0, reduce_res=None, reduce_cmd=reduce_cmd.idle, reduce_init=0.0, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         return _shape_activation(ins, attrs)
@@ -1560,7 +1566,7 @@ def exponential(dst, src, max_value=0.0, reduce_res=None, reduce_cmd=reduce_cmd.
     return _new_sym_tensor("exponential", inputs, attrs, _default_out_shape(dst, src))
 
 
-@semantics()
+@semantics_hw()
 def iota(dst, pattern, offset=0, channel_multiplier=0, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         out_shape = attrs.get("out_shape", ())
@@ -1602,7 +1608,7 @@ def iota(dst, pattern, offset=0, channel_multiplier=0, name=None):
     )
 
 
-@semantics()
+@semantics_hw()
 def local_gather(dst, src_buffer, index, num_elem_per_idx=1, num_valid_indices=None, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         return _shape_from_out(attrs.get("out_shape", tuple(ins[0].dims)))
@@ -1621,7 +1627,7 @@ def local_gather(dst, src_buffer, index, num_elem_per_idx=1, num_valid_indices=N
     )
 
 
-@semantics()
+@semantics_hw()
 def max8(dst, src, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         src_shape = ins[0]
@@ -1639,7 +1645,7 @@ def max8(dst, src, name=None):
     return _new_sym_tensor("max8", [src], {"name": name}, out_shape)
 
 
-@semantics()
+@semantics_hw()
 def memset(dst, value, engine=engine.unknown, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         return _shape_from_out(attrs.get("out_shape", (z3.IntVal(1),)))
@@ -1658,7 +1664,7 @@ def memset(dst, value, engine=engine.unknown, name=None):
     return _new_sym_tensor("memset", [], {"value": value, "engine": engine, "out_shape": out_shape, "name": name}, out_shape)
 
 
-@semantics()
+@semantics_hw()
 def nc_find_index8(dst, data, vals, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         data_shape = ins[0]
@@ -1677,7 +1683,7 @@ def nc_find_index8(dst, data, vals, name=None):
     return _new_sym_tensor("nc_find_index8", [data, vals], {"name": name}, out_shape)
 
 
-@semantics()
+@semantics_hw()
 def nc_match_replace8(dst, data, vals, imm, dst_idx=None, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         data_shape = ins[0]
@@ -1693,7 +1699,7 @@ def nc_match_replace8(dst, data, vals, imm, dst_idx=None, name=None):
     return _new_sym_tensor("nc_match_replace8", [data, vals], {"imm": imm, "name": name}, _default_out_shape(dst, data))
 
 
-@semantics()
+@semantics_hw()
 def nc_matmul(dst, stationary, moving, is_stationary_onezero=False, is_moving_onezero=False, is_transpose=False, accumulate=None, tile_position=(), tile_size=(), perf_mode=matmul_perf_mode.none, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         lhs, rhs = ins
@@ -1748,7 +1754,7 @@ def nc_matmul(dst, stationary, moving, is_stationary_onezero=False, is_moving_on
     )
 
 
-@semantics()
+@semantics_hw()
 def nc_n_gather(dst, data, indices, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         data_shape, idx_shape = ins
@@ -1779,7 +1785,7 @@ def nc_n_gather(dst, data, indices, name=None):
     return _new_sym_tensor("nc_n_gather", [data, indices], {"name": name}, out_shape)
 
 
-@semantics()
+@semantics_hw()
 def nc_stream_shuffle(dst, src, shuffle_mask, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         src_shape = ins[0]
@@ -1811,7 +1817,7 @@ def nc_stream_shuffle(dst, src, shuffle_mask, name=None):
     return _new_sym_tensor("nc_stream_shuffle", [src], {"shuffle_mask": list(shuffle_mask), "name": name}, _default_out_shape(dst, src))
 
 
-@semantics()
+@semantics_hw()
 def nc_transpose(dst, data, engine=engine.unknown, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         return _shape_nc_transpose(ins, attrs)
@@ -1828,7 +1834,7 @@ def nc_transpose(dst, data, engine=engine.unknown, name=None):
     return _new_sym_tensor("nc_transpose", [data], {"engine": engine, "name": name}, out_shape)
 
 
-@semantics()
+@semantics_hw()
 def reciprocal(dst, data, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         return _shape_unary_same(ins, attrs)
@@ -1842,7 +1848,7 @@ def reciprocal(dst, data, name=None):
     return _new_sym_tensor("reciprocal", [data], {"name": name}, _default_out_shape(dst, data))
 
 
-@semantics()
+@semantics_hw()
 def scalar_tensor_tensor(dst, data, op0, operand0, op1, operand1, reverse0=False, reverse1=False, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         data_shape = ins[0]
@@ -1882,7 +1888,7 @@ def scalar_tensor_tensor(dst, data, op0, operand0, op1, operand1, reverse0=False
     return _new_sym_tensor("scalar_tensor_tensor", inputs, attrs, _default_out_shape(dst, data))
 
 
-@semantics()
+@semantics_hw()
 def select_reduce(dst, predicate, on_true, on_false, reduce_res=None, reduce_cmd=reduce_cmd.idle, reduce_op=nl.maximum, reverse_pred=False, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         return _shape_tensor_scalar(ins, attrs)
@@ -1909,7 +1915,7 @@ def select_reduce(dst, predicate, on_true, on_false, reduce_res=None, reduce_cmd
     return _new_sym_tensor("select_reduce", inputs, attrs, _default_out_shape(dst, on_true))
 
 
-@semantics()
+@semantics_hw()
 def tensor_copy(dst, src, engine=engine.unknown, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         return _shape_same_as_first(ins, attrs)
@@ -1923,7 +1929,7 @@ def tensor_copy(dst, src, engine=engine.unknown, name=None):
     return _new_sym_tensor("tensor_copy", [src], {"engine": engine, "name": name}, _default_out_shape(dst, src))
 
 
-@semantics()
+@semantics_hw()
 def tensor_copy_predicated(dst, src, predicate, reverse_pred=False, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         src_shape = ins[0]
@@ -1961,7 +1967,7 @@ def tensor_copy_predicated(dst, src, predicate, reverse_pred=False, name=None):
     )
 
 
-@semantics()
+@semantics_hw()
 def tensor_partition_reduce(dst, op, data, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         data_shape = ins[0]
@@ -2006,7 +2012,7 @@ def tensor_partition_reduce(dst, op, data, name=None):
     return _new_sym_tensor("tensor_partition_reduce", [data], {"op": op, "name": name}, out_shape)
 
 
-@semantics()
+@semantics_hw()
 def tensor_reduce(dst, op, data, axis, negate=False, keepdims=False, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         return _shape_tensor_reduce(ins, attrs)
@@ -2025,7 +2031,7 @@ def tensor_reduce(dst, op, data, axis, negate=False, keepdims=False, name=None):
     )
 
 
-@semantics()
+@semantics_hw()
 def tensor_scalar(dst, data, op0, operand0, reverse0=False, op1=None, operand1=None, reverse1=False, engine=engine.unknown, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         return _shape_tensor_scalar(ins, attrs)
@@ -2058,7 +2064,7 @@ def tensor_scalar(dst, data, op0, operand0, reverse0=False, op1=None, operand1=N
     return _new_sym_tensor("tensor_scalar", inputs, attrs, _default_out_shape(dst, data))
 
 
-@semantics()
+@semantics_hw()
 def tensor_scalar_cumulative(dst, src, op0, op1, imm0, imm1=None, reduce_cmd=reduce_cmd.reset_reduce, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         data_shape = ins[0]
@@ -2119,7 +2125,7 @@ def tensor_scalar_cumulative(dst, src, op0, op1, imm0, imm1=None, reduce_cmd=red
     return _new_sym_tensor("tensor_scalar_cumulative", inputs, attrs, _default_out_shape(dst, src))
 
 
-@semantics()
+@semantics_hw()
 def tensor_scalar_reduce(dst, data, op0, operand0, reduce_op, reduce_res, reverse0=False, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         data_shape = ins[0]
@@ -2161,7 +2167,7 @@ def tensor_scalar_reduce(dst, data, op0, operand0, reduce_op, reduce_res, revers
     return _new_sym_tensor("tensor_scalar_reduce", inputs, attrs, _default_out_shape(dst, data))
 
 
-@semantics()
+@semantics_hw()
 def tensor_tensor(dst, data1, data2, op, engine=engine.unknown, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         return _shape_tensor_tensor(ins, attrs)
@@ -2180,7 +2186,7 @@ def tensor_tensor(dst, data1, data2, op, engine=engine.unknown, name=None):
     )
 
 
-@semantics()
+@semantics_hw()
 def tensor_tensor_scan(dst, data0, data1, initial, op0, op1, reverse0=False, reverse1=False, name=None):
     def shape_rule(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
         data_shape = ins[0]
