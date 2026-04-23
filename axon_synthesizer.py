@@ -387,46 +387,6 @@ def _apply_activation(op: Any, x: z3.ArithRef) -> tuple[z3.ArithRef, list[z3.Boo
     return fn(x), []
 
 
-def _add_reduction_extensionality_axiom(solver: z3.Solver, lhs: Semantics, rhs: Semantics) -> None:
-    lhs_red = lhs.reduction
-    rhs_red = rhs.reduction
-    if lhs_red is None or rhs_red is None or lhs_red.outer_rank != rhs_red.outer_rank:
-        return
-    lhs_bid = z3.IntVal(lhs_red.body_id)
-    rhs_bid = z3.IntVal(rhs_red.body_id)
-    if lhs_red.outer_rank == 1:
-        i = z3.Int("equiv_reduce_i")
-        k = z3.Int("equiv_reduce_k")
-        same_body = z3.ForAll([k], BODY1(lhs_bid, i, k) == BODY1(rhs_bid, i, k))
-        solver.add(
-            z3.ForAll(
-                [i],
-                z3.Implies(
-                    z3.And(lhs_red.extent == rhs_red.extent, same_body),
-                    REDUCE1(lhs_bid, i, lhs_red.extent) == REDUCE1(rhs_bid, i, rhs_red.extent),
-                ),
-            )
-        )
-        return
-    if lhs_red.outer_rank == 2:
-        i = z3.Int("equiv_reduce_i")
-        j = z3.Int("equiv_reduce_j")
-        k = z3.Int("equiv_reduce_k")
-        same_body = z3.ForAll([k], BODY2(lhs_bid, i, j, k) == BODY2(rhs_bid, i, j, k))
-        solver.add(
-            z3.ForAll(
-                [i, j],
-                z3.Implies(
-                    z3.And(lhs_red.extent == rhs_red.extent, same_body),
-                    REDUCE2(lhs_bid, i, j, lhs_red.extent) == REDUCE2(rhs_bid, i, j, rhs_red.extent),
-                ),
-            )
-        )
-
-
-_last_check_stats: dict[str, Any] = {}
-
-
 def singleton_dimension_extensionality(sem: Semantics) -> Context:
     ctx = Context()
     if sem.shape.rank == 0:
@@ -475,15 +435,6 @@ def reduction_extensionality_context() -> Context:
         )
     )
     return ctx
-
-
-def reduction_comparison_context(lhs: Semantics, rhs: Semantics) -> Context:
-    """Kept for API compatibility; reduction equality now comes from body proofs.
-
-    Callers should use `_check_reduction_equivalent_by_body` for actual
-    reduction comparison instead of relying on extra comparison context.
-    """
-    return Context()
 
 
 def _check_reduction_equivalent_by_body(
@@ -649,7 +600,8 @@ def check_equivalent(
     rhs_expr = _rename_expr_tree_for_equivalence(rhs.expr, "rhs", shared_names, used_names, name_counter)
     lsem = compile_expr(lhs_expr, {})
     rsem = compile_expr(rhs_expr, {})
-
+    print("lsem.shape:", lsem.shape.dims)
+    print("rsem.shape:", rsem.shape.dims)
     shape_eq = _shape_eq(lsem.shape, rsem.shape)
 
     if lsem.shape.rank != rsem.shape.rank:
@@ -668,7 +620,6 @@ def check_equivalent(
     full_ctx = lsem.ctx.merged(
         rsem.ctx,
         reduction_extensionality_context(),
-        reduction_comparison_context(lsem, rsem),
         extra_ctx,
     )
     theorem = z3.Implies(full_ctx.as_formula(), z3.And(shape_eq, val_eq))
@@ -681,7 +632,7 @@ def check_equivalent(
     if not ok and _check_reduction_equivalent_by_body(lsem, rsem, shape_eq, timeout):
         ok = True
 
-    _last_check_stats.clear()
+    _last_check_stats: dict[str, Any] = {}
     _last_check_stats["num_obligations"] = len(full_ctx.facts)
     _last_check_stats["failure_reason"] = "" if ok else str(res)
 
@@ -3214,31 +3165,6 @@ def _graph_symbolic_tensors(G: nuGraph) -> dict[str, SymTensor]:
     return out
 
 
-def _graphs_equivalent_symbolically(
-    lhs_graph: nuGraph,
-    rhs_graph: nuGraph,
-    timeout: int = 10000,
-    verbose: bool = False,
-    rule_name: Optional[str] = None,
-) -> bool:
-    lhs_tensors = _graph_symbolic_tensors(lhs_graph)
-    rhs_tensors = _graph_symbolic_tensors(rhs_graph)
-    lhs_outputs = {n.id: lhs_tensors[n.id] for n in _graph_output_nodes(lhs_graph)}
-    rhs_outputs = {n.id: rhs_tensors[n.id] for n in _graph_output_nodes(rhs_graph)}
-    if tuple(sorted(lhs_outputs)) != tuple(sorted(rhs_outputs)):
-        return False
-    for out_id in sorted(lhs_outputs):
-        if not check_equivalent(
-            lhs_outputs[out_id],
-            rhs_outputs[out_id],
-            timeout=timeout,
-            rule_name=f"{rule_name or 'graph_equiv'}_{out_id}",
-            verbose=verbose,
-        ):
-            return False
-    return True
-
-
 def _swap_composition_tensor(G: nuGraph, result_id: str) -> Optional[SymTensor]:
     tensors = _graph_symbolic_tensors(G)
     return tensors.get(result_id)
@@ -3327,13 +3253,6 @@ def _swap_with_successor_variants(
     return out
 
 
-def _swap_with_successor(
-    G_cur: nuGraph, pos: int, succ_pos: int, clone_inputs: set[str]
-) -> Optional[tuple[nuGraph, int]]:
-    variants = _swap_with_successor_variants(G_cur, pos, succ_pos, clone_inputs)
-    return variants[0] if variants else None
-
-
 def z3_equivalent_order(
     op1: Node, op2: Node, G_cur: nuGraph, G_new: Optional[nuGraph] = None, verbose: bool = False
 ) -> bool:
@@ -3407,10 +3326,8 @@ def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
                                 break
                         if accepted:
                             break
-
                 if not found_valid_swap:
                     M_next.add(G_cur)
-
         M |= M_next
 
     return sorted(M, key=graph_signature)
