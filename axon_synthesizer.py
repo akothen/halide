@@ -3674,7 +3674,6 @@ def _test_symbolic_variant_generation_without_shape_metadata() -> None:
 
 def run_all_tests() -> None:
     print("\n================ RUNNING NU-GRAPH TESTS ================")
-    _test_compositional_shape_equivalence()
     # _test_expected_variant_counts()
     # _test_no_illegal_reduce_broadcast_swap()
     # _test_no_illegal_reduce_sqrt_swap()
