@@ -334,7 +334,7 @@ def _operand_to_expr(op: Any) -> Any:
 
 
 def _safe_divide(lhs: z3.ArithRef, rhs: z3.ArithRef) -> z3.ArithRef:
-    """Use the file-wide reciprocal convention: division by zero yields 0."""
+    """Match `_compile_reciprocal`: division by zero follows the zero-reciprocal path."""
     return z3.If(rhs == 0, z3.RealVal(0), lhs / rhs)
 
 
@@ -593,6 +593,7 @@ def _rename_expr_tree_for_equivalence(
     side: str,
     shared_names: dict[Any, str],
     used_names: set[str],
+    name_counter: list[int],
     cache: Optional[dict[int, SymExpr]] = None,
     sig_cache: Optional[dict[int, Any]] = None,
 ) -> SymExpr:
@@ -612,14 +613,19 @@ def _rename_expr_tree_for_equivalence(
         name = shared_names[sig]
     else:
         candidate_names = [expr.name, f"{expr.name}_{side}"]
-        fallback_name = f"{expr.name}_{side}_{len(used_names)}"
+        fallback_name = f"{expr.name}_{side}_{name_counter[0]}"
         name = next((candidate for candidate in candidate_names if candidate not in used_names), fallback_name)
+        if name == fallback_name:
+            name_counter[0] += 1
         shared_names[sig] = name
         used_names.add(name)
 
     renamed = SymExpr(
         expr.op,
-        [_rename_expr_tree_for_equivalence(inp, side, shared_names, used_names, cache, sig_cache) for inp in expr.inputs],
+        [
+            _rename_expr_tree_for_equivalence(inp, side, shared_names, used_names, name_counter, cache, sig_cache)
+            for inp in expr.inputs
+        ],
         expr.shape,
         dict(expr.attrs),
         name,
@@ -638,8 +644,9 @@ def check_equivalent(
 ) -> bool:
     shared_names: dict[Any, str] = {}
     used_names: set[str] = set()
-    lhs_expr = _rename_expr_tree_for_equivalence(lhs.expr, "lhs", shared_names, used_names)
-    rhs_expr = _rename_expr_tree_for_equivalence(rhs.expr, "rhs", shared_names, used_names)
+    name_counter = [0]
+    lhs_expr = _rename_expr_tree_for_equivalence(lhs.expr, "lhs", shared_names, used_names, name_counter)
+    rhs_expr = _rename_expr_tree_for_equivalence(rhs.expr, "rhs", shared_names, used_names, name_counter)
     lsem = compile_expr(lhs_expr, {})
     rsem = compile_expr(rhs_expr, {})
 
@@ -2385,6 +2392,7 @@ def _compile_tensor_reduce(expr: SymExpr, ins: list[Semantics], out_shape: Shape
     out_fn = _tensor_function(f"V_{expr.name}", out_shape.rank)
     axis_attr = expr.attrs.get("axis", 1)
     axis = axis_attr[0] if isinstance(axis_attr, (list, tuple)) else axis_attr
+    # Graph nodes still use `keep_dims`; public tensor-style callers use `keepdims`.
     keep = bool(expr.attrs.get("keepdims", expr.attrs.get("keep_dims", False)))
     negate = bool(expr.attrs.get("negate", False))
     body_id = _fresh_body_id()
