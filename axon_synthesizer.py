@@ -4804,7 +4804,7 @@ def _test_lower_nu_graph_all_variants() -> None:
 def _test_reduce_sum_lowering_no_crash() -> None:
     """Regression test for the z3 thread-safety crash that was triggered when
     multiple threads concurrently constructed z3 formulas sharing the global
-    z3.main_ctx() while synthesising reduce_sum_1001 in kernel_matmul_red_div.
+    z3.main_ctx() while synthesizing reduce_sum_1001 in kernel_matmul_red_div.
 
     The fix adds _Z3_LOCK to serialise check_equivalent calls within
     _synthesize_all_from_pool._check_one so that the shared z3 context is
