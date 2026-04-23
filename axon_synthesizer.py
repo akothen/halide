@@ -9,7 +9,7 @@ from contextlib import redirect_stdout
 from dataclasses import dataclass, field
 from enum import Enum
 from itertools import combinations, permutations, product as _iproduct
-from threading import Lock
+from threading import Lock, RLock
 from typing import Any, Callable, Optional, List
 
 import z3
@@ -44,7 +44,7 @@ _BODY_LOCK = Lock()
 _UF_LOCK = Lock()
 _SEMANTICS_LOCK = Lock()
 _VERBOSE_LOCK = Lock()   # serialises verbose prints from concurrent synthesis threads
-_Z3_LOCK = Lock()        # serialises z3 formula construction (z3.main_ctx is not thread-safe)
+_Z3_LOCK = RLock()       # serialises z3 formula construction (z3.main_ctx is not thread-safe)
 
 
 def _gen_id(prefix: Optional[str] = None) -> str:
@@ -3433,13 +3433,18 @@ _HW_OP_NAMES: list[str] = [
     "tensor_tensor",
 ]
 
+# Synthesis candidates used to build the sketch pool.  Layout transforms are
+# represented abstractly here so synthesis does not branch over multiple
+# concrete copy/transpose hardware implementations.
+_SYNTHESIS_POOL_OP_NAMES: list[str] = [
+    hw_op for hw_op in _HW_OP_NAMES
+    if hw_op not in {"dma_copy", "dma_transpose", "nc_transpose", "tensor_copy"}
+] + ["transpose"]
+
 # Ops whose only semantic role is a data layout transformation (always included
 # in the pool regardless of constituent overlap).
 _LAYOUT_TRANSFORM_OPS: frozenset[str] = frozenset({
-    "nc_transpose",
-    "dma_transpose",
-    "tensor_copy",
-    "dma_copy",
+    "transpose",
 })
 
 # Public ops that lower trivially to a single hw op without needing synthesis
@@ -3628,6 +3633,8 @@ def _invoke_hw_op(op: str, input_syms: list[SymTensor], attrs: dict[str, Any]) -
             return reciprocal(dst=None, data=input_syms[0])
         if op == "tensor_copy":
             return tensor_copy(dst=None, src=input_syms[0])
+        if op == "transpose":
+            return transpose(input_syms[0])
         if op == "tensor_partition_reduce":
             reduce_op_attr = attrs.get("op", nl.add)
             return tensor_partition_reduce(dst=None, op=reduce_op_attr, data=input_syms[0])
@@ -3671,6 +3678,42 @@ def _eval_sketch(sketch: SketchNode) -> Optional[SymTensor]:
     return _invoke_hw_op(sketch.op, child_syms, sketch.attrs)
 
 
+def _template_constituents(sketch: SketchNode) -> frozenset[str]:
+    """Return the primitive ops exercised by a single hardware template."""
+    if sketch.hole or sketch.op == "INPUT":
+        return frozenset()
+    if sketch.op == "activation":
+        return frozenset({_operand_to_expr(sketch.attrs.get("op", nl.copy))})
+    if sketch.op == "activation_reduce":
+        return frozenset({
+            _operand_to_expr(sketch.attrs.get("op", nl.copy)),
+            _operand_to_expr(sketch.attrs.get("reduce_op", nl.add)),
+        })
+    if sketch.op in ("dma_copy", "tensor_copy"):
+        return frozenset({"copy"})
+    if sketch.op in ("dma_transpose", "nc_transpose"):
+        return frozenset({"transpose", "copy"})
+    if sketch.op == "transpose":
+        return frozenset({"transpose"})
+    if sketch.op == "exponential":
+        return frozenset({"exp"})
+    if sketch.op == "nc_matmul":
+        return frozenset({"multiply", "add"})
+    if sketch.op == "reciprocal":
+        return frozenset({"divide"})
+    if sketch.op in ("tensor_partition_reduce", "tensor_reduce"):
+        return frozenset({_operand_to_expr(sketch.attrs.get("op", nl.add))})
+    if sketch.op == "tensor_scalar":
+        constituents = {_operand_to_expr(sketch.attrs.get("op0", nl.multiply))}
+        op1 = sketch.attrs.get("op1")
+        if op1 is not None:
+            constituents.add(_operand_to_expr(op1))
+        return frozenset(constituents)
+    if sketch.op == "tensor_tensor":
+        return frozenset({_operand_to_expr(sketch.attrs.get("op", nl.add))})
+    return _op_constituents(sketch.op)
+
+
 # ---------------------------------------------------------------------------
 # Phase 1 – Build instruction pool
 # ---------------------------------------------------------------------------
@@ -3698,10 +3741,7 @@ def _pool_templates_for_hw_op(
                 templates.append(SketchNode.make_op(hw_op, [n1, n2], attrs))
 
     # Unary layout transforms
-    if hw_op in ("nc_transpose", "dma_copy", "tensor_copy"):
-        add_unary({})
-        return templates
-    if hw_op == "dma_transpose":
+    if hw_op == "transpose":
         add_unary({})          # default (swap first two dims)
         return templates
     if hw_op == "reciprocal":
@@ -3776,15 +3816,21 @@ def _build_synthesis_pool(
     """Phase 1: build the instruction pool P for target operation."""
     concrete = [SketchNode.make_input(sym) for sym in input_syms]
     pool: list[SketchNode] = list(concrete)  # include raw inputs
+    target_constituents = _op_constituents(target_op)
 
     augmented_attrs = dict(target_attrs)
     augmented_attrs["op_name"] = target_op
 
-    for hw_op in _HW_OP_NAMES:
+    for hw_op in _SYNTHESIS_POOL_OP_NAMES:
         is_layout = hw_op in _LAYOUT_TRANSFORM_OPS
         if not is_layout and not _shares_constituents(target_op, hw_op):
             continue
         templates = _pool_templates_for_hw_op(hw_op, concrete, augmented_attrs)
+        if not is_layout:
+            templates = [
+                template for template in templates
+                if _template_constituents(template).issubset(target_constituents)
+            ]
         pool.extend(templates)
 
     return pool
@@ -3801,7 +3847,8 @@ def _check_equivalent_quiet(
 ) -> bool:
     """Wrapper around quiet-by-default check_equivalent."""
     try:
-        return check_equivalent(lhs, rhs, timeout=timeout)
+        with _Z3_LOCK:
+            return check_equivalent(lhs, rhs, timeout=timeout)
     except Exception:
         return False
 
@@ -3902,8 +3949,9 @@ def _synthesize_all_from_pool(
     """Like _synthesize_from_pool but returns ALL equivalent sketches.
 
     Phase 1 runs the same DFS worklist as _synthesize_from_pool to enumerate
-    every complete, evaluatable candidate sketch.  Phase 2 checks each
-    candidate for equivalence in DFS order.
+    every complete, evaluatable candidate sketch.  Phase 2 dispatches the
+    equivalence checks across sketches through a ThreadPoolExecutor while
+    serialising the z3 work under _Z3_LOCK.
 
     Returns every sketch that passes equivalence (empty list if none).
     When *verbose* is True all sketches and their results are printed in
@@ -3954,21 +4002,30 @@ def _synthesize_all_from_pool(
         with _VERBOSE_LOCK:
             print(f"    candidate_count={len(candidates)}")
 
-    # Phase 2: check all candidates in DFS order.
-    # z3.main_ctx() is not thread-safe, so every call to check_equivalent
-    # must hold _Z3_LOCK. Running through a thread pool would serialize on
-    # the same lock anyway and only add scheduling overhead.
+    # Phase 2: check all candidates, optionally dispatching sketches through a
+    # thread pool.  z3.main_ctx() is not thread-safe, so every actual solver
+    # call must still hold _Z3_LOCK.
     def _check_one(item: tuple[SketchNode, SymTensor]) -> tuple[SketchNode, bool]:
         sketch, cand_sym = item
         try:
-            with _Z3_LOCK:
-                return sketch, _check_equivalent_quiet(target_sym, cand_sym, timeout=timeout)
+            return sketch, _check_equivalent_quiet(target_sym, cand_sym, timeout=timeout)
         except Exception:
             return sketch, False
 
     ordered: dict[int, tuple[SketchNode, bool]] = {}
-    for idx, item in enumerate(candidates):
-        ordered[idx] = _check_one(item)
+    if max_workers > 1 and len(candidates) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            fs = {executor.submit(_check_one, item): idx
+                  for idx, item in enumerate(candidates)}
+            for future in concurrent.futures.as_completed(fs):
+                idx = fs[future]
+                try:
+                    ordered[idx] = future.result()
+                except Exception:
+                    ordered[idx] = (candidates[idx][0], False)
+    else:
+        for idx, item in enumerate(candidates):
+            ordered[idx] = _check_one(item)
 
     # Phase 3: collect results and emit verbose output in original DFS order
     valid: list[SketchNode] = []
@@ -4017,8 +4074,9 @@ def _sketch_to_graph_nodes(
         child_ids.append(cid)
 
     clean_attrs = {k: v for k, v in sketch.attrs.items() if k != "name"}
-    new_id = _gen_id(sketch.op)
-    new_nodes.append(Node(id=new_id, op=sketch.op, inputs=child_ids, attrs=clean_attrs))
+    materialized_op = "nc_transpose" if sketch.op == "transpose" else sketch.op
+    new_id = _gen_id(materialized_op)
+    new_nodes.append(Node(id=new_id, op=materialized_op, inputs=child_ids, attrs=clean_attrs))
     return new_id
 
 
@@ -4095,12 +4153,13 @@ def _lower_node_all(
     max_hw_size: int,
     timeout: int,
     verbose: bool = False,
+    max_workers: int = 4,
 ) -> list[tuple[list[Node], str, SymTensor]]:
     """Synthesize ALL valid hw-only replacements for *node*.
 
     Like _lower_node but uses _synthesize_all_from_pool so every equivalent
-    sketch is found (with sketch-level parallelism) rather than stopping at
-    the first.  Returns a (possibly empty) list of
+    sketch is found rather than stopping at the first.  Returns a (possibly
+    empty) list of
     (new_nodes, output_hw_id, output_hw_sym) triples – one per valid sketch.
     """
     input_syms = [sym for sym, _ in hw_input_pairs]
@@ -4123,6 +4182,7 @@ def _lower_node_all(
     found_sketches = _synthesize_all_from_pool(
         effective_target, pool,
         max_hw_size=max_hw_size, timeout=timeout, verbose=verbose,
+        max_workers=max_workers,
     )
 
     if not found_sketches:
@@ -4161,12 +4221,15 @@ def lower_nu_graph(
     max_hw_size: int = 2,
     timeout: int = 3000,
     verbose: bool = False,
+    max_workers: int = 4,
 ) -> Optional[nuGraph]:
     """Lower all public ops in *G* to hw ops using sketch-driven synthesis.
 
     Returns a new nuGraph that uses only hw ops, or None if any node could
-    not be lowered.  When *verbose* is True every sketch evaluated for every
-    node is printed so the search can be manually inspected.
+    not be lowered.  Independent synthesis nodes that share a DAG level are
+    lowered concurrently when *max_workers* > 1.  When *verbose* is True every
+    sketch evaluated for every node is printed so the search can be manually
+    inspected.
     """
     # Build symbolic tensors for the original graph (used as synthesis targets)
     orig_syms: dict[str, SymTensor] = {}
@@ -4175,55 +4238,97 @@ def lower_nu_graph(
     except (KeyError, Exception):
         return None
 
-    hw_nodes: list[Node] = []        # accumulate lowered nodes
+    hw_nodes: list[Node] = []           # accumulate lowered nodes
     hw_syms: dict[str, SymTensor] = {}  # hw_node_id -> SymTensor
     node_id_map: dict[str, str] = {}    # orig_id -> hw_id
 
     if verbose:
         print(f"[lower_nu_graph] graph has {len(G.nodes)} nodes")
 
-    for node in G.nodes:
-        if node.op == "input":
-            # Input nodes pass through unchanged
-            hw_nodes.append(Node(node.id, node.op, list(node.inputs), dict(node.attrs), node.shape))
-            hw_syms[node.id] = orig_syms[node.id]
-            node_id_map[node.id] = node.id
+    levels = _build_dag_levels(G)
+
+    for level_nodes in levels:
+        deterministic: list[Node] = []
+        synthesis: list[Node] = []
+        for node in level_nodes:
+            if node.op == "input" or node.op in _PUBLIC_PASSTHROUGH_OPS:
+                deterministic.append(node)
+            else:
+                synthesis.append(node)
+
+        for node in deterministic:
+            if node.op == "input":
+                hw_nodes.append(Node(node.id, node.op, list(node.inputs), dict(node.attrs), node.shape))
+                hw_syms[node.id] = orig_syms[node.id]
+                node_id_map[node.id] = node.id
+            else:
+                new_inputs = [node_id_map.get(inp, inp) for inp in node.inputs]
+                out_sym = hw_syms.get(new_inputs[0]) if new_inputs else None
+                if out_sym is None:
+                    return None
+                new_id = _gen_id(node.op)
+                hw_nodes.append(Node(new_id, node.op, new_inputs, dict(node.attrs), node.shape))
+                hw_syms[new_id] = out_sym
+                node_id_map[node.id] = new_id
+
+        if not synthesis:
             continue
 
-        if node.op in _PUBLIC_PASSTHROUGH_OPS:
-            # Passthrough ops: remap inputs and copy node using hw ids
-            new_inputs = [node_id_map.get(inp, inp) for inp in node.inputs]
-            # Use the symbolic result of the first hw input as the output sym
-            out_sym = hw_syms.get(new_inputs[0]) if new_inputs else None
-            if out_sym is None:
+        SynthArgs = tuple[Node, SymTensor, list[tuple[SymTensor, str]]]
+        synthesis_args: list[SynthArgs] = []
+        for node in synthesis:
+            hw_input_pairs: list[tuple[SymTensor, str]] = []
+            for inp_id in node.inputs:
+                hw_id = node_id_map.get(inp_id, inp_id)
+                hw_sym = hw_syms.get(hw_id)
+                if hw_sym is None:
+                    return None
+                hw_input_pairs.append((hw_sym, hw_id))
+            target_sym = orig_syms.get(node.id)
+            if target_sym is None:
                 return None
-            new_id = _gen_id(node.op)
-            hw_nodes.append(Node(new_id, node.op, new_inputs, dict(node.attrs), node.shape))
-            hw_syms[new_id] = out_sym
-            node_id_map[node.id] = new_id
-            continue
+            synthesis_args.append((node, target_sym, hw_input_pairs))
 
-        # Build hw_input_pairs: (hw_sym_for_input, hw_node_id_for_input)
-        hw_input_pairs: list[tuple[SymTensor, str]] = []
-        for inp_id in node.inputs:
-            hw_id = node_id_map.get(inp_id, inp_id)
-            hw_sym = hw_syms.get(hw_id)
-            if hw_sym is None:
+        def _synth(args: SynthArgs) -> Optional[tuple[list[Node], str, SymTensor]]:
+            nd, tgt, pairs = args
+            return _lower_node(
+                nd,
+                tgt,
+                pairs,
+                max_hw_size,
+                timeout,
+                verbose=verbose,
+            )
+
+        level_results: list[Optional[tuple[list[Node], str, SymTensor]]]
+        if max_workers > 1 and len(synthesis) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(_synth, args) for args in synthesis_args]
+                level_results_tmp: list[Optional[tuple[list[Node], str, SymTensor]]] = []
+                for i_f, future in enumerate(futures):
+                    try:
+                        level_results_tmp.append(future.result())
+                    except Exception as exc:
+                        if verbose:
+                            nd = synthesis[i_f]
+                            with _VERBOSE_LOCK:
+                                print(f"[lower_nu_graph] synthesis of '{nd.id}' op={nd.op} raised: {exc}")
+                        level_results_tmp.append(None)
+                level_results = level_results_tmp
+        else:
+            level_results = [_synth(args) for args in synthesis_args]
+
+        for result in level_results:
+            if result is None:
                 return None
-            hw_input_pairs.append((hw_sym, hw_id))
-
-        target_sym = orig_syms.get(node.id)
-        if target_sym is None:
-            return None
-
-        result = _lower_node(node, target_sym, hw_input_pairs, max_hw_size, timeout, verbose=verbose)
-        if result is None:
-            return None
-
-        new_hw_nodes, output_id, output_sym = result
-        hw_nodes.extend(new_hw_nodes)
-        hw_syms[output_id] = output_sym
-        node_id_map[node.id] = output_id
+            new_hw_nodes, output_id, output_sym = result
+            hw_nodes.extend(new_hw_nodes)
+            hw_syms[output_id] = output_sym
+        for node, result in zip(synthesis, level_results):
+            if result is None:
+                return None
+            _, output_id, _ = result
+            node_id_map[node.id] = output_id
 
     G_hw = nuGraph(hw_nodes)
     try:
@@ -4238,12 +4343,22 @@ def lower_nu_graph_variants(
     max_hw_size: int = 2,
     timeout: int = 3000,
     verbose: bool = False,
+    max_workers: int = 4,
 ) -> list[Optional[nuGraph]]:
     """Lower every variant in *variants* to hardware ops.
 
     Returns a list of the same length; entries that could not be lowered are None.
     """
-    return [lower_nu_graph(v, max_hw_size=max_hw_size, timeout=timeout, verbose=verbose) for v in variants]
+    return [
+        lower_nu_graph(
+            v,
+            max_hw_size=max_hw_size,
+            timeout=timeout,
+            verbose=verbose,
+            max_workers=max_workers,
+        )
+        for v in variants
+    ]
 
 
 def _build_dag_levels(G: nuGraph) -> list[list[Node]]:
@@ -4284,11 +4399,14 @@ def lower_nu_graph_all_variants(
 ) -> list[nuGraph]:
     """Lower *G* to hardware discovering every valid sketch choice per node.
 
-    Node-level parallelism is used:
+    Two levels of parallelism are used:
 
     1. **Node-level**: nodes that sit at the same DAG level (no data
-       dependency between them) are synthesised concurrently via a
-       ThreadPoolExecutor.
+        dependency between them) are synthesised concurrently via a
+        ThreadPoolExecutor.
+    2. **Sketch-level**: within each node, candidate equivalence checks are
+       dispatched through _synthesize_all_from_pool.
+
      After synthesis the Cartesian product of per-node alternatives is taken.
     Because all valid sketches for a node are semantically equivalent to the
     target, downstream nodes are synthesised against the canonical (first)
@@ -4389,7 +4507,7 @@ def lower_nu_graph_all_variants(
             nd, tgt, pairs = args
             return _lower_node_all(nd, tgt, pairs,
                                    max_hw_size=max_hw_size, timeout=timeout,
-                                   verbose=verbose)
+                                   verbose=verbose, max_workers=max_workers)
 
         node_alts_list: list[list[tuple[list[Node], str, SymTensor]]]
         if max_workers > 1 and len(synthesis) > 1:
@@ -4484,6 +4602,7 @@ def synthesize_hw_graph(
     max_hw_size: int = 2,
     timeout: int = 3000,
     verbose: bool = False,
+    max_workers: int = 4,
 ) -> list[nuGraph]:
     """Generate all variant orderings of *G* and lower each to hw ops.
 
@@ -4492,7 +4611,13 @@ def synthesize_hw_graph(
     during synthesis for manual inspection.
     """
     variants = nu_graph_generation_z3(G)
-    lowered = lower_nu_graph_variants(variants, max_hw_size=max_hw_size, timeout=timeout, verbose=verbose)
+    lowered = lower_nu_graph_variants(
+        variants,
+        max_hw_size=max_hw_size,
+        timeout=timeout,
+        verbose=verbose,
+        max_workers=max_workers,
+    )
     seen: set[str] = set()
     results: list[nuGraph] = []
     for g_hw in lowered:
@@ -5080,6 +5205,123 @@ def _test_synthesis_verbose_reports_candidate_count() -> None:
     print(" synthesis: verbose output reports candidate_count")
 
 
+def _test_synthesis_pool_filters_templates_by_target_constituents() -> None:
+    G = build_kernel_matmul_red_div_graph(4, 8, 16)
+    orig_syms = _graph_symbolic_tensors(G)
+
+    reduce_node = _nodes_by_op(G, "reduce_sum")[0]
+    reduce_pool = _build_synthesis_pool(
+        reduce_node.op,
+        reduce_node.attrs,
+        [orig_syms[inp_id] for inp_id in reduce_node.inputs],
+    )
+    assert not any(sk.op == "activation_reduce" for sk in reduce_pool), \
+        "reduce_sum pool should exclude activation_reduce templates with extra primitives"
+    for sketch in reduce_pool:
+        if sketch.op in ("INPUT", "HOLE") or sketch.op in _LAYOUT_TRANSFORM_OPS:
+            continue
+        assert _template_constituents(sketch).issubset(_op_constituents(reduce_node.op)), \
+            f"reduce_sum pool admitted non-subset template: {_format_sketch(sketch)}"
+    assert any(sk.op == "transpose" for sk in reduce_pool), \
+        "reduce_sum pool should keep the abstract transpose layout template"
+    assert not any(sk.op in {"dma_copy", "tensor_copy", "dma_transpose", "nc_transpose"}
+                   for sk in reduce_pool), \
+        "reduce_sum pool should exclude concrete copy/transpose hardware ops"
+
+    matmul_node = _nodes_by_op(G, "matmul")[0]
+    matmul_pool = _build_synthesis_pool(
+        matmul_node.op,
+        matmul_node.attrs,
+        [orig_syms[inp_id] for inp_id in matmul_node.inputs],
+    )
+    assert any(sk.op == "nc_matmul" for sk in matmul_pool), \
+        "matmul pool should still keep nc_matmul templates"
+    assert any(sk.op == "tensor_tensor" and _operand_to_expr(sk.attrs.get("op")) == "add"
+               for sk in matmul_pool), "matmul pool should keep tensor_tensor add templates"
+    assert any(sk.op == "tensor_tensor" and _operand_to_expr(sk.attrs.get("op")) == "multiply"
+               for sk in matmul_pool), "matmul pool should keep tensor_tensor multiply templates"
+    assert not any(sk.op == "activation_reduce" for sk in matmul_pool), \
+        "matmul pool should exclude activation_reduce templates with extra primitives"
+    assert not any(sk.op == "tensor_tensor" and _operand_to_expr(sk.attrs.get("op")) == "divide"
+                   for sk in matmul_pool), \
+        "matmul pool should exclude tensor_tensor divide templates"
+    assert any(sk.op == "transpose" for sk in matmul_pool), \
+        "matmul pool should keep the abstract transpose layout template"
+    assert not any(sk.op in {"dma_copy", "tensor_copy", "dma_transpose", "nc_transpose"}
+                   for sk in matmul_pool), \
+        "matmul pool should exclude concrete copy/transpose hardware ops"
+    print(" synthesis: pool filtering keeps only subset-compatible templates")
+
+
+def _test_single_operator_sketches_cover_distinct_inputs() -> None:
+    G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
+    orig_syms = _graph_symbolic_tensors(G)
+    div_node = _nodes_by_op(G, "div")[0]
+    input_names = tuple(div_node.inputs)
+    pool = _build_synthesis_pool(
+        div_node.op,
+        div_node.attrs,
+        [orig_syms[inp_id] for inp_id in div_node.inputs],
+    )
+
+    reciprocal_inputs = {
+        sketch.children[0].sym.expr.name
+        for sketch in pool
+        if sketch.op == "reciprocal"
+        and not sketch.has_hole()
+        and sketch.children
+        and sketch.children[0].sym is not None
+        and sketch.children[0].sym.expr is not None
+    }
+    assert reciprocal_inputs == set(input_names), \
+        f"Expected unary single-op sketches over both div inputs, got {sorted(reciprocal_inputs)}"
+
+    divide_pairs = {
+        tuple(
+            child.sym.expr.name
+            for child in sketch.children
+            if child.sym is not None and child.sym.expr is not None
+        )
+        for sketch in pool
+        if sketch.op == "tensor_tensor"
+        and _operand_to_expr(sketch.attrs.get("op")) == "divide"
+        and not sketch.has_hole()
+    }
+    expected_pairs = {
+        (input_names[0], input_names[0]),
+        (input_names[0], input_names[1]),
+        (input_names[1], input_names[0]),
+        (input_names[1], input_names[1]),
+    }
+    assert divide_pairs == expected_pairs, \
+        f"Expected binary single-op sketches over all ordered div input pairs, got {sorted(divide_pairs)}"
+    print(" synthesis: single-op sketches cover distinct concrete inputs")
+
+
+def _test_lower_nu_graph_parallel_levels() -> None:
+    def kernel_parallel_reductions(x, y):
+        return x.sum(axis=1, keep_dims=True) / y.sum(axis=1, keep_dims=True)
+
+    G = _build_graph_from_kernel(
+        kernel_parallel_reductions,
+        ("x", (4, 8)),
+        ("y", (4, 8)),
+    )
+    levels = _build_dag_levels(G)
+    assert any(len([node for node in level if node.op not in {"input"} | _PUBLIC_PASSTHROUGH_OPS]) > 1
+               for level in levels), "Expected a DAG level with multiple synthesis nodes"
+
+    G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000, verbose=False, max_workers=2)
+    assert G_hw is not None, "parallel lower_nu_graph returned None"
+    assert _graph_uses_hw_only(G_hw), "parallel lower_nu_graph left public ops in the graph"
+    pair = _graph_output_sym_lowered(G, G_hw)
+    assert pair is not None, "parallel lower_nu_graph could not extract output syms"
+    orig_sym, hw_sym = pair
+    assert _check_equivalent_quiet(orig_sym, hw_sym, timeout=15000), \
+        "parallel lower_nu_graph result is not equivalent to the original graph"
+    print(" synthesizer: parallel lower_nu_graph handles independent DAG levels")
+
+
 def run_all_tests() -> None:
     print("\n================ RUNNING NU-GRAPH TESTS ================")
     _test_expected_variant_counts()
@@ -5095,6 +5337,9 @@ def run_all_tests() -> None:
     _test_print_graph_includes_symbolic_shapes()
     _test_synthesis_prefers_direct_reduce_candidate()
     _test_synthesis_verbose_reports_candidate_count()
+    _test_synthesis_pool_filters_templates_by_target_constituents()
+    _test_single_operator_sketches_cover_distinct_inputs()
+    _test_lower_nu_graph_parallel_levels()
     print("\n================ RUNNING SYNTHESIZER TESTS =============")
     _test_synthesizer_matmul_red_div()
     _test_synthesizer_rmsnorm_matmul()
