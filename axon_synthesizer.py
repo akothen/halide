@@ -3576,13 +3576,15 @@ def build_kernel_silu_matmul_graph(M: int, K: int, N: int) -> nuGraph:
 
 def print_graph(G: nuGraph) -> None:
     symbolic_shapes: dict[str, tuple[Any, ...]] = {}
+    sym_shape_fallback = "None"
     try:
         symbolic_shapes = {node_id: tensor.shape for node_id, tensor in _graph_symbolic_tensors(G).items()}
-    except Exception:
+    except (KeyError, z3.Z3Exception):
         symbolic_shapes = {}
+        sym_shape_fallback = "unavailable"
     for i, n in enumerate(G.nodes):
         sym_shape = symbolic_shapes.get(n.id)
-        sym_shape_str = _format_shape(sym_shape) if sym_shape is not None else "-"
+        sym_shape_str = _format_shape(sym_shape) if sym_shape is not None else sym_shape_fallback
         print(
             f"[{i}] id={n.id:12s} op={n.op:10s} inputs={n.inputs} "
             f"shape={_format_shape(n.shape)} sym_shape={sym_shape_str} attrs={n.attrs}"
@@ -3739,9 +3741,12 @@ def _test_print_graph_includes_symbolic_shapes() -> None:
         print_graph(G)
     out = buf.getvalue()
     assert "sym_shape=" in out
-    assert "shape=(4, 16)" in out
-    assert "x_d0" in out
-    assert "w_d1" in out
+    x_line = next(line for line in out.splitlines() if "id=x" in line)
+    out_line = next(line for line in out.splitlines() if "id=out" in line)
+    assert "shape=(4, 8)" in x_line
+    assert "sym_shape=(x_d0, x_d1)" in x_line
+    assert "shape=(4, 16)" in out_line
+    assert "sym_shape=(x_d0, w_d1)" in out_line
 
 
 def run_all_tests() -> None:
