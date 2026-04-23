@@ -3200,6 +3200,58 @@ def _swap_with_successor(
     return variants[0] if variants else None
 
 
+def _is_rowwise_div_matmul_swap(op1: Node, op2: Node, G_cur: nuGraph, G_new: nuGraph) -> bool:
+    """Recognize the legal swap of row-wise division across matmul.
+
+    This covers graphs of the form `(x / s) @ w  <->  (x @ w) / s` where the
+    divisor `s` has shape `(rows, 1)` and therefore broadcasts uniformly across
+    the matmul reduction/output columns for each row.
+    """
+    if op1.op != "div" or op2.op != "matmul":
+        return False
+    if len(op1.inputs) != 2 or len(op2.inputs) != 2 or op2.inputs[0] != op1.id:
+        return False
+
+    data_id, scale_id = op1.inputs
+    weight_id = op2.inputs[1]
+
+    data_node = _node_by_id(G_cur, data_id)
+    scale_node = _node_by_id(G_cur, scale_id)
+    weight_node = _node_by_id(G_cur, weight_id)
+    if data_node is None or scale_node is None or weight_node is None:
+        return False
+
+    data_shape = tuple(data_node.shape or ())
+    scale_shape = tuple(scale_node.shape or ())
+    weight_shape = tuple(weight_node.shape or ())
+    div_shape = tuple(op1.shape or ())
+    matmul_shape = tuple(op2.shape or ())
+    if len(data_shape) != 2 or len(scale_shape) != 2 or len(weight_shape) != 2:
+        return False
+    if len(div_shape) != 2 or len(matmul_shape) != 2:
+        return False
+
+    rows, inner = data_shape
+    if scale_shape != (rows, 1):
+        return False
+    if weight_shape[0] != inner:
+        return False
+    if div_shape != data_shape:
+        return False
+    if matmul_shape != (rows, weight_shape[1]):
+        return False
+
+    swapped_out = _node_by_id(G_new, op2.id)
+    if swapped_out is None or swapped_out.op != "div" or swapped_out.inputs[1] != scale_id:
+        return False
+    swapped_mm = _node_by_id(G_new, swapped_out.inputs[0])
+    if swapped_mm is None or swapped_mm.op != "matmul":
+        return False
+    if swapped_mm.inputs != [data_id, weight_id]:
+        return False
+    return _node_by_id(G_new, op1.id) is None
+
+
 def z3_equivalent_order(
     op1: Node, op2: Node, G_cur: nuGraph, G_new: Optional[nuGraph] = None, verbose: bool = False
 ) -> bool:
@@ -3209,13 +3261,17 @@ def z3_equivalent_order(
     rhs = _swap_composition_tensor(G_new, op2.id)
     if lhs is None or rhs is None:
         return False
-    return check_equivalent(
+    if check_equivalent(
         lhs,
         rhs,
         timeout=10000,
         rule_name=f"swap_{op1.id}_{op2.id}",
         verbose=verbose,
-    )
+    ):
+        return True
+    if _is_rowwise_div_matmul_swap(op1, op2, G_cur, G_new):
+        return True
+    return False
 
 
 def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
@@ -3567,8 +3623,14 @@ def _test_rmsnorm_matmul_graph() -> None:
     assert out.shape == (4, 16), f"out shape wrong: {out.shape}"
 
     variants = nu_graph_generation_z3(G, verbose=False)
-    assert len(variants) == 1, f"rmsnorm_matmul should not emit illegal reordered variants, got {len(variants)}"
-    assert graph_signature(variants[0]) == graph_signature(G), "rmsnorm_matmul should keep the original graph only"
+    norm_pos = next(i for i, node in enumerate(G.nodes) if node.id == "norm")
+    out_pos = next(i for i, node in enumerate(G.nodes) if node.id == "out")
+    swapped = _swap_with_successor_variants(G, norm_pos, out_pos, {"x"})
+    assert len(swapped) == 1, "rmsnorm_matmul should have exactly one legal div<->matmul swap"
+    expected_sigs = {graph_signature(G), graph_signature(swapped[0][0])}
+    got_sigs = {graph_signature(variant) for variant in variants}
+    assert len(variants) == 2, f"rmsnorm_matmul should emit original + swapped div/matmul variants, got {len(variants)}"
+    assert got_sigs == expected_sigs, "rmsnorm_matmul emitted an unexpected variant"
     print(" rmsnorm_matmul (+sqrt) graph builds and runs variant generation")
 
 
