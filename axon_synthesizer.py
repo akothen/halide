@@ -3799,11 +3799,9 @@ def _check_equivalent_quiet(
     rhs: SymTensor,
     timeout: int = 3000,
 ) -> bool:
-    """Wrapper around check_equivalent that suppresses diagnostic prints."""
-    buf = io.StringIO()
+    """Wrapper around quiet-by-default check_equivalent."""
     try:
-        with redirect_stdout(buf):
-            return check_equivalent(lhs, rhs, timeout=timeout)
+        return check_equivalent(lhs, rhs, timeout=timeout)
     except Exception:
         return False
 
@@ -3872,9 +3870,12 @@ def _synthesize_from_pool(
                 return sketch
             continue
 
-        # Incomplete sketch – fill the first hole with each pool entry
+        # Incomplete sketch – fill the first hole with each pool entry.
+        # Iterate in reverse so DFS/LIFO explores pool entries in their
+        # declared priority order instead of visiting the last-added template
+        # first.
         can_add_hw_op = sketch.hw_size() < max_hw_size
-        for pool_entry in pool:
+        for pool_entry in reversed(pool):
             # Decide whether this pool entry is allowed at this depth
             if pool_entry.op not in ("INPUT", "HOLE"):
                 if not can_add_hw_op:
@@ -3901,9 +3902,8 @@ def _synthesize_all_from_pool(
     """Like _synthesize_from_pool but returns ALL equivalent sketches.
 
     Phase 1 runs the same DFS worklist as _synthesize_from_pool to enumerate
-    every complete, evaluatable candidate sketch.  Phase 2 dispatches the
-    equivalence check for each candidate to a ThreadPoolExecutor so
-    independent candidates are evaluated concurrently.
+    every complete, evaluatable candidate sketch.  Phase 2 checks each
+    candidate for equivalence in DFS order.
 
     Returns every sketch that passes equivalence (empty list if none).
     When *verbose* is True all sketches and their results are printed in
@@ -3935,7 +3935,7 @@ def _synthesize_all_from_pool(
             continue
 
         can_add_hw_op = sketch.hw_size() < max_hw_size
-        for pool_entry in pool:
+        for pool_entry in reversed(pool):
             if pool_entry.op not in ("INPUT", "HOLE"):
                 if not can_add_hw_op:
                     continue
@@ -3950,33 +3950,25 @@ def _synthesize_all_from_pool(
     if not candidates:
         return []
 
-    # Phase 2: check all candidates in parallel.
+    if verbose:
+        with _VERBOSE_LOCK:
+            print(f"    candidate_count={len(candidates)}")
+
+    # Phase 2: check all candidates in DFS order.
     # z3.main_ctx() is not thread-safe, so every call to check_equivalent
-    # (which constructs z3 formulas and runs a solver) must hold _Z3_LOCK.
-    # This serialises the z3 work while still allowing the thread pool to
-    # overlap non-z3 overhead (future scheduling, Python bookkeeping, etc.).
+    # must hold _Z3_LOCK. Running through a thread pool would serialize on
+    # the same lock anyway and only add scheduling overhead.
     def _check_one(item: tuple[SketchNode, SymTensor]) -> tuple[SketchNode, bool]:
         sketch, cand_sym = item
         try:
             with _Z3_LOCK:
-                return sketch, check_equivalent(target_sym, cand_sym, timeout=timeout)
+                return sketch, _check_equivalent_quiet(target_sym, cand_sym, timeout=timeout)
         except Exception:
             return sketch, False
 
     ordered: dict[int, tuple[SketchNode, bool]] = {}
-    if max_workers > 1 and len(candidates) > 1:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            fs = {executor.submit(_check_one, item): idx
-                  for idx, item in enumerate(candidates)}
-            for future in concurrent.futures.as_completed(fs):
-                idx = fs[future]
-                try:
-                    ordered[idx] = future.result()
-                except Exception:
-                    ordered[idx] = (candidates[idx][0], False)
-    else:
-        for idx, item in enumerate(candidates):
-            ordered[idx] = _check_one(item)
+    for idx, item in enumerate(candidates):
+        ordered[idx] = _check_one(item)
 
     # Phase 3: collect results and emit verbose output in original DFS order
     valid: list[SketchNode] = []
@@ -4292,16 +4284,12 @@ def lower_nu_graph_all_variants(
 ) -> list[nuGraph]:
     """Lower *G* to hardware discovering every valid sketch choice per node.
 
-    Two levels of parallelism are used:
+    Node-level parallelism is used:
 
     1. **Node-level**: nodes that sit at the same DAG level (no data
        dependency between them) are synthesised concurrently via a
        ThreadPoolExecutor.
-    2. **Sketch-level**: within each node, the equivalence check for every
-       complete candidate sketch is dispatched concurrently through
-       _synthesize_all_from_pool.
-
-    After synthesis the Cartesian product of per-node alternatives is taken.
+     After synthesis the Cartesian product of per-node alternatives is taken.
     Because all valid sketches for a node are semantically equivalent to the
     target, downstream nodes are synthesised against the canonical (first)
     alternative, and the remaining combinations are produced by substituting
@@ -5049,6 +5037,49 @@ def _test_print_graph_includes_symbolic_shapes() -> None:
     assert "sym_shape=(x_d0, w_d1)" in out_line
 
 
+def _test_synthesis_prefers_direct_reduce_candidate() -> None:
+    G = build_kernel_matmul_red_div_graph(4, 8, 16)
+    variants = nu_graph_generation_z3(G, verbose=False)
+    gv = variants[0]
+    reduce_node = _nodes_by_op(gv, "reduce_sum")[0]
+    orig_syms = _graph_symbolic_tensors(gv)
+    input_syms = [orig_syms[inp_id] for inp_id in reduce_node.inputs]
+    target_sym = orig_syms[reduce_node.id]
+    pool = _build_synthesis_pool(reduce_node.op, reduce_node.attrs, input_syms)
+
+    sketch = _synthesize_from_pool(target_sym, pool, max_hw_size=2, timeout=500, verbose=False)
+    assert sketch is not None, "Expected to find a direct lowering for reduce_sum"
+    sketch_str = _format_sketch(sketch)
+    assert "tensor_reduce" in sketch_str or sketch.op == "tensor_reduce", \
+        f"Expected reduce-oriented candidate first, got {sketch_str}"
+    print(f" synthesis: reduce_sum prefers reduce-oriented candidate ({sketch_str})")
+
+
+def _test_synthesis_verbose_reports_candidate_count() -> None:
+    G = build_kernel_matmul_red_div_graph(4, 8, 16)
+    variants = nu_graph_generation_z3(G, verbose=False)
+    gv = variants[0]
+    reduce_node = _nodes_by_op(gv, "reduce_sum")[0]
+    orig_syms = _graph_symbolic_tensors(gv)
+    input_syms = [orig_syms[inp_id] for inp_id in reduce_node.inputs]
+    target_sym = orig_syms[reduce_node.id]
+    pool = _build_synthesis_pool(reduce_node.op, reduce_node.attrs, input_syms)
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        _synthesize_all_from_pool(
+            target_sym,
+            pool,
+            max_hw_size=2,
+            timeout=100,
+            verbose=True,
+            max_workers=1,
+        )
+    out = buf.getvalue()
+    assert "candidate_count=" in out, "Expected verbose synthesis output to report candidate_count"
+    print(" synthesis: verbose output reports candidate_count")
+
+
 def run_all_tests() -> None:
     print("\n================ RUNNING NU-GRAPH TESTS ================")
     _test_expected_variant_counts()
@@ -5062,6 +5093,8 @@ def run_all_tests() -> None:
     _test_relu_matmul_graph()
     _test_silu_matmul_graph()
     _test_print_graph_includes_symbolic_shapes()
+    _test_synthesis_prefers_direct_reduce_candidate()
+    _test_synthesis_verbose_reports_candidate_count()
     print("\n================ RUNNING SYNTHESIZER TESTS =============")
     _test_synthesizer_matmul_red_div()
     _test_synthesizer_rmsnorm_matmul()
