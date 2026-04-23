@@ -3532,6 +3532,8 @@ class SketchNode:
 
     def hw_size(self) -> int:
         """Number of hw op nodes (excluding INPUT leaves)."""
+        if self.hole:
+            return 0
         if self.op == "INPUT":
             return 0
         return 1 + builtins.sum(c.hw_size() for c in self.children)
