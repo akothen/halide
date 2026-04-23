@@ -3069,6 +3069,22 @@ def _normalize_dim(d: Any) -> Any:
     return d
 
 
+def _format_dim(d: Any) -> str:
+    d = _normalize_dim(d)
+    if isinstance(d, z3.ArithRef):
+        return str(z3.simplify(d))
+    return str(d)
+
+
+def _format_shape(shape: Optional[tuple[Any, ...]]) -> str:
+    if shape is None:
+        return "None"
+    dims = ", ".join(_format_dim(d) for d in shape)
+    if len(shape) == 1:
+        dims += ","
+    return f"({dims})"
+
+
 def _dims_equal(a: Any, b: Any) -> bool:
     lhs = _to_dim(a) if isinstance(a, int) else a
     rhs = _to_dim(b) if isinstance(b, int) else b
@@ -3559,8 +3575,18 @@ def build_kernel_silu_matmul_graph(M: int, K: int, N: int) -> nuGraph:
 
 
 def print_graph(G: nuGraph) -> None:
+    symbolic_shapes: dict[str, tuple[Any, ...]] = {}
+    try:
+        symbolic_shapes = {node_id: tensor.shape for node_id, tensor in _graph_symbolic_tensors(G).items()}
+    except Exception:
+        symbolic_shapes = {}
     for i, n in enumerate(G.nodes):
-        print(f"[{i}] id={n.id:12s} op={n.op:10s} inputs={n.inputs} shape={n.shape} attrs={n.attrs}")
+        sym_shape = symbolic_shapes.get(n.id)
+        sym_shape_str = _format_shape(sym_shape) if sym_shape is not None else "-"
+        print(
+            f"[{i}] id={n.id:12s} op={n.op:10s} inputs={n.inputs} "
+            f"shape={_format_shape(n.shape)} sym_shape={sym_shape_str} attrs={n.attrs}"
+        )
 
 
 def _variants_for(builder: Callable[[int, int, int], nuGraph], M: int = 4, K: int = 8, N: int = 16) -> list[nuGraph]:
@@ -3703,6 +3729,21 @@ def _test_silu_matmul_graph() -> None:
     assert graph_signature(variants[0]) == graph_signature(G)
 
 
+def _test_print_graph_includes_symbolic_shapes() -> None:
+    import io
+    from contextlib import redirect_stdout
+
+    G = build_kernel_relu_matmul_graph(4, 8, 16)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        print_graph(G)
+    out = buf.getvalue()
+    assert "sym_shape=" in out
+    assert "shape=(4, 16)" in out
+    assert "x_d0" in out
+    assert "w_d1" in out
+
+
 def run_all_tests() -> None:
     print("\n================ RUNNING NU-GRAPH TESTS ================")
     _test_expected_variant_counts()
@@ -3714,6 +3755,7 @@ def run_all_tests() -> None:
     _test_matmul_transpose_graph()
     _test_relu_matmul_graph()
     _test_silu_matmul_graph()
+    _test_print_graph_includes_symbolic_shapes()
     print("=============== ALL TESTS PASSED  =====================\n")
 
 
