@@ -2645,6 +2645,8 @@ class AxonArray:
                 raise TypeError("matmul expects AxonArray operand")
             if len(self.shape) != 2 or len(other.shape) != 2:
                 raise ValueError("matmul expects rank-2 inputs")
+            if not _dims_equal(self.shape[1], other.shape[0]):
+                raise ValueError("matmul expects compatible inner dimensions")
             return AxonArray(_gen_id(op), (self.shape[0], other.shape[1]))
 
         if isinstance(other, AxonArray):
@@ -2775,7 +2777,7 @@ def annotate_shapes_concrete(G: nuGraph) -> nuGraph:
             if len(a_shape) == 2 and len(b_shape) == 2:
                 shape = (_to_int_dim(a_shape[0]), _to_int_dim(b_shape[1]))
             else:
-                shape = tuple(_to_int_dim(d) for d in a_shape)
+                shape = tuple()
         elif n.op == "transpose" and n.inputs:
             in_shape = shapes.get(n.inputs[0], tuple())
             if len(in_shape) == 2:
@@ -2876,7 +2878,9 @@ def z3_equivalent_order(
         scale_shape = shape_map.get(lhs.inputs[1], tuple())
         if len(x_shape) != 2 or len(scale_shape) != 2:
             return False
-        return _dims_equal(scale_shape[0], x_shape[0]) and _dims_equal(scale_shape[1], 1)
+        rows_match = _dims_equal(scale_shape[0], x_shape[0])
+        is_column_scale = _dims_equal(scale_shape[1], 1)
+        return rows_match and is_column_scale
 
     return False
 
