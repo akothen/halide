@@ -2543,6 +2543,16 @@ def _shape_public_reduce(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeRe
     return ShapeResult(ShapeExpr(out_dims if out_dims else [z3.IntVal(1)]), ctx)
 
 
+def _shape_graph_reduce_sum(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
+    return _shape_public_reduce(
+        ins,
+        {
+            "axis": attrs.get("axis"),
+            "keepdims": bool(attrs.get("keep_dims", attrs.get("keepdims", False))),
+        },
+    )
+
+
 def _compile_public_reduce(expr: SymExpr, ins: list[Semantics], out_shape: ShapeExpr) -> Semantics:
     a = ins[0]
     out_fn = _tensor_function(f"V_{expr.name}", out_shape.rank)
@@ -2567,6 +2577,11 @@ def _shape_public_broadcast_to(ins: list[ShapeExpr], attrs: dict[str, Any]) -> S
         return out
     compat = _broadcast_shape(ins[0], out.out)
     return ShapeResult(out.out, compat.ctx)
+
+
+def _shape_graph_broadcast(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
+    target_shape = tuple(ins[1].dims) if len(ins) >= 2 else attrs.get("shape")
+    return _shape_public_broadcast_to(ins[:1], {"shape": target_shape})
 
 
 def _shape_public_expand_dims(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
@@ -2802,11 +2817,15 @@ def _register_public_semantics() -> None:
         compile_rule = _compile_copy if op_name == "store" else _compile_public_opaque
         _ensure_semantics(op_name, shape_rule, compile_rule)
 
+    _ensure_semantics("broadcast", _shape_graph_broadcast, _compile_copy)
     _ensure_semantics("broadcast_to", _shape_public_broadcast_to, _compile_copy)
+    _ensure_semantics("div", _shape_public_binary, _compile_public_binary)
     _ensure_semantics("expand_dims", _shape_public_expand_dims, _compile_public_expand_dims)
     _ensure_semantics("load", _shape_same_as_first, _compile_copy)
     _ensure_semantics("load_transpose2d", _shape_public_transpose2d, _compile_nc_transpose)
     _ensure_semantics("matmul", _shape_public_matmul, _compile_public_matmul)
+    _ensure_semantics("mul", _shape_public_binary, _compile_public_binary)
+    _ensure_semantics("reduce_sum", _shape_graph_reduce_sum, _compile_public_reduce)
     _ensure_semantics("transpose", _shape_public_transpose2d, _compile_nc_transpose)
     _ensure_semantics("where", _shape_public_where, _compile_public_where)
 
@@ -2929,6 +2948,8 @@ def graph_signature(G: nuGraph) -> str:
 def _normalize_dim(d: Any) -> Any:
     if isinstance(d, int):
         return d
+    if isinstance(d, z3.ArithRef):
+        d = z3.simplify(d)
     if isinstance(d, z3.IntNumRef):
         return d.as_long()
     return d
@@ -2940,40 +2961,23 @@ def _dims_equal(a: Any, b: Any) -> bool:
     return _arith_equal(lhs, rhs)
 
 
+def _shape_expr_from_dims(shape: tuple[Any, ...]) -> ShapeExpr:
+    return ShapeExpr([_to_dim(dim) for dim in shape])
+
+
 def annotate_shapes_concrete(G: nuGraph) -> nuGraph:
     shapes: dict[str, tuple[Any, ...]] = {}
     for n in G.nodes:
         if n.op == "input":
             shape = tuple(_normalize_dim(d) for d in n.attrs.get("shape", n.shape or tuple()))
-        elif n.op == "reduce_sum" and n.inputs:
-            in_shape = shapes.get(n.inputs[0], tuple())
-            keep_dims = bool(n.attrs.get("keep_dims", n.attrs.get("keepdims", False)))
-            shape = tuple(_normalize_dim(d) for d in _public_reduce_out_shape(in_shape, n.attrs.get("axis"), keep_dims))
-        elif n.op in {"add", "mul", "div"} and len(n.inputs) >= 2:
-            a_shape = shapes.get(n.inputs[0], tuple())
-            b_shape = shapes.get(n.inputs[1], tuple())
-            shape = tuple(_normalize_dim(d) for d in _public_broadcast_shape_tuple(a_shape, b_shape))
-        elif n.op == "broadcast" and len(n.inputs) >= 2:
-            shape = tuple(_normalize_dim(d) for d in shapes.get(n.inputs[1], tuple()))
-        elif n.op == "matmul" and len(n.inputs) >= 2:
-            a_shape = shapes.get(n.inputs[0], tuple())
-            b_shape = shapes.get(n.inputs[1], tuple())
-            if len(a_shape) == 2 and len(b_shape) == 2:
-                shape = (_normalize_dim(a_shape[0]), _normalize_dim(b_shape[1]))
-            else:
-                shape = tuple()
-        elif n.op == "transpose" and n.inputs:
-            in_shape = shapes.get(n.inputs[0], tuple())
-            if len(in_shape) == 2:
-                shape = (_normalize_dim(in_shape[1]), _normalize_dim(in_shape[0]))
-            else:
-                shape = tuple(_normalize_dim(d) for d in in_shape)
-        elif n.op in {"sqrt", "exp", "relu", "silu"} and n.inputs:
-            shape = tuple(_normalize_dim(d) for d in shapes.get(n.inputs[0], tuple()))
-        elif n.inputs:
-            shape = tuple(_normalize_dim(d) for d in shapes.get(n.inputs[0], tuple()))
         else:
-            shape = tuple(_normalize_dim(d) for d in n.attrs.get("shape", n.shape or tuple()))
+            if n.op not in _SEMANTICS:
+                raise KeyError(f"No shape rule registered for graph op '{n.op}'")
+            shape_rule, _ = _SEMANTICS[n.op]
+            if shape_rule is None:
+                raise KeyError(f"No shape rule registered for graph op '{n.op}'")
+            shape_res = shape_rule([_shape_expr_from_dims(shapes[inp]) for inp in n.inputs], dict(n.attrs))
+            shape = tuple(_normalize_dim(d) for d in shape_res.out.dims)
         n.shape = shape
         shapes[n.id] = shape
     return G
@@ -3027,37 +3031,15 @@ def _sym_expr_from_graph_node(
         shape = tuple(z3.Int(f"{node.id}_d{k}") for k in range(rank))
         return SymTensor(node.id, shape=shape)
 
-    op = node.op
-    attrs = dict(node.attrs)
-    if node.op == "reduce_sum":
-        op = "sum"
-        attrs = {
-            "axis": attrs.get("axis"),
-            "keepdims": bool(attrs.get("keep_dims", attrs.get("keepdims", False))),
-        }
-    elif node.op == "mul":
-        op = "multiply"
-        attrs = {}
-    elif node.op == "div":
-        op = "divide"
-        attrs = {}
-    elif node.op == "add":
-        op = "add"
-        attrs = {}
-    elif node.op == "broadcast":
-        op = "broadcast_to"
-        target = inputs[1]
-        attrs = {"shape": target.shape}
-
-    if op not in _SEMANTICS:
+    if node.op not in _SEMANTICS:
         raise KeyError(f"No symbolic conversion registered for graph op '{node.op}'")
 
-    shape_rule, _ = _SEMANTICS[op]
+    shape_rule, _ = _SEMANTICS[node.op]
     if shape_rule is None:
-        raise KeyError(f"No shape rule registered for symbolic op '{op}'")
-    shape_res = shape_rule([ShapeExpr(list(inp.shape)) for inp in inputs], attrs)
+        raise KeyError(f"No shape rule registered for symbolic op '{node.op}'")
+    shape_res = shape_rule([ShapeExpr(list(inp.shape)) for inp in inputs], dict(node.attrs))
     out_shape = symbolic_shape or tuple(shape_res.out.dims)
-    expr = SymExpr(op, [inp.expr for inp in inputs], out_shape, attrs, node.id)
+    expr = SymExpr(node.op, [inp.expr for inp in inputs], out_shape, dict(node.attrs), node.id)
     return SymTensor(node.id, expr=expr)
 
 
@@ -3169,7 +3151,7 @@ def _swap_with_successor_variants(
             copied = Node(node.id, node.op, list(node.inputs), dict(node.attrs), node.shape)
             new_nodes.append(copied)
 
-        G_new = annotate_shapes_concrete(nuGraph(new_nodes))
+        G_new = nuGraph(new_nodes)
         new_pos = _position_by_id(G_new, op2.id)
         if new_pos is None:
             continue
@@ -3211,7 +3193,7 @@ def z3_equivalent_order(
 
 # COMPLETE THIS FUNCTION
 def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
-    G0 = annotate_shapes_concrete(G.clone())
+    G0 = G.clone()
     M: set[nuGraph] = {G0}
     equivalence_cache: dict[tuple[str, str, str, str], bool] = {}
 
@@ -3271,10 +3253,7 @@ def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
 
         M |= M_next
 
-    out = sorted(M, key=graph_signature)
-    for gv in out:
-        annotate_shapes_concrete(gv)
-    return out
+    return sorted(M, key=graph_signature)
 
 
 
@@ -3668,10 +3647,29 @@ def _test_generic_symbolic_non_equivalence() -> None:
     bad = G.clone()
     bad_out = next(n for n in bad.nodes if n.id == "out")
     bad_out.inputs = ["x", "w"]
-    annotate_shapes_concrete(bad)
     scale = next(n for n in G.nodes if n.id == "scale")
     out = next(n for n in G.nodes if n.id == "out")
     assert not z3_equivalent_order(scale, out, G, bad, verbose=False)
+
+
+def _test_shape_annotation_uses_registered_semantics() -> None:
+    G = build_kernel_reduce_broadcast_mul_graph(4, 8, 16)
+    for node in G.nodes:
+        if node.op != "input":
+            node.shape = None
+    annotate_shapes_concrete(G)
+    assert next(n for n in G.nodes if n.id == "rec").shape == (4, 1)
+    assert next(n for n in G.nodes if n.id == "rec_b").shape == (4, 8)
+    assert next(n for n in G.nodes if n.id == "z").shape == (4, 8)
+    assert next(n for n in G.nodes if n.id == "out").shape == (4, 16)
+
+
+def _test_symbolic_variant_generation_without_shape_metadata() -> None:
+    G = build_kernel_matmul_transpose_graph(4, 8, 16)
+    for node in G.nodes:
+        if node.op != "input":
+            node.shape = None
+    assert len(nu_graph_generation_z3(G, verbose=False)) >= 2
 
 
 def run_all_tests() -> None:
