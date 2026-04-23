@@ -3205,7 +3205,7 @@ def _matches_reduction_scale_distribution_axiom(op1: Node, op2: Node, G_cur: nuG
 
     This encodes the first reduction-element rule
 
-        v * Red^+_X f(X) -> Red^+_X (v * f(X))
+        v * Red_X^+ f(X) -> Red_X^+ (v * f(X))
 
     for the matmul/reduction case. In Python IR we also accept the equivalent
     row-wise division form by treating `(x / s) @ w <-> (x @ w) / s` as
@@ -3230,9 +3230,10 @@ def _matches_reduction_scale_distribution_axiom(op1: Node, op2: Node, G_cur: nuG
     weight_shape = tuple(weight_node.shape or ())
     div_shape = tuple(op1.shape or ())
     matmul_shape = tuple(op2.shape or ())
-    if len(data_shape) != 2 or len(scale_shape) != 2 or len(weight_shape) != 2:
-        return False
-    if len(div_shape) != 2 or len(matmul_shape) != 2:
+    shapes_are_rank2 = builtins.all(
+        len(shape) == 2 for shape in (data_shape, scale_shape, weight_shape, div_shape, matmul_shape)
+    )
+    if not shapes_are_rank2:
         return False
 
     rows, reduction_dim = data_shape
@@ -3265,17 +3266,13 @@ def z3_equivalent_order(
     rhs = _swap_composition_tensor(G_new, op2.id)
     if lhs is None or rhs is None:
         return False
-    if check_equivalent(
+    return check_equivalent(
         lhs,
         rhs,
         timeout=10000,
         rule_name=f"swap_{op1.id}_{op2.id}",
         verbose=verbose,
-    ):
-        return True
-    if _matches_reduction_scale_distribution_axiom(op1, op2, G_cur, G_new):
-        return True
-    return False
+    ) or _matches_reduction_scale_distribution_axiom(op1, op2, G_cur, G_new)
 
 
 def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
@@ -3629,8 +3626,8 @@ def _test_rmsnorm_matmul_graph() -> None:
     variants = nu_graph_generation_z3(G, verbose=False)
     norm_pos = _position_by_id(G, "norm")
     out_pos = _position_by_id(G, "out")
-    assert norm_pos is not None, "Internal test error: rmsnorm_matmul graph missing norm node"
-    assert out_pos is not None, "Internal test error: rmsnorm_matmul graph missing out node"
+    assert norm_pos is not None, "Internal test error: RMSNorm test graph missing norm node"
+    assert out_pos is not None, "Internal test error: RMSNorm test graph missing out node"
     swapped = _swap_with_successor_variants(G, norm_pos, out_pos, {"x"})
     assert len(swapped) == 1, "rmsnorm_matmul should have exactly one legal div<->matmul swap"
     expected_sigs = {graph_signature(G), graph_signature(swapped[0][0])}
