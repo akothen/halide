@@ -451,7 +451,19 @@ def _check_reduction_equivalent_by_body(
         return False
 
     full_ctx = lhs.ctx.merged(rhs.ctx, reduction_extensionality_context())
-    counterexample: Optional[z3.BoolRef] = None
+    solver = z3.Solver()
+    solver.set("timeout", timeout)
+    solver.add(full_ctx.as_formula(), z3.Not(shape_eq))
+    if solver.check() != z3.unsat:
+        return False
+
+    solver = z3.Solver()
+    solver.set("timeout", timeout)
+    solver.add(full_ctx.as_formula(), lhs.reduction.extent != rhs.reduction.extent)
+    if solver.check() != z3.unsat:
+        return False
+
+    counterexample_formula: Optional[z3.BoolRef] = None
 
     if lhs.reduction.outer_rank == 1:
         i = z3.Int("body_eq1_i")
@@ -459,20 +471,14 @@ def _check_reduction_equivalent_by_body(
         bounds = z3.And(
             i >= 0,
             i < lhs.shape.dims[0],
-            i < rhs.shape.dims[0],
             k >= 0,
             k < lhs.reduction.extent,
-            k < rhs.reduction.extent,
         )
-        counterexample = z3.Or(
-            z3.Not(shape_eq),
-            lhs.reduction.extent != rhs.reduction.extent,
-            z3.And(
-                shape_eq,
-                lhs.reduction.extent == rhs.reduction.extent,
-                bounds,
-                BODY1(z3.IntVal(lhs.reduction.body_id), i, k) != BODY1(z3.IntVal(rhs.reduction.body_id), i, k),
-            ),
+        counterexample_formula = z3.And(
+            shape_eq,
+            lhs.reduction.extent == rhs.reduction.extent,
+            bounds,
+            BODY1(z3.IntVal(lhs.reduction.body_id), i, k) != BODY1(z3.IntVal(rhs.reduction.body_id), i, k),
         )
     elif lhs.reduction.outer_rank == 2:
         i = z3.Int("body_eq2_i")
@@ -481,31 +487,24 @@ def _check_reduction_equivalent_by_body(
         bounds = z3.And(
             i >= 0,
             i < lhs.shape.dims[0],
-            i < rhs.shape.dims[0],
             j >= 0,
             j < lhs.shape.dims[1],
-            j < rhs.shape.dims[1],
             k >= 0,
             k < lhs.reduction.extent,
-            k < rhs.reduction.extent,
         )
-        counterexample = z3.Or(
-            z3.Not(shape_eq),
-            lhs.reduction.extent != rhs.reduction.extent,
-            z3.And(
-                shape_eq,
-                lhs.reduction.extent == rhs.reduction.extent,
-                bounds,
-                BODY2(z3.IntVal(lhs.reduction.body_id), i, j, k) != BODY2(z3.IntVal(rhs.reduction.body_id), i, j, k),
-            ),
+        counterexample_formula = z3.And(
+            shape_eq,
+            lhs.reduction.extent == rhs.reduction.extent,
+            bounds,
+            BODY2(z3.IntVal(lhs.reduction.body_id), i, j, k) != BODY2(z3.IntVal(rhs.reduction.body_id), i, j, k),
         )
 
-    if counterexample is None:
+    if counterexample_formula is None:
         return False
 
     solver = z3.Solver()
     solver.set("timeout", timeout)
-    solver.add(full_ctx.as_formula(), counterexample)
+    solver.add(full_ctx.as_formula(), counterexample_formula)
     return solver.check() == z3.unsat
 
 
@@ -622,6 +621,8 @@ def check_equivalent(
     print("lsem.shape:", lsem.shape.dims)
     print("rsem.shape:", rsem.shape.dims)
     shape_eq = _shape_eq(lsem.shape, rsem.shape)
+    if lsem.shape.rank != rsem.shape.rank:
+        return False
 
     preconditions = preconditions or []
     extra_ctx = Context([p.constraint for p in preconditions])
@@ -633,19 +634,23 @@ def check_equivalent(
 
     solver = z3.Solver()
     solver.set("timeout", timeout)
-    solver.add(full_ctx.as_formula())
-    if lsem.shape.rank != rsem.shape.rank:
-        solver.add(z3.BoolVal(True))
-    elif lsem.shape.rank == 0:
-        solver.add(z3.Or(z3.Not(shape_eq), lsem.fn() != rsem.fn()))
-    else:
-        vars = [z3.Int(f"ce_{idx}") for idx in range(lsem.shape.rank)]
-        lhs_bounds = [z3.And(vars[i] >= 0, vars[i] < lsem.shape.dims[i]) for i in range(lsem.shape.rank)]
-        rhs_bounds = [z3.And(vars[i] >= 0, vars[i] < rsem.shape.dims[i]) for i in range(rsem.shape.rank)]
-        bounds = z3.And(*(lhs_bounds + rhs_bounds))
-        solver.add(z3.Or(z3.Not(shape_eq), z3.And(shape_eq, bounds, lsem.fn(*vars) != rsem.fn(*vars))))
+    solver.add(full_ctx.as_formula(), z3.Not(shape_eq))
     res = solver.check()
-    ok = res == z3.unsat
+    if res != z3.unsat:
+        ok = False
+    else:
+        solver = z3.Solver()
+        solver.set("timeout", timeout)
+        solver.add(full_ctx.as_formula(), shape_eq)
+        if lsem.shape.rank == 0:
+            solver.add(lsem.fn() != rsem.fn())
+        else:
+            witness_vars = [z3.Int(f"witness_{idx}") for idx in range(lsem.shape.rank)]
+            lhs_bounds = [z3.And(witness_vars[i] >= 0, witness_vars[i] < lsem.shape.dims[i]) for i in range(lsem.shape.rank)]
+            bounds = z3.And(*lhs_bounds)
+            solver.add(bounds, lsem.fn(*witness_vars) != rsem.fn(*witness_vars))
+        res = solver.check()
+        ok = res == z3.unsat
     if not ok and _check_reduction_equivalent_by_body(lsem, rsem, shape_eq, timeout):
         ok = True
 
@@ -3573,8 +3578,8 @@ def _test_matmul_red_div_graph() -> None:
     variants = nu_graph_generation_z3(G, verbose=False)
     norm_pos = _position_by_id(G, norm.id)
     out_pos = _position_by_id(G, out.id)
-    assert norm_pos is not None, "Internal test error: matmul_red_div test graph missing norm node"
-    assert out_pos is not None, "Internal test error: matmul_red_div test graph missing out node"
+    assert norm_pos is not None, "Internal test error: _test_matmul_red_div_graph missing norm node"
+    assert out_pos is not None, "Internal test error: _test_matmul_red_div_graph missing out node"
     swapped = _swap_with_successor_variants(G, norm_pos, out_pos, {"x"})
     assert len(swapped) == 1, "matmul_red_div should have exactly one legal div/matmul swap"
     assert z3_equivalent_order(G.node_at(norm_pos), G.node_at(out_pos), G, swapped[0][0], verbose=False)
