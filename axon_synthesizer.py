@@ -527,6 +527,25 @@ def compile_expr(expr: SymExpr, cache: dict[int, Semantics]) -> Semantics:
     return sem
 
 
+def _rename_expr_tree(expr: SymExpr, suffix: str, cache: Optional[dict[int, SymExpr]] = None) -> SymExpr:
+    cache = {} if cache is None else cache
+    key = id(expr)
+    if key in cache:
+        return cache[key]
+    if expr.op == "input":
+        renamed = SymExpr(expr.op, [], expr.shape, dict(expr.attrs), expr.name)
+    else:
+        renamed = SymExpr(
+            expr.op,
+            [_rename_expr_tree(inp, suffix, cache) for inp in expr.inputs],
+            expr.shape,
+            dict(expr.attrs),
+            f"{expr.name}{suffix}",
+        )
+    cache[key] = renamed
+    return renamed
+
+
 def check_equivalent(
     lhs: SymTensor,
     rhs: SymTensor,
@@ -535,8 +554,10 @@ def check_equivalent(
     rule_name: Optional[str] = None,
     verbose: bool = False,
 ) -> bool:
-    lsem = compile_expr(lhs.expr, {})
-    rsem = compile_expr(rhs.expr, {})
+    lhs_expr = _rename_expr_tree(lhs.expr, "_lhs")
+    rhs_expr = _rename_expr_tree(rhs.expr, "_rhs")
+    lsem = compile_expr(lhs_expr, {})
+    rsem = compile_expr(rhs_expr, {})
 
     shape_eq = _shape_eq(lsem.shape, rsem.shape)
 
@@ -3540,7 +3561,8 @@ def _test_rmsnorm_matmul_graph() -> None:
     assert out.shape == (4, 16), f"out shape wrong: {out.shape}"
 
     variants = nu_graph_generation_z3(G, verbose=False)
-    assert len(variants) >= 1, "rmsnorm_matmul should emit at least org variant"
+    assert len(variants) == 1, f"rmsnorm_matmul should not emit illegal reordered variants, got {len(variants)}"
+    assert graph_signature(variants[0]) == graph_signature(G), "rmsnorm_matmul should keep the original graph only"
     print(" rmsnorm_matmul (+sqrt) graph builds and runs variant generation")
 
 
@@ -3593,7 +3615,9 @@ def _test_relu_matmul_graph() -> None:
     out = next(n for n in G.nodes if n.id == "out")
     assert z.shape == (4, 8)
     assert out.shape == (4, 16)
-    assert len(nu_graph_generation_z3(G, verbose=False)) >= 1
+    variants = nu_graph_generation_z3(G, verbose=False)
+    assert len(variants) == 1, f"relu_matmul should not push relu past matmul, got {len(variants)} variants"
+    assert graph_signature(variants[0]) == graph_signature(G)
 
 def _test_silu_matmul_graph() -> None:
     G = build_kernel_silu_matmul_graph(4, 8, 16)
@@ -3601,17 +3625,20 @@ def _test_silu_matmul_graph() -> None:
     out = next(n for n in G.nodes if n.id == "out")
     assert z.shape == (4, 8)
     assert out.shape == (4, 16)
-    assert len(nu_graph_generation_z3(G, verbose=False)) >= 1
+    variants = nu_graph_generation_z3(G, verbose=False)
+    assert len(variants) == 1, f"silu_matmul should not push silu past matmul, got {len(variants)} variants"
+    assert graph_signature(variants[0]) == graph_signature(G)
 
 
 def run_all_tests() -> None:
     print("\n================ RUNNING NU-GRAPH TESTS ================")
-    # _test_expected_variant_counts()
-    # _test_no_illegal_reduce_broadcast_swap()
-    # _test_no_illegal_reduce_sqrt_swap()
-    # _test_rmsnorm_matmul_graph()
-    # _test_softmax_matmul_graph()
-    # _test_transpose_matmul_graph()
+    _test_expected_variant_counts()
+    _test_no_illegal_reduce_broadcast_swap()
+    _test_no_illegal_reduce_sqrt_swap()
+    _test_rmsnorm_matmul_graph()
+    _test_softmax_matmul_graph()
+    _test_transpose_matmul_graph()
+    _test_matmul_transpose_graph()
     _test_relu_matmul_graph()
     _test_silu_matmul_graph()
     print("=============== ALL TESTS PASSED  =====================\n")
