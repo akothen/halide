@@ -3,6 +3,8 @@ from __future__ import annotations
 import builtins
 import argparse
 import sys
+import io
+from contextlib import redirect_stdout
 from dataclasses import dataclass, field
 from enum import Enum
 from itertools import combinations, permutations
@@ -2952,9 +2954,29 @@ _register_public_semantics()
 
 
 class AxonArray:
-    def __init__(self, node_id: str, shape: tuple[int, ...]):
+    def __init__(self, node_id: str, shape: tuple[int, ...], nodes: Optional[list[Any]] = None):
         self.node_id = node_id
         self.shape = shape
+        self.nodes = list(nodes) if nodes is not None else [_make_input_node(node_id, shape)]
+
+    @staticmethod
+    def _merge_nodes(inputs: list["AxonArray"]) -> list[Any]:
+        merged: list[Any] = []
+        seen: set[str] = set()
+        for inp in inputs:
+            for node in inp.nodes:
+                if node.id in seen:
+                    continue
+                merged.append(node)
+                seen.add(node.id)
+        return merged
+
+    @staticmethod
+    def _from_op(op: str, inputs: list["AxonArray"], out_shape: tuple[int, ...], attrs: Optional[dict[str, Any]] = None) -> "AxonArray":
+        node_id = _gen_id(op)
+        nodes = AxonArray._merge_nodes(inputs)
+        nodes.append(Node(id=node_id, op=op, inputs=[inp.node_id for inp in inputs], attrs=dict(attrs or {})))
+        return AxonArray(node_id, out_shape, nodes)
 
     def _binary_op(self, other: Any, op: str) -> "AxonArray":
         if op == "matmul":
@@ -2964,13 +2986,14 @@ class AxonArray:
                 raise ValueError("matmul expects rank-2 inputs")
             if not _dims_equal(self.shape[1], other.shape[0]):
                 raise ValueError("matmul expects compatible inner dimensions")
-            return AxonArray(_gen_id(op), (self.shape[0], other.shape[1]))
+            return AxonArray._from_op(op, [self, other], (self.shape[0], other.shape[1]))
 
         if isinstance(other, AxonArray):
             out_shape = tuple(_normalize_dim(d) for d in _public_broadcast_shape_tuple(self.shape, other.shape))
+            return AxonArray._from_op(op, [self, other], out_shape)
         else:
             out_shape = self.shape
-        return AxonArray(_gen_id(op), out_shape)
+            return AxonArray._from_op(op, [self], out_shape, {"scalar": other})
 
     def __add__(self, other: Any) -> "AxonArray":
         return self._binary_op(other, "add")
@@ -2986,27 +3009,32 @@ class AxonArray:
 
     def sum(self, axis: Any = None, keep_dims: bool = False) -> "AxonArray":
         out_shape = _public_reduce_out_shape(self.shape, axis, keep_dims)
-        return AxonArray(_gen_id("reduce_sum"), tuple(_normalize_dim(d) for d in out_shape))
+        return AxonArray._from_op(
+            "reduce_sum",
+            [self],
+            tuple(_normalize_dim(d) for d in out_shape),
+            {"axis": axis, "keep_dims": keep_dims},
+        )
 
     def broadcast_like(self, other: "AxonArray") -> "AxonArray":
-        return AxonArray(_gen_id("broadcast"), other.shape)
+        return AxonArray._from_op("broadcast", [self, other], other.shape)
 
     def sqrt(self) -> "AxonArray":
-        return AxonArray(_gen_id("sqrt"), self.shape)
+        return AxonArray._from_op("sqrt", [self], self.shape)
 
     def exp(self) -> "AxonArray":
-        return AxonArray(_gen_id("exp"), self.shape)
+        return AxonArray._from_op("exp", [self], self.shape)
 
     def transpose(self) -> "AxonArray":
         if len(self.shape) == 2:
-            return AxonArray(_gen_id("transpose"), (self.shape[1], self.shape[0]))
-        return AxonArray(_gen_id("transpose"), self.shape)
+            return AxonArray._from_op("transpose", [self], (self.shape[1], self.shape[0]))
+        return AxonArray._from_op("transpose", [self], self.shape)
 
     def relu(self) -> "AxonArray":
-        return AxonArray(_gen_id("relu"), self.shape)
+        return AxonArray._from_op("relu", [self], self.shape)
 
     def silu(self) -> "AxonArray":
-        return AxonArray(_gen_id("silu"), self.shape)
+        return AxonArray._from_op("silu", [self], self.shape)
 
 
 @dataclass(eq=True, frozen=True)
@@ -3027,6 +3055,10 @@ class Node:
 
     def sig(self) -> NodeSig:
         return NodeSig(self.id, self.op, tuple(self.inputs), tuple(sorted(self.attrs.items())))
+
+
+def _make_input_node(node_id: str, shape: tuple[int, ...]) -> Node:
+    return Node(id=node_id, op="input", inputs=[], attrs={"shape": shape})
 
 
 @dataclass
@@ -3069,6 +3101,22 @@ def _normalize_dim(d: Any) -> Any:
     return d
 
 
+def _format_dim(d: Any) -> str:
+    d = _normalize_dim(d)
+    if isinstance(d, z3.ArithRef):
+        return str(z3.simplify(d))
+    return str(d)
+
+
+def _format_shape(shape: Optional[tuple[Any, ...]]) -> str:
+    if shape is None:
+        return "None"
+    dims = ", ".join(_format_dim(d) for d in shape)
+    if len(shape) == 1:
+        dims += ","
+    return f"({dims})"
+
+
 def _dims_equal(a: Any, b: Any) -> bool:
     lhs = _to_dim(a) if isinstance(a, int) else a
     rhs = _to_dim(b) if isinstance(b, int) else b
@@ -3109,6 +3157,10 @@ def _position_by_id(G: nuGraph, node_id: str) -> Optional[int]:
         if n.id == node_id:
             return i
     return None
+
+
+def _nodes_by_op(G: nuGraph, op: str) -> list[Node]:
+    return [n for n in G.nodes if n.op == op]
 
 
 def _immediate_successor_positions(G: nuGraph, pos: int) -> list[int]:
@@ -3401,166 +3453,77 @@ def kernel_silu_matmul(x: AxonArray, w: AxonArray) -> AxonArray:
     return x.silu() @ w
 
 
-def _base_inputs(M: int, K: int, N: int) -> list[Node]:
-    return [
-        Node(id="x", op="input", inputs=[], attrs={"shape": (M, K)}),
-        Node(id="y", op="input", inputs=[], attrs={"shape": (M, K)}),
-        Node(id="w", op="input", inputs=[], attrs={"shape": (K, N)}),
-    ]
+def _graph_from_axon_array(out: AxonArray) -> nuGraph:
+    G = nuGraph([Node(id=n.id, op=n.op, inputs=list(n.inputs), attrs=dict(n.attrs)) for n in out.nodes])
+    annotate_shapes_concrete(G)
+    return G
+
+
+def _build_graph_from_kernel(kernel: Callable[..., AxonArray], *inputs: tuple[str, tuple[int, ...]]) -> nuGraph:
+    args = [AxonArray(name, shape) for name, shape in inputs]
+    out = kernel(*args)
+    return _graph_from_axon_array(out)
 
 
 def build_kernel_matmul_red_div_graph(M: int, K: int, N: int) -> nuGraph:
-    _ = kernel_matmul_red_div(AxonArray("x", (M, K)), AxonArray("y", (M, K)), AxonArray("w", (K, N)))
-    G = nuGraph(_base_inputs(M, K, N) + [
-        Node(id="rec", op="reduce_sum", inputs=["y"], attrs={"axis": 1, "keep_dims": True}),
-        Node(id="scale", op="div", inputs=["x", "rec"], attrs={}),
-        Node(id="out", op="matmul", inputs=["scale", "w"], attrs={}),
-    ])
-    annotate_shapes_concrete(G)
-    return G
+    return _build_graph_from_kernel(kernel_matmul_red_div, ("x", (M, K)), ("y", (M, K)), ("w", (K, N)))
 
 
 def build_kernel_matmul_red_mul_graph(M: int, K: int, N: int) -> nuGraph:
-    _ = kernel_matmul_red_mul(AxonArray("x", (M, K)), AxonArray("y", (M, K)), AxonArray("w", (K, N)))
-    G = nuGraph(_base_inputs(M, K, N) + [
-        Node(id="rec", op="reduce_sum", inputs=["y"], attrs={"axis": 1, "keep_dims": True}),
-        Node(id="scale", op="mul", inputs=["x", "rec"], attrs={}),
-        Node(id="out", op="matmul", inputs=["scale", "w"], attrs={}),
-    ])
-    annotate_shapes_concrete(G)
-    return G
+    return _build_graph_from_kernel(kernel_matmul_red_mul, ("x", (M, K)), ("y", (M, K)), ("w", (K, N)))
 
 
 def build_kernel_broadcast_row_bias_add_graph(M: int, K: int, N: int) -> nuGraph:
-    _ = kernel_broadcast_row_bias_add(AxonArray("x", (M, K)), AxonArray("y", (M, K)), AxonArray("w", (K, N)))
-    G = nuGraph(_base_inputs(M, K, N) + [
-        Node(id="bias", op="reduce_sum", inputs=["y"], attrs={"axis": 1, "keep_dims": True}),
-        Node(id="bias_b", op="broadcast", inputs=["bias", "x"], attrs={}),
-        Node(id="z", op="add", inputs=["x", "bias_b"], attrs={}),
-        Node(id="out", op="matmul", inputs=["z", "w"], attrs={}),
-    ])
-    annotate_shapes_concrete(G)
-    return G
+    return _build_graph_from_kernel(kernel_broadcast_row_bias_add, ("x", (M, K)), ("y", (M, K)), ("w", (K, N)))
 
 
 def build_kernel_reduce_mul_broadcast_graph(M: int, K: int, N: int) -> nuGraph:
-    _ = kernel_reduce_mul_broadcast(AxonArray("x", (M, K)), AxonArray("y", (M, K)), AxonArray("w", (K, N)))
-    G = nuGraph(_base_inputs(M, K, N) + [
-        Node(id="rec", op="reduce_sum", inputs=["y"], attrs={"axis": 1, "keep_dims": True}),
-        Node(id="z", op="mul", inputs=["x", "rec"], attrs={}),
-        Node(id="z_b", op="broadcast", inputs=["z", "x"], attrs={}),
-        Node(id="out", op="matmul", inputs=["z_b", "w"], attrs={}),
-    ])
-    annotate_shapes_concrete(G)
-    return G
+    return _build_graph_from_kernel(kernel_reduce_mul_broadcast, ("x", (M, K)), ("y", (M, K)), ("w", (K, N)))
 
 
 def build_kernel_reduce_broadcast_mul_graph(M: int, K: int, N: int) -> nuGraph:
-    _ = kernel_reduce_broadcast_mul(AxonArray("x", (M, K)), AxonArray("y", (M, K)), AxonArray("w", (K, N)))
-    G = nuGraph(_base_inputs(M, K, N) + [
-        Node(id="rec", op="reduce_sum", inputs=["y"], attrs={"axis": 1, "keep_dims": True}),
-        Node(id="rec_b", op="broadcast", inputs=["rec", "x"], attrs={}),
-        Node(id="z", op="mul", inputs=["x", "rec_b"], attrs={}),
-        Node(id="out", op="matmul", inputs=["z", "w"], attrs={}),
-    ])
-    annotate_shapes_concrete(G)
-    return G
+    return _build_graph_from_kernel(kernel_reduce_broadcast_mul, ("x", (M, K)), ("y", (M, K)), ("w", (K, N)))
 
 
 def build_kernel_rmsnorm_matmul_graph(M: int, K: int, N: int) -> nuGraph:
-    _ = kernel_rmsnorm_matmul(
-        AxonArray("x", (M, K)),
-        AxonArray("y", (M, K)),
-        AxonArray("w", (K, N)),
-    )
-    nodes = _base_inputs(M, K, N) + [
-        Node(id="yy", op="mul", inputs=["y", "y"], attrs={}),
-        Node(id="rec", op="reduce_sum", inputs=["yy"], attrs={"axis": 1, "keep_dims": True}),
-        Node(id="rms", op="sqrt", inputs=["rec"], attrs={}),
-        Node(id="norm", op="div", inputs=["x", "rms"], attrs={}),
-        Node(id="out", op="matmul", inputs=["norm", "w"], attrs={}),
-    ]
-    G = nuGraph(nodes)
-    annotate_shapes_concrete(G)
-    return G
+    return _build_graph_from_kernel(kernel_rmsnorm_matmul, ("x", (M, K)), ("y", (M, K)), ("w", (K, N)))
 
 
 def build_kernel_softmax_matmul_graph(M: int, K: int, N: int) -> nuGraph:
-    _ = kernel_softmax_matmul(
-        AxonArray("x", (M, K)),
-        AxonArray("w", (K, N)),
-    )
-    nodes = [
-        Node(id="x", op="input", inputs=[], attrs={"shape": (M, K)}),
-        Node(id="w", op="input", inputs=[], attrs={"shape": (K, N)}),
-        Node(id="ex", op="exp", inputs=["x"], attrs={}),                                       # (M,K)
-        Node(id="den", op="reduce_sum", inputs=["ex"], attrs={"axis": 1, "keep_dims": True}),  # (M,1)
-        Node(id="probs", op="div", inputs=["ex", "den"], attrs={}),                             # (M,K)
-        Node(id="out", op="matmul", inputs=["probs", "w"], attrs={}),                           # (M,N)
-    ]
-    G = nuGraph(nodes)
-    annotate_shapes_concrete(G)
-    return G
+    return _build_graph_from_kernel(kernel_softmax_matmul, ("x", (M, K)), ("w", (K, N)))
 
 
 def build_kernel_transpose_matmul_graph(M: int, K: int, N: int) -> nuGraph:
-    _ = kernel_transpose_matmul(
-        AxonArray("x", (M, K)),
-        AxonArray("w", (M, N)),
-    )
-    nodes = [
-        Node(id="x", op="input", inputs=[], attrs={"shape": (M, K)}),
-        Node(id="w", op="input", inputs=[], attrs={"shape": (M, N)}),
-        Node(id="xt", op="transpose", inputs=["x"], attrs={}),       # (K,M)
-        Node(id="out", op="matmul", inputs=["xt", "w"], attrs={}),   # (K,N)
-    ]
-    G = nuGraph(nodes)
-    annotate_shapes_concrete(G)
-    return G
+    return _build_graph_from_kernel(kernel_transpose_matmul, ("x", (M, K)), ("w", (M, N)))
 
 
 def build_kernel_matmul_transpose_graph(M: int, K: int, N: int) -> nuGraph:
-    _ = kernel_matmul_transpose(
-        AxonArray("x", (M, K)),
-        AxonArray("w", (K, N)),
-    )
-    nodes = [
-        Node(id="x", op="input", inputs=[], attrs={"shape": (M, K)}),
-        Node(id="w", op="input", inputs=[], attrs={"shape": (K, N)}),
-        Node(id="mm", op="matmul", inputs=["x", "w"], attrs={}),
-        Node(id="out", op="transpose", inputs=["mm"], attrs={}),
-    ]
-    G = nuGraph(nodes)
-    annotate_shapes_concrete(G)
-    return G
+    return _build_graph_from_kernel(kernel_matmul_transpose, ("x", (M, K)), ("w", (K, N)))
 
 
 def build_kernel_relu_matmul_graph(M: int, K: int, N: int) -> nuGraph:
-    _ = kernel_relu_matmul(AxonArray("x", (M, K)), AxonArray("w", (K, N)))
-    G = nuGraph([
-        Node(id="x", op="input", inputs=[], attrs={"shape": (M, K)}),
-        Node(id="w", op="input", inputs=[], attrs={"shape": (K, N)}),
-        Node(id="z", op="relu", inputs=["x"], attrs={}),
-        Node(id="out", op="matmul", inputs=["z", "w"], attrs={}),
-    ])
-    annotate_shapes_concrete(G)
-    return G
+    return _build_graph_from_kernel(kernel_relu_matmul, ("x", (M, K)), ("w", (K, N)))
+
 
 def build_kernel_silu_matmul_graph(M: int, K: int, N: int) -> nuGraph:
-    _ = kernel_silu_matmul(AxonArray("x", (M, K)), AxonArray("w", (K, N)))
-    G = nuGraph([
-        Node(id="x", op="input", inputs=[], attrs={"shape": (M, K)}),
-        Node(id="w", op="input", inputs=[], attrs={"shape": (K, N)}),
-        Node(id="z", op="silu", inputs=["x"], attrs={}),
-        Node(id="out", op="matmul", inputs=["z", "w"], attrs={}),
-    ])
-    annotate_shapes_concrete(G)
-    return G
+    return _build_graph_from_kernel(kernel_silu_matmul, ("x", (M, K)), ("w", (K, N)))
 
 
 def print_graph(G: nuGraph) -> None:
+    symbolic_shapes: dict[str, tuple[Any, ...]] = {}
+    sym_shape_fallback = "None"
+    try:
+        symbolic_shapes = {node_id: tensor.shape for node_id, tensor in _graph_symbolic_tensors(G).items()}
+    except (KeyError, z3.Z3Exception):
+        symbolic_shapes = {}
+        sym_shape_fallback = "unavailable"
     for i, n in enumerate(G.nodes):
-        print(f"[{i}] id={n.id:12s} op={n.op:10s} inputs={n.inputs} shape={n.shape} attrs={n.attrs}")
+        sym_shape = symbolic_shapes.get(n.id)
+        sym_shape_str = _format_shape(sym_shape) if sym_shape is not None else sym_shape_fallback
+        print(
+            f"[{i}] id={n.id:12s} op={n.op:10s} inputs={n.inputs} "
+            f"shape={_format_shape(n.shape)} sym_shape={sym_shape_str} attrs={n.attrs}"
+        )
 
 
 def _variants_for(builder: Callable[[int, int, int], nuGraph], M: int = 4, K: int = 8, N: int = 16) -> list[nuGraph]:
@@ -3586,8 +3549,8 @@ def _test_expected_variant_counts() -> None:
 
 def _test_no_illegal_reduce_broadcast_swap() -> None:
     G = build_kernel_reduce_broadcast_mul_graph(4, 8, 16)
-    rec = next(n for n in G.nodes if n.id == "rec")
-    rec_b = next(n for n in G.nodes if n.id == "rec_b")
+    rec = _nodes_by_op(G, "reduce_sum")[0]
+    rec_b = _nodes_by_op(G, "broadcast")[0]
     ok = z3_equivalent_order(rec, rec_b, G, verbose=False)
     assert not ok, "reduce_sum <-> broadcast must be rejected"
     print(" reduce_sum<->broadcast illegal swap rejected")
@@ -3595,8 +3558,8 @@ def _test_no_illegal_reduce_broadcast_swap() -> None:
 
 def _test_no_illegal_reduce_sqrt_swap() -> None:
     G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
-    rec = next(n for n in G.nodes if n.id == "rec")
-    rms = next(n for n in G.nodes if n.id == "rms")
+    rec = _nodes_by_op(G, "reduce_sum")[0]
+    rms = _nodes_by_op(G, "sqrt")[0]
     ok = z3_equivalent_order(rec, rms, G, verbose=False)
     assert not ok, "reduce_sum <-> sqrt must be rejected by axioms"
     print(" reduce_sum<->sqrt illegal swap rejected (axiomatic)")
@@ -3605,11 +3568,13 @@ def _test_no_illegal_reduce_sqrt_swap() -> None:
 def _test_rmsnorm_matmul_graph() -> None:
     G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
 
-    yy = next(n for n in G.nodes if n.id == "yy")
-    rec = next(n for n in G.nodes if n.id == "rec")
-    rms = next(n for n in G.nodes if n.id == "rms")
-    norm = next(n for n in G.nodes if n.id == "norm")
-    out = next(n for n in G.nodes if n.id == "out")
+    # Find y*y node where both inputs reference the same tensor id.
+    yy = next((n for n in _nodes_by_op(G, "mul") if len(n.inputs) == 2 and n.inputs[0] == n.inputs[1]), None)
+    assert yy is not None, "Internal test error: rmsnorm_matmul graph missing y*y node"
+    rec = _nodes_by_op(G, "reduce_sum")[0]
+    rms = _nodes_by_op(G, "sqrt")[0]
+    norm = _nodes_by_op(G, "div")[0]
+    out = _nodes_by_op(G, "matmul")[0]
 
     assert yy.shape == (4, 8), f"yy shape wrong: {yy.shape}"
     assert rec.shape == (4, 1), f"rec shape wrong: {rec.shape}"
@@ -3618,8 +3583,8 @@ def _test_rmsnorm_matmul_graph() -> None:
     assert out.shape == (4, 16), f"out shape wrong: {out.shape}"
 
     variants = nu_graph_generation_z3(G, verbose=False)
-    norm_pos = _position_by_id(G, "norm")
-    out_pos = _position_by_id(G, "out")
+    norm_pos = _position_by_id(G, norm.id)
+    out_pos = _position_by_id(G, out.id)
     assert norm_pos is not None, "Internal test error: rmsnorm_matmul test graph missing norm node"
     assert out_pos is not None, "Internal test error: rmsnorm_matmul test graph missing out node"
     swapped = _swap_with_successor_variants(G, norm_pos, out_pos, {"x"})
@@ -3634,10 +3599,10 @@ def _test_rmsnorm_matmul_graph() -> None:
 
 def _test_softmax_matmul_graph() -> None:
     G = build_kernel_softmax_matmul_graph(4, 8, 16)
-    ex = next(n for n in G.nodes if n.id == "ex")
-    den = next(n for n in G.nodes if n.id == "den")
-    probs = next(n for n in G.nodes if n.id == "probs")
-    out = next(n for n in G.nodes if n.id == "out")
+    ex = _nodes_by_op(G, "exp")[0]
+    den = _nodes_by_op(G, "reduce_sum")[0]
+    probs = _nodes_by_op(G, "div")[0]
+    out = _nodes_by_op(G, "matmul")[0]
 
     assert ex.shape == (4, 8), f"ex shape wrong: {ex.shape}"
     assert den.shape == (4, 1), f"den shape wrong: {den.shape}"
@@ -3651,8 +3616,8 @@ def _test_softmax_matmul_graph() -> None:
 
 def _test_transpose_matmul_graph() -> None:
     G = build_kernel_transpose_matmul_graph(4, 8, 16)
-    xt = next(n for n in G.nodes if n.id == "xt")
-    out = next(n for n in G.nodes if n.id == "out")
+    xt = _nodes_by_op(G, "transpose")[0]
+    out = _nodes_by_op(G, "matmul")[0]
 
     assert xt.shape == (8, 4), f"xt shape wrong: {xt.shape}"
     assert out.shape == (8, 16), f"out shape wrong: {out.shape}"
@@ -3664,8 +3629,8 @@ def _test_transpose_matmul_graph() -> None:
 
 def _test_matmul_transpose_graph() -> None:
     G = build_kernel_matmul_transpose_graph(4, 8, 16)
-    mm = next(n for n in G.nodes if n.id == "mm")
-    out = next(n for n in G.nodes if n.id == "out")
+    mm = _nodes_by_op(G, "matmul")[0]
+    out = _nodes_by_op(G, "transpose")[0]
 
     assert mm.shape == (4, 16), f"mm shape wrong: {mm.shape}"
     assert out.shape == (16, 4), f"out shape wrong: {out.shape}"
@@ -3677,15 +3642,15 @@ def _test_matmul_transpose_graph() -> None:
 
 def _test_relu_matmul_graph() -> None:
     G = build_kernel_relu_matmul_graph(4, 8, 16)
-    z = next(n for n in G.nodes if n.id == "z")
-    out = next(n for n in G.nodes if n.id == "out")
+    z = _nodes_by_op(G, "relu")[0]
+    out = _nodes_by_op(G, "matmul")[0]
     assert z.shape == (4, 8)
     assert out.shape == (4, 16)
     variants = nu_graph_generation_z3(G, verbose=False)
     assert len(variants) == 1, f"relu_matmul should not push relu past matmul, got {len(variants)} variants"
     assert graph_signature(variants[0]) == graph_signature(G)
-    z_pos = _position_by_id(G, "z")
-    out_pos = _position_by_id(G, "out")
+    z_pos = _position_by_id(G, z.id)
+    out_pos = _position_by_id(G, out.id)
     assert z_pos is not None and out_pos is not None
     illegal_swaps = _swap_with_successor_variants(G, z_pos, out_pos, {"x"})
     assert illegal_swaps, "relu_matmul should generate a candidate illegal swap for rejection testing"
@@ -3693,14 +3658,32 @@ def _test_relu_matmul_graph() -> None:
 
 def _test_silu_matmul_graph() -> None:
     G = build_kernel_silu_matmul_graph(4, 8, 16)
-    z = next(n for n in G.nodes if n.id == "z")
-    out = _node_by_id(G, "out")
+    z = _nodes_by_op(G, "silu")[0]
+    out = _nodes_by_op(G, "matmul")[0]
     assert out is not None, "Internal test error: silu_matmul graph missing out node"
     assert z.shape == (4, 8)
     assert out.shape == (4, 16)
     variants = nu_graph_generation_z3(G, verbose=False)
     assert len(variants) == 1, f"silu_matmul should not push silu past matmul, got {len(variants)} variants"
     assert graph_signature(variants[0]) == graph_signature(G)
+
+
+def _test_print_graph_includes_symbolic_shapes() -> None:
+    G = build_kernel_relu_matmul_graph(4, 8, 16)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        print_graph(G)
+    out = buf.getvalue()
+    assert "sym_shape=" in out
+    lines = out.splitlines()
+    x_line = next((line for line in lines if "id=x" in line and "op=input" in line), None)
+    out_line = next((line for line in lines if "op=matmul" in line), None)
+    assert x_line is not None, "Expected print_graph output line for input node x"
+    assert out_line is not None, "Expected print_graph output line for matmul node"
+    assert "shape=(4, 8)" in x_line
+    assert "sym_shape=(x_d0, x_d1)" in x_line
+    assert "shape=(4, 16)" in out_line
+    assert "sym_shape=(x_d0, w_d1)" in out_line
 
 
 def run_all_tests() -> None:
@@ -3714,6 +3697,7 @@ def run_all_tests() -> None:
     _test_matmul_transpose_graph()
     _test_relu_matmul_graph()
     _test_silu_matmul_graph()
+    _test_print_graph_includes_symbolic_shapes()
     print("=============== ALL TESTS PASSED  =====================\n")
 
 
