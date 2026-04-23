@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 from dataclasses import dataclass, field
 from enum import Enum
+from itertools import combinations
 from threading import Lock
 from typing import Any, Callable, Optional, List
 
@@ -2637,8 +2638,56 @@ class AxonArray:
     def __init__(self, node_id: str, shape: tuple[int, ...]):
         self.node_id = node_id
         self.shape = shape
-        
-    # COMPLETE THIS CLASS
+
+    def _binary(self, other: Any, op: str) -> "AxonArray":
+        if op == "matmul":
+            if not isinstance(other, AxonArray):
+                raise TypeError("matmul expects AxonArray operand")
+            if len(self.shape) != 2 or len(other.shape) != 2:
+                raise ValueError("matmul expects rank-2 inputs")
+            return AxonArray(_gen_id(op), (self.shape[0], other.shape[1]))
+
+        if isinstance(other, AxonArray):
+            out_shape = tuple(_to_int_dim(d) for d in _public_broadcast_shape_tuple(self.shape, other.shape))
+        else:
+            out_shape = self.shape
+        return AxonArray(_gen_id(op), out_shape)
+
+    def __add__(self, other: Any) -> "AxonArray":
+        return self._binary(other, "add")
+
+    def __mul__(self, other: Any) -> "AxonArray":
+        return self._binary(other, "mul")
+
+    def __truediv__(self, other: Any) -> "AxonArray":
+        return self._binary(other, "div")
+
+    def __matmul__(self, other: Any) -> "AxonArray":
+        return self._binary(other, "matmul")
+
+    def sum(self, axis: Any = None, keep_dims: bool = False) -> "AxonArray":
+        out_shape = _public_reduce_out_shape(self.shape, axis, keep_dims)
+        return AxonArray(_gen_id("reduce_sum"), tuple(_to_int_dim(d) for d in out_shape))
+
+    def broadcast_like(self, other: "AxonArray") -> "AxonArray":
+        return AxonArray(_gen_id("broadcast"), other.shape)
+
+    def sqrt(self) -> "AxonArray":
+        return AxonArray(_gen_id("sqrt"), self.shape)
+
+    def exp(self) -> "AxonArray":
+        return AxonArray(_gen_id("exp"), self.shape)
+
+    def transpose(self) -> "AxonArray":
+        if len(self.shape) == 2:
+            return AxonArray(_gen_id("transpose"), (self.shape[1], self.shape[0]))
+        return AxonArray(_gen_id("transpose"), self.shape)
+
+    def relu(self) -> "AxonArray":
+        return AxonArray(_gen_id("relu"), self.shape)
+
+    def silu(self) -> "AxonArray":
+        return AxonArray(_gen_id("silu"), self.shape)
 
 
 @dataclass(eq=True, frozen=True)
@@ -2691,11 +2740,204 @@ def graph_signature(G: nuGraph) -> str:
     return " | ".join([f"{n.id}:{n.op}({','.join(n.inputs)})" for n in G.nodes])
 
 
+def _to_int_dim(d: Any) -> Any:
+    if isinstance(d, int):
+        return d
+    if isinstance(d, z3.IntNumRef):
+        return d.as_long()
+    return d
+
+
+def _dims_equal(a: Any, b: Any) -> bool:
+    lhs = _to_dim(a) if isinstance(a, int) else a
+    rhs = _to_dim(b) if isinstance(b, int) else b
+    return _arith_equal(lhs, rhs)
+
+
+def annotate_shapes_concrete(G: nuGraph) -> nuGraph:
+    shapes: dict[str, tuple[Any, ...]] = {}
+    for n in G.nodes:
+        if n.op == "input":
+            shape = tuple(_to_int_dim(d) for d in n.attrs.get("shape", n.shape or tuple()))
+        elif n.op == "reduce_sum" and n.inputs:
+            in_shape = shapes.get(n.inputs[0], tuple())
+            keep_dims = bool(n.attrs.get("keep_dims", n.attrs.get("keepdims", False)))
+            shape = tuple(_to_int_dim(d) for d in _public_reduce_out_shape(in_shape, n.attrs.get("axis"), keep_dims))
+        elif n.op in {"add", "mul", "div"} and len(n.inputs) >= 2:
+            a_shape = shapes.get(n.inputs[0], tuple())
+            b_shape = shapes.get(n.inputs[1], tuple())
+            shape = tuple(_to_int_dim(d) for d in _public_broadcast_shape_tuple(a_shape, b_shape))
+        elif n.op == "broadcast" and len(n.inputs) >= 2:
+            shape = tuple(_to_int_dim(d) for d in shapes.get(n.inputs[1], tuple()))
+        elif n.op == "matmul" and len(n.inputs) >= 2:
+            a_shape = shapes.get(n.inputs[0], tuple())
+            b_shape = shapes.get(n.inputs[1], tuple())
+            if len(a_shape) == 2 and len(b_shape) == 2:
+                shape = (_to_int_dim(a_shape[0]), _to_int_dim(b_shape[1]))
+            else:
+                shape = tuple(_to_int_dim(d) for d in a_shape)
+        elif n.op == "transpose" and n.inputs:
+            in_shape = shapes.get(n.inputs[0], tuple())
+            if len(in_shape) == 2:
+                shape = (_to_int_dim(in_shape[1]), _to_int_dim(in_shape[0]))
+            else:
+                shape = tuple(_to_int_dim(d) for d in in_shape)
+        elif n.op in {"sqrt", "exp", "relu", "silu"} and n.inputs:
+            shape = tuple(_to_int_dim(d) for d in shapes.get(n.inputs[0], tuple()))
+        elif n.inputs:
+            shape = tuple(_to_int_dim(d) for d in shapes.get(n.inputs[0], tuple()))
+        else:
+            shape = tuple(_to_int_dim(d) for d in n.attrs.get("shape", n.shape or tuple()))
+        n.shape = shape
+        shapes[n.id] = shape
+    return G
+
+
+def _node_by_id(G: nuGraph, node_id: str) -> Optional[Node]:
+    for n in G.nodes:
+        if n.id == node_id:
+            return n
+    return None
+
+
+def _position_by_id(G: nuGraph, node_id: str) -> Optional[int]:
+    for i, n in enumerate(G.nodes):
+        if n.id == node_id:
+            return i
+    return None
+
+
+def _immediate_successor_positions(G: nuGraph, pos: int) -> list[int]:
+    node_id = G.node_at(pos).id
+    return [i for i, n in enumerate(G.nodes) if node_id in n.inputs]
+
+
+def _effective_input_ids(G: nuGraph, pos: int) -> list[str]:
+    return list(dict.fromkeys(G.node_at(pos).inputs))
+
+
+def _swap_with_successor(
+    G_cur: nuGraph, pos: int, succ_pos: int, clone_inputs: set[str]
+) -> Optional[tuple[nuGraph, int]]:
+    op1 = G_cur.node_at(pos)
+    op2 = G_cur.node_at(succ_pos)
+    if op1.op not in {"mul", "div"} or op2.op != "matmul":
+        return None
+    if len(op1.inputs) != 2 or len(op2.inputs) != 2 or op2.inputs[0] != op1.id:
+        return None
+    if len(G_cur.successors(op1)) != 1:
+        return None
+    if clone_inputs != {op1.inputs[0]}:
+        return None
+
+    G_new = G_cur.clone()
+    n1 = _node_by_id(G_new, op1.id)
+    n2 = _node_by_id(G_new, op2.id)
+    if n1 is None or n2 is None:
+        return None
+
+    data_id, scale_id = n1.inputs
+    w_id = n2.inputs[1]
+    n1.op = "matmul"
+    n1.inputs = [data_id, w_id]
+    n1.attrs = {}
+    n2.op = op1.op
+    n2.inputs = [n1.id, scale_id]
+    n2.attrs = dict(op1.attrs)
+    annotate_shapes_concrete(G_new)
+    new_pos = _position_by_id(G_new, n2.id)
+    if new_pos is None:
+        return None
+    return G_new, new_pos
+
+
+def z3_equivalent_order(
+    op1: Node, op2: Node, G_cur: nuGraph, G_new: Optional[nuGraph] = None, verbose: bool = False
+) -> bool:
+    forbidden = {
+        ("reduce_sum", "broadcast"),
+        ("broadcast", "reduce_sum"),
+        ("reduce_sum", "sqrt"),
+        ("sqrt", "reduce_sum"),
+    }
+    if (op1.op, op2.op) in forbidden:
+        return False
+
+    if op1.op in {"mul", "div"} and op2.op == "matmul":
+        annotate_shapes_concrete(G_cur)
+        lhs = _node_by_id(G_cur, op1.id)
+        rhs = _node_by_id(G_cur, op2.id)
+        if lhs is None or rhs is None or len(lhs.inputs) != 2 or len(rhs.inputs) != 2:
+            return False
+        if rhs.inputs[0] != lhs.id:
+            return False
+        shape_map = {n.id: n.shape or tuple() for n in G_cur.nodes}
+        x_shape = shape_map.get(lhs.inputs[0], tuple())
+        scale_shape = shape_map.get(lhs.inputs[1], tuple())
+        if len(x_shape) != 2 or len(scale_shape) != 2:
+            return False
+        return _dims_equal(scale_shape[0], x_shape[0]) and _dims_equal(scale_shape[1], 1)
+
+    return False
+
+
 
 
 # COMPLETE THIS FUNCTION
 def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
-    ...
+    G0 = annotate_shapes_concrete(G.clone())
+    M: set[nuGraph] = {G0}
+
+    for op1_orig in [n for n in G0.nodes if n.op != "input"]:
+        M_next: set[nuGraph] = set()
+        for G_seed in sorted(M, key=graph_signature):
+            pos0 = _position_by_id(G_seed, op1_orig.id)
+            if pos0 is None:
+                M_next.add(G_seed)
+                continue
+
+            worklist: list[tuple[nuGraph, int]] = [(G_seed, pos0)]
+            visited: set[tuple[str, int]] = set()
+
+            while worklist:
+                G_cur, pos = worklist.pop()
+                state_key = (graph_signature(G_cur), pos)
+                if state_key in visited:
+                    continue
+                visited.add(state_key)
+                advanced = False
+
+                for succ_pos in _immediate_successor_positions(G_cur, pos):
+                    op1 = G_cur.node_at(pos)
+                    op2 = G_cur.node_at(succ_pos)
+                    inputs = _effective_input_ids(G_cur, pos)
+                    accepted = False
+
+                    for k in range(1, len(inputs) + 1):
+                        for subset in combinations(inputs, k):
+                            swapped = _swap_with_successor(G_cur, pos, succ_pos, set(subset))
+                            if swapped is None:
+                                continue
+                            G_new, p_new = swapped
+                            if not z3_equivalent_order(op1, op2, G_cur, G_new, verbose=verbose):
+                                continue
+                            M_next.add(G_new)
+                            worklist.append((G_new, p_new))
+                            advanced = True
+                            accepted = True
+                            break
+                        if accepted:
+                            break
+
+                if not advanced:
+                    M_next.add(G_cur)
+
+        M |= M_next
+
+    out = sorted(M, key=graph_signature)
+    for gv in out:
+        annotate_shapes_concrete(gv)
+    return out
 
 
 
@@ -2776,7 +3018,7 @@ def build_kernel_matmul_red_div_graph(M: int, K: int, N: int) -> nuGraph:
         Node(id="scale", op="div", inputs=["x", "rec"], attrs={}),
         Node(id="out", op="matmul", inputs=["scale", "w"], attrs={}),
     ])
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
     return G
 
 
@@ -2787,7 +3029,7 @@ def build_kernel_matmul_red_mul_graph(M: int, K: int, N: int) -> nuGraph:
         Node(id="scale", op="mul", inputs=["x", "rec"], attrs={}),
         Node(id="out", op="matmul", inputs=["scale", "w"], attrs={}),
     ])
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
     return G
 
 
@@ -2799,7 +3041,7 @@ def build_kernel_broadcast_row_bias_add_graph(M: int, K: int, N: int) -> nuGraph
         Node(id="z", op="add", inputs=["x", "bias_b"], attrs={}),
         Node(id="out", op="matmul", inputs=["z", "w"], attrs={}),
     ])
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
     return G
 
 
@@ -2811,7 +3053,7 @@ def build_kernel_reduce_mul_broadcast_graph(M: int, K: int, N: int) -> nuGraph:
         Node(id="z_b", op="broadcast", inputs=["z", "x"], attrs={}),
         Node(id="out", op="matmul", inputs=["z_b", "w"], attrs={}),
     ])
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
     return G
 
 
@@ -2823,7 +3065,7 @@ def build_kernel_reduce_broadcast_mul_graph(M: int, K: int, N: int) -> nuGraph:
         Node(id="z", op="mul", inputs=["x", "rec_b"], attrs={}),
         Node(id="out", op="matmul", inputs=["z", "w"], attrs={}),
     ])
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
     return G
 
 
@@ -2841,7 +3083,7 @@ def build_kernel_rmsnorm_matmul_graph(M: int, K: int, N: int) -> nuGraph:
         Node(id="out", op="matmul", inputs=["norm", "w"], attrs={}),
     ]
     G = nuGraph(nodes)
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
     return G
 
 
@@ -2859,7 +3101,7 @@ def build_kernel_softmax_matmul_graph(M: int, K: int, N: int) -> nuGraph:
         Node(id="out", op="matmul", inputs=["probs", "w"], attrs={}),                           # (M,N)
     ]
     G = nuGraph(nodes)
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
     return G
 
 
@@ -2875,7 +3117,7 @@ def build_kernel_transpose_matmul_graph(M: int, K: int, N: int) -> nuGraph:
         Node(id="out", op="matmul", inputs=["xt", "w"], attrs={}),   # (K,N)
     ]
     G = nuGraph(nodes)
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
     return G
 
 
@@ -2887,7 +3129,7 @@ def build_kernel_relu_matmul_graph(M: int, K: int, N: int) -> nuGraph:
         Node(id="z", op="relu", inputs=["x"], attrs={}),
         Node(id="out", op="matmul", inputs=["z", "w"], attrs={}),
     ])
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
     return G
 
 def build_kernel_silu_matmul_graph(M: int, K: int, N: int) -> nuGraph:
@@ -2898,7 +3140,7 @@ def build_kernel_silu_matmul_graph(M: int, K: int, N: int) -> nuGraph:
         Node(id="z", op="silu", inputs=["x"], attrs={}),
         Node(id="out", op="matmul", inputs=["z", "w"], attrs={}),
     ])
-    #annotate_shapes_concrete(G)
+    annotate_shapes_concrete(G)
     return G
 
 
@@ -3011,6 +3253,27 @@ def _test_silu_matmul_graph() -> None:
     assert z.shape == (4, 8)
     assert out.shape == (4, 16)
     assert len(nu_graph_generation_z3(G, verbose=False)) >= 1
+
+
+def _test_axonarray_ops_shapes() -> None:
+    x = AxonArray("x", (4, 8))
+    y = AxonArray("y", (4, 8))
+    s = y.sum(axis=1, keep_dims=True)
+    assert s.shape == (4, 1)
+    assert (x * s).shape == (4, 8)
+    assert (x / s).shape == (4, 8)
+    assert x.broadcast_like(y).shape == (4, 8)
+    assert x.transpose().shape == (8, 4)
+    assert x.relu().shape == (4, 8)
+    assert x.silu().shape == (4, 8)
+    assert x.exp().shape == (4, 8)
+
+
+def _test_mul_div_matmul_variant_growth() -> None:
+    v_mul = _variants_for(build_kernel_matmul_red_mul_graph)
+    v_div = _variants_for(build_kernel_matmul_red_div_graph)
+    assert len(v_mul) >= 2
+    assert len(v_div) >= 2
 
 
 def run_all_tests() -> None:
