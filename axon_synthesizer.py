@@ -4318,16 +4318,12 @@ def lower_nu_graph(
         else:
             level_results = [_synth(args) for args in synthesis_args]
 
-        for result in level_results:
+        for node, result in zip(synthesis, level_results):
             if result is None:
                 return None
             new_hw_nodes, output_id, output_sym = result
             hw_nodes.extend(new_hw_nodes)
             hw_syms[output_id] = output_sym
-        for node, result in zip(synthesis, level_results):
-            if result is None:
-                return None
-            _, output_id, _ = result
             node_id_map[node.id] = output_id
 
     G_hw = nuGraph(hw_nodes)
