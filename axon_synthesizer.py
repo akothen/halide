@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import builtins
+import argparse
+import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from itertools import combinations, permutations
@@ -285,7 +287,12 @@ def _broadcast_shape(a: ShapeExpr, b: ShapeExpr) -> ShapeResult:
     ctx = Context([d > 0 for d in ad + bd])
     for da, db in zip(ad, bd):
         ctx.add(z3.Or(da == db, da == 1, db == 1))
-        out.append(z3.If(da == 1, db, da))
+        if _arith_equal(da, 1):
+            out.append(db)
+        elif _arith_equal(db, 1):
+            out.append(da)
+        else:
+            out.append(z3.If(da == 1, db, da))
     return ShapeResult(ShapeExpr(out), ctx)
 
 
@@ -326,6 +333,11 @@ def _operand_to_expr(op: Any) -> Any:
     return op.name if isinstance(op, _OpRef) else op
 
 
+def _safe_divide(lhs: z3.ArithRef, rhs: z3.ArithRef) -> z3.ArithRef:
+    """Match `_compile_reciprocal`: division by zero follows the zero-reciprocal path."""
+    return z3.If(rhs == 0, z3.RealVal(0), lhs / rhs)
+
+
 def _apply_binary(op: Any, lhs: z3.ArithRef, rhs: z3.ArithRef) -> z3.ArithRef:
     opn = _operand_to_expr(op)
     if opn in ("add", "plus", "maximum", "max"):
@@ -335,7 +347,7 @@ def _apply_binary(op: Any, lhs: z3.ArithRef, rhs: z3.ArithRef) -> z3.ArithRef:
     if opn in ("multiply", "mul"):
         return lhs * rhs
     if opn in ("divide", "div"):
-        return lhs / rhs
+        return _safe_divide(lhs, rhs)
     if opn in ("minimum", "min"):
         return z3.If(lhs <= rhs, lhs, rhs)
     if opn in ("equal",):
@@ -466,32 +478,65 @@ def reduction_extensionality_context() -> Context:
 
 
 def reduction_comparison_context(lhs: Semantics, rhs: Semantics) -> Context:
-    ctx = Context()
+    """Kept for API compatibility; reduction equality now comes from body proofs.
 
+    Callers should use `_check_reduction_equivalent_by_body` for actual
+    reduction comparison instead of relying on extra comparison context.
+    """
+    return Context()
+
+
+def _check_reduction_equivalent_by_body(
+    lhs: Semantics,
+    rhs: Semantics,
+    shape_eq: z3.BoolRef,
+    timeout: int,
+) -> bool:
     if lhs.reduction is None or rhs.reduction is None:
-        return ctx
-
+        return False
     if lhs.reduction.outer_rank != rhs.reduction.outer_rank:
-        return ctx
+        return False
 
-    if lhs.reduction.outer_rank == 2:
-        l = lhs.reduction
-        r = rhs.reduction
-        i = z3.Int("cmp2_i")
-        j = z3.Int("cmp2_j")
-        k = z3.Int("cmp2_k")
-        ctx.add(z3.ForAll([i, j, k], BODY2(z3.IntVal(l.body_id), i, j, k) == BODY2(z3.IntVal(r.body_id), i, j, k)))
-        return ctx
+    full_ctx = lhs.ctx.merged(rhs.ctx, reduction_extensionality_context())
+    theorem: Optional[z3.BoolRef] = None
 
     if lhs.reduction.outer_rank == 1:
-        l = lhs.reduction
-        r = rhs.reduction
-        i = z3.Int("cmp1_i")
-        k = z3.Int("cmp1_k")
-        ctx.add(z3.ForAll([i, k], BODY1(z3.IntVal(l.body_id), i, k) == BODY1(z3.IntVal(r.body_id), i, k)))
-        return ctx
+        i = z3.Int("body_eq1_i")
+        k = z3.Int("body_eq1_k")
+        theorem = z3.Implies(
+            full_ctx.as_formula(),
+            z3.And(
+                shape_eq,
+                lhs.reduction.extent == rhs.reduction.extent,
+                z3.ForAll(
+                    [i, k],
+                    BODY1(z3.IntVal(lhs.reduction.body_id), i, k) == BODY1(z3.IntVal(rhs.reduction.body_id), i, k),
+                ),
+            ),
+        )
+    elif lhs.reduction.outer_rank == 2:
+        i = z3.Int("body_eq2_i")
+        j = z3.Int("body_eq2_j")
+        k = z3.Int("body_eq2_k")
+        theorem = z3.Implies(
+            full_ctx.as_formula(),
+            z3.And(
+                shape_eq,
+                lhs.reduction.extent == rhs.reduction.extent,
+                z3.ForAll(
+                    [i, j, k],
+                    BODY2(z3.IntVal(lhs.reduction.body_id), i, j, k) == BODY2(z3.IntVal(rhs.reduction.body_id), i, j, k),
+                ),
+            ),
+        )
 
-    return ctx
+    if theorem is None:
+        return False
+
+    solver = z3.Solver()
+    solver.set("timeout", timeout)
+    solver.add(z3.Not(theorem))
+    return solver.check() == z3.unsat
 
 
 def compile_expr(expr: SymExpr, cache: dict[int, Semantics]) -> Semantics:
@@ -525,6 +570,70 @@ def compile_expr(expr: SymExpr, cache: dict[int, Semantics]) -> Semantics:
     return sem
 
 
+def _expr_structural_key(expr: SymExpr, cache: Optional[dict[int, Any]] = None) -> Any:
+    cache = {} if cache is None else cache
+    key = id(expr)
+    if key in cache:
+        return cache[key]
+    if expr.op == "input":
+        sig = ("input", expr.name, tuple(map(str, expr.shape)))
+    else:
+        sig = (
+            expr.op,
+            tuple(map(str, expr.shape)),
+            tuple(sorted((k, repr(v)) for k, v in expr.attrs.items())),
+            tuple(_expr_structural_key(inp, cache) for inp in expr.inputs),
+        )
+    cache[key] = sig
+    return sig
+
+
+def _rename_expr_tree_for_equivalence(
+    expr: SymExpr,
+    side: str,
+    shared_names: dict[Any, str],
+    used_names: set[str],
+    name_counter: list[int],
+    cache: Optional[dict[int, SymExpr]] = None,
+    sig_cache: Optional[dict[int, Any]] = None,
+) -> SymExpr:
+    cache = {} if cache is None else cache
+    sig_cache = {} if sig_cache is None else sig_cache
+    key = id(expr)
+    if key in cache:
+        return cache[key]
+
+    if expr.op == "input":
+        renamed = SymExpr(expr.op, [], expr.shape, dict(expr.attrs), expr.name)
+        cache[key] = renamed
+        return renamed
+
+    sig = _expr_structural_key(expr, sig_cache)
+    if sig in shared_names:
+        name = shared_names[sig]
+    else:
+        candidate_names = [expr.name, f"{expr.name}_{side}"]
+        fallback_name = f"{expr.name}_{side}_{name_counter[0]}"
+        name = next((candidate for candidate in candidate_names if candidate not in used_names), fallback_name)
+        if name == fallback_name:
+            name_counter[0] += 1
+        shared_names[sig] = name
+        used_names.add(name)
+
+    renamed = SymExpr(
+        expr.op,
+        [
+            _rename_expr_tree_for_equivalence(inp, side, shared_names, used_names, name_counter, cache, sig_cache)
+            for inp in expr.inputs
+        ],
+        expr.shape,
+        dict(expr.attrs),
+        name,
+    )
+    cache[key] = renamed
+    return renamed
+
+
 def check_equivalent(
     lhs: SymTensor,
     rhs: SymTensor,
@@ -533,8 +642,13 @@ def check_equivalent(
     rule_name: Optional[str] = None,
     verbose: bool = False,
 ) -> bool:
-    lsem = compile_expr(lhs.expr, {})
-    rsem = compile_expr(rhs.expr, {})
+    shared_names: dict[Any, str] = {}
+    used_names: set[str] = set()
+    name_counter = [0]
+    lhs_expr = _rename_expr_tree_for_equivalence(lhs.expr, "lhs", shared_names, used_names, name_counter)
+    rhs_expr = _rename_expr_tree_for_equivalence(rhs.expr, "rhs", shared_names, used_names, name_counter)
+    lsem = compile_expr(lhs_expr, {})
+    rsem = compile_expr(rhs_expr, {})
 
     shape_eq = _shape_eq(lsem.shape, rsem.shape)
 
@@ -564,6 +678,8 @@ def check_equivalent(
     solver.add(z3.Not(theorem))
     res = solver.check()
     ok = res == z3.unsat
+    if not ok and _check_reduction_equivalent_by_body(lsem, rsem, shape_eq, timeout):
+        ok = True
 
     _last_check_stats.clear()
     _last_check_stats["num_obligations"] = len(full_ctx.facts)
@@ -2276,7 +2392,8 @@ def _compile_tensor_reduce(expr: SymExpr, ins: list[Semantics], out_shape: Shape
     out_fn = _tensor_function(f"V_{expr.name}", out_shape.rank)
     axis_attr = expr.attrs.get("axis", 1)
     axis = axis_attr[0] if isinstance(axis_attr, (list, tuple)) else axis_attr
-    keep = bool(expr.attrs.get("keepdims", False))
+    # Graph nodes still use `keep_dims`; public tensor-style callers use `keepdims`.
+    keep = bool(expr.attrs.get("keepdims", expr.attrs.get("keep_dims", False)))
     negate = bool(expr.attrs.get("negate", False))
     body_id = _fresh_body_id()
     ctx = a.ctx.merged()
@@ -2490,6 +2607,52 @@ def _shape_public_binary(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeRe
 
 
 def _compile_public_binary(expr: SymExpr, ins: list[Semantics], out_shape: ShapeExpr) -> Semantics:
+    def lift_binary_reduction(op_name: Any) -> Optional[ReductionDesc]:
+        """Push a binary mul/div factor into a rank-2 reduction body when legal.
+
+        Returns a new `ReductionDesc` for the lifted reduction body, or `None`
+        when the binary expression is not an axiom-supported reduction element.
+        """
+        if len(ins) != 2:
+            return None
+        opn = _operand_to_expr(op_name)
+        if opn not in ("mul", "multiply", "div", "divide"):
+            return None
+
+        reduction_index = next((idx for idx, sem in enumerate(ins) if sem.reduction is not None), None)
+        if reduction_index is None:
+            return None
+        # Only reductions in the numerator can be lifted through division:
+        # Red_X^+(f(X)) / v == Red_X^+(f(X) / v), but v / Red_X^+(f(X)) does not.
+        if opn in ("div", "divide") and reduction_index != 0:
+            return None
+
+        reduction_sem = ins[reduction_index]
+        factor_sem = ins[1 - reduction_index]
+        reduction = reduction_sem.reduction
+        if reduction is None or reduction.outer_rank != 2 or out_shape.rank != 2:
+            return None
+
+        body_id = _fresh_body_id()
+        target_body = z3.IntVal(body_id)
+        source_body = z3.IntVal(reduction.body_id)
+        i = z3.Int(f"{expr.name}_ri")
+        j = z3.Int(f"{expr.name}_rj")
+        k = z3.Int(f"{expr.name}_rk")
+        factor = _call_broadcasted(factor_sem, out_shape, [i, j])
+
+        if opn in ("mul", "multiply"):
+            if reduction_index == 0:
+                lifted_body = BODY2(source_body, i, j, k) * factor
+            else:
+                lifted_body = factor * BODY2(source_body, i, j, k)
+        else:
+            lifted_body = _safe_divide(BODY2(source_body, i, j, k), factor)
+
+        ctx.add(z3.ForAll([i, j, k], BODY2(target_body, i, j, k) == lifted_body))
+        ctx.add(z3.ForAll([i, j], out_fn(i, j) == REDUCE2(target_body, i, j, reduction.extent)))
+        return ReductionDesc(body_id, reduction.extent, outer_rank=2)
+
     out_fn = _tensor_function(f"V_{expr.name}", out_shape.rank)
     idx = _index_vars(expr.name, out_shape.rank)
     ctx = Context()
@@ -2514,7 +2677,7 @@ def _compile_public_binary(expr: SymExpr, ins: list[Semantics], out_shape: Shape
     else:
         return _compile_public_opaque(expr, ins, out_shape)
     ctx.add(z3.ForAll(idx, out_fn(*idx) == _apply_binary(expr.attrs.get("op", expr.op), lhs, rhs)))
-    return Semantics(expr.name, out_shape, out_fn, ctx)
+    return Semantics(expr.name, out_shape, out_fn, ctx, reduction=lift_binary_reduction(expr.attrs.get("op", expr.op)))
 
 
 def _shape_public_reduce(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
@@ -2825,7 +2988,7 @@ def _register_public_semantics() -> None:
     _ensure_semantics("load_transpose2d", _shape_public_transpose2d, _compile_nc_transpose)
     _ensure_semantics("matmul", _shape_public_matmul, _compile_public_matmul)
     _ensure_semantics("mul", _shape_public_binary, _compile_public_binary)
-    _ensure_semantics("reduce_sum", _shape_graph_reduce_sum, _compile_public_reduce)
+    _ensure_semantics("reduce_sum", _shape_graph_reduce_sum, _compile_tensor_reduce)
     _ensure_semantics("transpose", _shape_public_transpose2d, _compile_nc_transpose)
     _ensure_semantics("where", _shape_public_where, _compile_public_where)
 
@@ -3538,7 +3701,17 @@ def _test_rmsnorm_matmul_graph() -> None:
     assert out.shape == (4, 16), f"out shape wrong: {out.shape}"
 
     variants = nu_graph_generation_z3(G, verbose=False)
-    assert len(variants) >= 1, "rmsnorm_matmul should emit at least org variant"
+    norm_pos = _position_by_id(G, "norm")
+    out_pos = _position_by_id(G, "out")
+    assert norm_pos is not None, "Internal test error: rmsnorm_matmul test graph missing norm node"
+    assert out_pos is not None, "Internal test error: rmsnorm_matmul test graph missing out node"
+    swapped = _swap_with_successor_variants(G, norm_pos, out_pos, {"x"})
+    assert len(swapped) == 1, "rmsnorm_matmul should have exactly one legal div/matmul swap"
+    assert z3_equivalent_order(G.node_at(norm_pos), G.node_at(out_pos), G, swapped[0][0], verbose=False)
+    expected_sigs = {graph_signature(G), graph_signature(swapped[0][0])}
+    got_sigs = {graph_signature(variant) for variant in variants}
+    assert len(variants) == 2, f"rmsnorm_matmul should emit original + swapped div/matmul variants, got {len(variants)}"
+    assert got_sigs == expected_sigs, "rmsnorm_matmul emitted an unexpected variant"
     print(" rmsnorm_matmul (+sqrt) graph builds and runs variant generation")
 
 
@@ -3591,32 +3764,54 @@ def _test_relu_matmul_graph() -> None:
     out = next(n for n in G.nodes if n.id == "out")
     assert z.shape == (4, 8)
     assert out.shape == (4, 16)
-    assert len(nu_graph_generation_z3(G, verbose=False)) >= 1
+    variants = nu_graph_generation_z3(G, verbose=False)
+    assert len(variants) == 1, f"relu_matmul should not push relu past matmul, got {len(variants)} variants"
+    assert graph_signature(variants[0]) == graph_signature(G)
+    z_pos = _position_by_id(G, "z")
+    out_pos = _position_by_id(G, "out")
+    assert z_pos is not None and out_pos is not None
+    illegal_swaps = _swap_with_successor_variants(G, z_pos, out_pos, {"x"})
+    assert illegal_swaps, "relu_matmul should generate a candidate illegal swap for rejection testing"
+    assert not z3_equivalent_order(G.node_at(z_pos), G.node_at(out_pos), G, illegal_swaps[0][0], verbose=False)
 
 def _test_silu_matmul_graph() -> None:
     G = build_kernel_silu_matmul_graph(4, 8, 16)
     z = next(n for n in G.nodes if n.id == "z")
-    out = next(n for n in G.nodes if n.id == "out")
+    out = _node_by_id(G, "out")
+    assert out is not None, "Internal test error: silu_matmul graph missing out node"
     assert z.shape == (4, 8)
     assert out.shape == (4, 16)
-    assert len(nu_graph_generation_z3(G, verbose=False)) >= 1
+    variants = nu_graph_generation_z3(G, verbose=False)
+    assert len(variants) == 1, f"silu_matmul should not push silu past matmul, got {len(variants)} variants"
+    assert graph_signature(variants[0]) == graph_signature(G)
 
 
 def run_all_tests() -> None:
     print("\n================ RUNNING NU-GRAPH TESTS ================")
-    # _test_expected_variant_counts()
-    # _test_no_illegal_reduce_broadcast_swap()
-    # _test_no_illegal_reduce_sqrt_swap()
-    # _test_rmsnorm_matmul_graph()
-    # _test_softmax_matmul_graph()
-    # _test_transpose_matmul_graph()
+    _test_expected_variant_counts()
+    _test_no_illegal_reduce_broadcast_swap()
+    _test_no_illegal_reduce_sqrt_swap()
+    _test_rmsnorm_matmul_graph()
+    _test_softmax_matmul_graph()
+    _test_transpose_matmul_graph()
+    _test_matmul_transpose_graph()
     _test_relu_matmul_graph()
     _test_silu_matmul_graph()
     print("=============== ALL TESTS PASSED  =====================\n")
 
 
 if __name__ == "__main__":
-    #run_all_tests()
+    parser = argparse.ArgumentParser(description="Axon synthesizer tracing and in-file test runner")
+    parser.add_argument(
+        "--run-tests",
+        action="store_true",
+        help="Run in-file nuGraph tests instead of tracing demo kernels",
+    )
+    args = parser.parse_args()
+
+    if args.run_tests:
+        run_all_tests()
+        sys.exit(0)
 
     kernels: list[tuple[str, Callable[[int, int, int], nuGraph]]] = [
         ("kernel_matmul_red_div", build_kernel_matmul_red_div_graph),
