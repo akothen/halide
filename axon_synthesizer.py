@@ -451,44 +451,61 @@ def _check_reduction_equivalent_by_body(
         return False
 
     full_ctx = lhs.ctx.merged(rhs.ctx, reduction_extensionality_context())
-    theorem: Optional[z3.BoolRef] = None
+    counterexample: Optional[z3.BoolRef] = None
 
     if lhs.reduction.outer_rank == 1:
         i = z3.Int("body_eq1_i")
         k = z3.Int("body_eq1_k")
-        theorem = z3.Implies(
-            full_ctx.as_formula(),
+        bounds = z3.And(
+            i >= 0,
+            i < lhs.shape.dims[0],
+            i < rhs.shape.dims[0],
+            k >= 0,
+            k < lhs.reduction.extent,
+            k < rhs.reduction.extent,
+        )
+        counterexample = z3.Or(
+            z3.Not(shape_eq),
+            lhs.reduction.extent != rhs.reduction.extent,
             z3.And(
                 shape_eq,
                 lhs.reduction.extent == rhs.reduction.extent,
-                z3.ForAll(
-                    [i, k],
-                    BODY1(z3.IntVal(lhs.reduction.body_id), i, k) == BODY1(z3.IntVal(rhs.reduction.body_id), i, k),
-                ),
+                bounds,
+                BODY1(z3.IntVal(lhs.reduction.body_id), i, k) != BODY1(z3.IntVal(rhs.reduction.body_id), i, k),
             ),
         )
     elif lhs.reduction.outer_rank == 2:
         i = z3.Int("body_eq2_i")
         j = z3.Int("body_eq2_j")
         k = z3.Int("body_eq2_k")
-        theorem = z3.Implies(
-            full_ctx.as_formula(),
+        bounds = z3.And(
+            i >= 0,
+            i < lhs.shape.dims[0],
+            i < rhs.shape.dims[0],
+            j >= 0,
+            j < lhs.shape.dims[1],
+            j < rhs.shape.dims[1],
+            k >= 0,
+            k < lhs.reduction.extent,
+            k < rhs.reduction.extent,
+        )
+        counterexample = z3.Or(
+            z3.Not(shape_eq),
+            lhs.reduction.extent != rhs.reduction.extent,
             z3.And(
                 shape_eq,
                 lhs.reduction.extent == rhs.reduction.extent,
-                z3.ForAll(
-                    [i, j, k],
-                    BODY2(z3.IntVal(lhs.reduction.body_id), i, j, k) == BODY2(z3.IntVal(rhs.reduction.body_id), i, j, k),
-                ),
+                bounds,
+                BODY2(z3.IntVal(lhs.reduction.body_id), i, j, k) != BODY2(z3.IntVal(rhs.reduction.body_id), i, j, k),
             ),
         )
 
-    if theorem is None:
+    if counterexample is None:
         return False
 
     solver = z3.Solver()
     solver.set("timeout", timeout)
-    solver.add(z3.Not(theorem))
+    solver.add(full_ctx.as_formula(), counterexample)
     return solver.check() == z3.unsat
 
 
@@ -606,17 +623,6 @@ def check_equivalent(
     print("rsem.shape:", rsem.shape.dims)
     shape_eq = _shape_eq(lsem.shape, rsem.shape)
 
-    if lsem.shape.rank != rsem.shape.rank:
-        val_eq = z3.BoolVal(False)
-    else:
-        rank = lsem.shape.rank
-        if rank == 0:
-            val_eq = lsem.fn() == rsem.fn()
-        else:
-            vars = [z3.Int(f"q_{idx}") for idx in range(rank)]
-            bounds = z3.And(*[z3.And(vars[i] >= 0, vars[i] < lsem.shape.dims[i]) for i in range(rank)])
-            val_eq = z3.ForAll(vars, z3.Implies(bounds, lsem.fn(*vars) == rsem.fn(*vars)))
-
     preconditions = preconditions or []
     extra_ctx = Context([p.constraint for p in preconditions])
     full_ctx = lsem.ctx.merged(
@@ -624,11 +630,20 @@ def check_equivalent(
         reduction_extensionality_context(),
         extra_ctx,
     )
-    theorem = z3.Implies(full_ctx.as_formula(), z3.And(shape_eq, val_eq))
 
     solver = z3.Solver()
     solver.set("timeout", timeout)
-    solver.add(z3.Not(theorem))
+    solver.add(full_ctx.as_formula())
+    if lsem.shape.rank != rsem.shape.rank:
+        solver.add(z3.BoolVal(True))
+    elif lsem.shape.rank == 0:
+        solver.add(z3.Or(z3.Not(shape_eq), lsem.fn() != rsem.fn()))
+    else:
+        vars = [z3.Int(f"ce_{idx}") for idx in range(lsem.shape.rank)]
+        lhs_bounds = [z3.And(vars[i] >= 0, vars[i] < lsem.shape.dims[i]) for i in range(lsem.shape.rank)]
+        rhs_bounds = [z3.And(vars[i] >= 0, vars[i] < rsem.shape.dims[i]) for i in range(rsem.shape.rank)]
+        bounds = z3.And(*(lhs_bounds + rhs_bounds))
+        solver.add(z3.Or(z3.Not(shape_eq), z3.And(shape_eq, bounds, lsem.fn(*vars) != rsem.fn(*vars))))
     res = solver.check()
     ok = res == z3.unsat
     if not ok and _check_reduction_equivalent_by_body(lsem, rsem, shape_eq, timeout):
