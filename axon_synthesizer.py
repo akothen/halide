@@ -3189,9 +3189,6 @@ def z3_equivalent_order(
     )
 
 
-
-
-# COMPLETE THIS FUNCTION
 def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
     G0 = G.clone()
     M: set[nuGraph] = {G0}
@@ -3605,73 +3602,6 @@ def _test_silu_matmul_graph() -> None:
     assert len(nu_graph_generation_z3(G, verbose=False)) >= 1
 
 
-def _test_axonarray_ops_shapes() -> None:
-    x = AxonArray("x", (4, 8))
-    y = AxonArray("y", (4, 8))
-    s = y.sum(axis=1, keep_dims=True)
-    assert s.shape == (4, 1)
-    assert (x * s).shape == (4, 8)
-    assert (x / s).shape == (4, 8)
-    assert x.broadcast_like(y).shape == (4, 8)
-    assert x.transpose().shape == (8, 4)
-    assert x.relu().shape == (4, 8)
-    assert x.silu().shape == (4, 8)
-    assert x.exp().shape == (4, 8)
-
-
-def _test_generic_symbolic_graph_equivalence() -> None:
-    G = build_kernel_softmax_matmul_graph(4, 8, 16)
-    assert _graphs_equivalent_symbolically(G, G.clone())
-
-
-def _test_generic_symbolic_swap_equivalence() -> None:
-    G = build_kernel_matmul_red_mul_graph(4, 8, 16)
-    scale = next(n for n in G.nodes if n.id == "scale")
-    out = next(n for n in G.nodes if n.id == "out")
-    candidates = _swap_with_successor_variants(G, G.position(scale), G.position(out), {"x"})
-    assert candidates
-    assert any(z3_equivalent_order(scale, out, G, G_new, verbose=False) for G_new, _ in candidates)
-
-
-def _test_transpose_matmul_swap_equivalence() -> None:
-    G = build_kernel_matmul_transpose_graph(4, 8, 16)
-    mm = next(n for n in G.nodes if n.id == "mm")
-    out = next(n for n in G.nodes if n.id == "out")
-    candidates = _swap_with_successor_variants(G, G.position(mm), G.position(out), {"x", "w"})
-    assert candidates
-    assert any(z3_equivalent_order(mm, out, G, G_new, verbose=False) for G_new, _ in candidates)
-
-
-def _test_generic_symbolic_non_equivalence() -> None:
-    G = build_kernel_matmul_red_mul_graph(4, 8, 16)
-    bad = G.clone()
-    bad_out = next(n for n in bad.nodes if n.id == "out")
-    bad_out.inputs = ["x", "w"]
-    scale = next(n for n in G.nodes if n.id == "scale")
-    out = next(n for n in G.nodes if n.id == "out")
-    assert not z3_equivalent_order(scale, out, G, bad, verbose=False)
-
-
-def _test_shape_annotation_uses_registered_semantics() -> None:
-    G = build_kernel_reduce_broadcast_mul_graph(4, 8, 16)
-    for node in G.nodes:
-        if node.op != "input":
-            node.shape = None
-    annotate_shapes_concrete(G)
-    assert next(n for n in G.nodes if n.id == "rec").shape == (4, 1)
-    assert next(n for n in G.nodes if n.id == "rec_b").shape == (4, 8)
-    assert next(n for n in G.nodes if n.id == "z").shape == (4, 8)
-    assert next(n for n in G.nodes if n.id == "out").shape == (4, 16)
-
-
-def _test_symbolic_variant_generation_without_shape_metadata() -> None:
-    G = build_kernel_matmul_transpose_graph(4, 8, 16)
-    for node in G.nodes:
-        if node.op != "input":
-            node.shape = None
-    assert len(nu_graph_generation_z3(G, verbose=False)) >= 2
-
-
 def run_all_tests() -> None:
     print("\n================ RUNNING NU-GRAPH TESTS ================")
     # _test_expected_variant_counts()
@@ -3691,14 +3621,15 @@ if __name__ == "__main__":
     kernels: list[tuple[str, Callable[[int, int, int], nuGraph]]] = [
         ("kernel_matmul_red_div", build_kernel_matmul_red_div_graph),
         ("kernel_matmul_red_mul", build_kernel_matmul_red_mul_graph),
-        # ("kernel_broadcast_row_bias_add", build_kernel_broadcast_row_bias_add_graph),
-        # ("kernel_reduce_mul_broadcast", build_kernel_reduce_mul_broadcast_graph),
-        # ("kernel_reduce_broadcast_mul", build_kernel_reduce_broadcast_mul_graph),
-        # ("kernel_rmsnorm_matmul", build_kernel_rmsnorm_matmul_graph),
-        # ("kernel_softmax_matmul", build_kernel_softmax_matmul_graph),
-        # ("kernel_transpose_matmul", build_kernel_transpose_matmul_graph),
-        # ("kernel_relu_matmul", build_kernel_relu_matmul_graph),
-        # ("kernel_silu_matmul", build_kernel_silu_matmul_graph),
+        ("kernel_broadcast_row_bias_add", build_kernel_broadcast_row_bias_add_graph),
+        ("kernel_reduce_mul_broadcast", build_kernel_reduce_mul_broadcast_graph),
+        ("kernel_reduce_broadcast_mul", build_kernel_reduce_broadcast_mul_graph),
+        ("kernel_rmsnorm_matmul", build_kernel_rmsnorm_matmul_graph),
+        ("kernel_softmax_matmul", build_kernel_softmax_matmul_graph),
+        ("kernel_transpose_matmul", build_kernel_transpose_matmul_graph),
+        ("kernel_matmul_transpose", build_kernel_matmul_transpose_graph),
+        ("kernel_relu_matmul", build_kernel_relu_matmul_graph),
+        ("kernel_silu_matmul", build_kernel_silu_matmul_graph),
     ]
 
     for kname, builder in kernels:
