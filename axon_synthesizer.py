@@ -3104,11 +3104,12 @@ def _swap_with_successor_variants(
 ) -> list[tuple[nuGraph, int]]:
     op1 = G_cur.node_at(pos)
     op2 = G_cur.node_at(succ_pos)
+    op1_input_ids = set(op1.inputs)
     if pos >= succ_pos:
         return []
     if not clone_inputs:
         return []
-    if not clone_inputs.issubset(set(op1.inputs)):
+    if not clone_inputs.issubset(op1_input_ids):
         return []
     if len(G_cur.successors(op1)) != 1:
         return []
@@ -3212,6 +3213,7 @@ def z3_equivalent_order(
 def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
     G0 = annotate_shapes_concrete(G.clone())
     M: set[nuGraph] = {G0}
+    equivalence_cache: dict[tuple[str, str, str, str], bool] = {}
 
     for op1_orig in [n for n in G0.nodes if n.op != "input"]:
         M_next: set[nuGraph] = set()
@@ -3238,15 +3240,21 @@ def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
                     inputs = _effective_input_ids(G_cur, pos)
                     accepted = False
 
-                    # The kernel graphs in this file only exercise low-arity operators,
-                    # and we cap the search to avoid exponential blowups if
-                    # higher-arity operators are introduced later.
+                    # We cap the number of source inputs considered here at 4 because
+                    # subset/permutation enumeration grows very quickly beyond that,
+                    # while the graphs exercised by this prototype only use small-input
+                    # operators in the propagation path.
                     if len(inputs) > 4:
                         continue
                     for k in range(1, len(inputs) + 1):
                         for subset in combinations(inputs, k):
                             for G_new, p_new in _swap_with_successor_variants(G_cur, pos, succ_pos, set(subset)):
-                                if not z3_equivalent_order(op1, op2, G_cur, G_new, verbose=verbose):
+                                cache_key = (graph_signature(G_cur), op1.id, op2.id, graph_signature(G_new))
+                                equivalent = equivalence_cache.get(cache_key)
+                                if equivalent is None:
+                                    equivalent = z3_equivalent_order(op1, op2, G_cur, G_new, verbose=verbose)
+                                    equivalence_cache[cache_key] = equivalent
+                                if not equivalent:
                                     continue
                                 M_next.add(G_new)
                                 worklist.append((G_new, p_new))
