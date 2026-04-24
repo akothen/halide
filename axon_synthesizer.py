@@ -5282,13 +5282,25 @@ def _test_matmul_1003_multi_input_synthesis() -> None:
         f"matmul node in variant 0 must have exactly 2 inputs, "
         f"got {matmul_node.inputs!r}"
     )
-    # One input must be 'w' (the weight tensor), the other from div/upstream.
+    # One input must be 'w' (the weight tensor), the other is the upstream
+    # synthesis node (div or similar) that must have been resolved.
     assert "w" in matmul_node.inputs, (
         f"matmul node must have 'w' as one of its inputs, got {matmul_node.inputs!r}"
     )
-    upstream_input = next((i for i in matmul_node.inputs if i != "w"), None)
-    assert upstream_input is not None, (
-        f"matmul node must have a non-'w' upstream input; inputs={matmul_node.inputs!r}"
+    # The previous assertions guarantee exactly 2 inputs with one being 'w',
+    # so next() is safe here and will find the non-'w' input.
+    upstream_input = next(i for i in matmul_node.inputs if i != "w")
+
+    # Confirm the upstream input comes from a synthesis node (not a bare input),
+    # which means it must be resolved through hw_syms_can during lowering.
+    upstream_node = next((n for n in gv.nodes if n.id == upstream_input), None)
+    assert upstream_node is not None, (
+        f"Upstream input '{upstream_input}' not found in variant graph"
+    )
+    assert upstream_node.op != "input", (
+        f"Upstream input '{upstream_input}' to matmul is a raw graph input, "
+        f"not a synthesis node; the test requires a derived node to stress the "
+        f"hw_syms_can resolution path"
     )
 
     # Run the full lowering and assert it succeeds with BOTH inputs resolved.
@@ -5328,7 +5340,7 @@ def _test_matmul_1003_multi_input_synthesis() -> None:
 
     print(
         f" synthesizer: matmul_1003 multi-input regression — "
-        f"matmul node inputs={matmul_node.inputs!r}, "
+        f"matmul node inputs={matmul_node.inputs!r} (upstream='{upstream_input}'), "
         f"{len(hw_variants)} hw variant(s) produced, first variant equivalent"
     )
 
