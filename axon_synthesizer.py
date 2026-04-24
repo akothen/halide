@@ -2067,7 +2067,7 @@ def tensor_scalar(dst, data, op0, operand0, reverse0=False, op1=None, operand1=N
         inputs.append(operand1)
     elif operand1 is not None:
         attrs["operand1_const"] = operand1
-    return _new_sym_tensor("tensor_scalar", inputs, attrs, _default_out_shape(dst, data))
+    return _new_sym_tensor("tensor_scalar", inputs, attrs, _tensor_scalar_out_shape(dst, data, operand0, operand1))
 
 
 @semantics_hw()
@@ -2285,14 +2285,31 @@ def _compile_tensor_tensor(expr: SymExpr, ins: list[Semantics], out_shape: Shape
 
 def _shape_tensor_scalar(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
     data = ins[0]
-    ctx = Context([d > 0 for d in data.dims])
+    out = ShapeResult(ShapeExpr(list(data.dims)), Context([d > 0 for d in data.dims]))
     if len(ins) > 1:
-        b0 = _broadcast_shape(data, ins[1])
-        ctx.extend(b0.ctx.facts)
+        out = _broadcast_shape(out.out, ins[1])
     if len(ins) > 2:
-        b1 = _broadcast_shape(data, ins[2])
-        ctx.extend(b1.ctx.facts)
-    return ShapeResult(ShapeExpr(list(data.dims)), ctx)
+        b1 = _broadcast_shape(out.out, ins[2])
+        out.ctx.extend(b1.ctx.facts)
+        out = ShapeResult(b1.out, out.ctx)
+    return out
+
+
+def _tensor_scalar_out_shape(
+    dst: Any,
+    data: SymTensor,
+    operand0: Any,
+    operand1: Any = None,
+) -> tuple[Any, ...]:
+    if isinstance(dst, SymTensor):
+        return dst.shape
+    with _Z3_LOCK:
+        out = ShapeExpr(list(data.shape))
+        if _is_sym_tensor(operand0):
+            out = _broadcast_shape(out, ShapeExpr(list(operand0.shape))).out
+        if _is_sym_tensor(operand1):
+            out = _broadcast_shape(out, ShapeExpr(list(operand1.shape))).out
+        return tuple(z3.simplify(dim) for dim in out.dims)
 
 
 def _operand_value(
