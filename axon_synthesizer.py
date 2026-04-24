@@ -3854,6 +3854,84 @@ def _check_equivalent_quiet(
         return False
 
 
+def _shape_rejects_symbolically(lhs: SymTensor, rhs: SymTensor) -> bool:
+    """Return True when the symbolic output shapes are obviously incompatible."""
+    if lhs.rank != rhs.rank:
+        return True
+    for ldim, rdim in zip(lhs.shape, rhs.shape):
+        if z3.is_false(z3.simplify(ldim == rdim)):
+            return True
+    return False
+
+
+def _eval_sketch_concrete_shape(
+    sketch: SketchNode,
+    concrete_input_shapes: dict[int, tuple[Any, ...]],
+) -> Optional[tuple[z3.ArithRef, ...]]:
+    """Infer a sketch's concrete output shape from concrete INPUT shapes."""
+    if sketch.hole:
+        return None
+    if sketch.op == "INPUT":
+        if sketch.sym is None:
+            return None
+        shape = concrete_input_shapes.get(id(sketch.sym))
+        if shape is None:
+            return None
+        return tuple(_to_dim(dim) for dim in shape)
+
+    child_shapes: list[ShapeExpr] = []
+    for child in sketch.children:
+        child_shape = _eval_sketch_concrete_shape(child, concrete_input_shapes)
+        if child_shape is None:
+            return None
+        child_shapes.append(ShapeExpr(list(child_shape)))
+
+    semantics = _SEMANTICS.get(sketch.op)
+    if semantics is None:
+        return None
+    shape_rule, _ = semantics
+    if shape_rule is None:
+        return None
+    try:
+        return tuple(shape_rule(child_shapes, sketch.attrs).out.dims)
+    except Exception:
+        return None
+
+
+def _shape_rejects_concretely(
+    sketch: SketchNode,
+    concrete_input_shapes: Optional[dict[int, tuple[Any, ...]]],
+    required_shape: Optional[tuple[Any, ...]],
+) -> bool:
+    """Return True when concrete input/output shapes prove the sketch cannot fit."""
+    if required_shape is None or not concrete_input_shapes:
+        return False
+    concrete_shape = _eval_sketch_concrete_shape(sketch, concrete_input_shapes)
+    if concrete_shape is None:
+        return False
+    if len(concrete_shape) != len(required_shape):
+        return True
+    for got_dim, want_dim in zip(concrete_shape, required_shape):
+        if z3.is_false(z3.simplify(got_dim == _to_dim(want_dim))):
+            return True
+    return False
+
+
+def _shape_rejection_reason(
+    target_sym: SymTensor,
+    candidate_sym: SymTensor,
+    sketch: SketchNode,
+    concrete_input_shapes: Optional[dict[int, tuple[Any, ...]]] = None,
+    required_shape: Optional[tuple[Any, ...]] = None,
+) -> Optional[str]:
+    """Return a rejection reason if shape information proves a mismatch."""
+    if _shape_rejects_concretely(sketch, concrete_input_shapes, required_shape):
+        return "concrete shape mismatch"
+    if _shape_rejects_symbolically(target_sym, candidate_sym):
+        return "symbolic shape mismatch"
+    return None
+
+
 def _format_sketch(sketch: SketchNode) -> str:
     """Return a compact human-readable string for a (possibly partial) sketch."""
     if sketch.hole:
@@ -3882,6 +3960,8 @@ def _synthesize_from_pool(
     max_hw_size: int = 2,
     timeout: int = 3000,
     verbose: bool = False,
+    concrete_input_shapes: Optional[dict[int, tuple[Any, ...]]] = None,
+    required_shape: Optional[tuple[Any, ...]] = None,
 ) -> Optional[SketchNode]:
     """Phase 2: worklist search for a hw-only sketch equivalent to target_sym.
 
@@ -3905,6 +3985,17 @@ def _synthesize_from_pool(
             if candidate_sym is None:
                 if verbose:
                     print(f"    sketch {_format_sketch(sketch)!s:60s}  [eval failed]")
+                continue
+            rejection_reason = _shape_rejection_reason(
+                target_sym,
+                candidate_sym,
+                sketch,
+                concrete_input_shapes=concrete_input_shapes,
+                required_shape=required_shape,
+            )
+            if rejection_reason is not None:
+                if verbose:
+                    print(f"    sketch {_format_sketch(sketch)!s:60s}  [{rejection_reason}]")
                 continue
             if sketch.hw_size() > max_hw_size:
                 if verbose:
@@ -3946,6 +4037,8 @@ def _synthesize_all_from_pool(
     timeout: int = 3000,
     verbose: bool = False,
     max_workers: int = 4,
+    concrete_input_shapes: Optional[dict[int, tuple[Any, ...]]] = None,
+    required_shape: Optional[tuple[Any, ...]] = None,
 ) -> list[SketchNode]:
     """Like _synthesize_from_pool but returns ALL equivalent sketches.
 
@@ -3979,6 +4072,18 @@ def _synthesize_all_from_pool(
                 if verbose:
                     with _VERBOSE_LOCK:
                         print(f"    sketch {_format_sketch(sketch)!s:60s}  [eval failed]")
+                continue
+            rejection_reason = _shape_rejection_reason(
+                target_sym,
+                candidate_sym,
+                sketch,
+                concrete_input_shapes=concrete_input_shapes,
+                required_shape=required_shape,
+            )
+            if rejection_reason is not None:
+                if verbose:
+                    with _VERBOSE_LOCK:
+                        print(f"    sketch {_format_sketch(sketch)!s:60s}  [{rejection_reason}]")
                 continue
             candidates.append((sketch, candidate_sym))
             continue
@@ -4101,12 +4206,21 @@ def _lower_node(
     max_hw_size: int,
     timeout: int,
     verbose: bool = False,
+    hw_shapes: Optional[dict[str, tuple[Any, ...]]] = None,
 ) -> Optional[tuple[list[Node], str, SymTensor]]:
     """Try to synthesize a hw-only replacement for *node*.
 
     Returns (new_nodes, output_hw_id, output_hw_sym) on success, None otherwise.
     """
     input_syms = [sym for sym, _ in hw_input_pairs]
+    concrete_input_shapes = (
+        {
+            id(sym): hw_shapes[hw_id]
+            for sym, hw_id in hw_input_pairs
+            if hw_shapes is not None and hw_id in hw_shapes
+        }
+        if hw_shapes is not None else None
+    )
 
     # Build a LOCAL target sym from the hw inputs: this makes the equivalence
     # check purely local (e.g., nc_matmul(nc_transpose(t), w) ≡ matmul(t, w))
@@ -4130,6 +4244,8 @@ def _lower_node(
     found = _synthesize_from_pool(
         effective_target, pool,
         max_hw_size=max_hw_size, timeout=timeout, verbose=verbose,
+        concrete_input_shapes=concrete_input_shapes,
+        required_shape=node.shape,
     )
     if found is None:
         if verbose:
@@ -4164,6 +4280,7 @@ def _lower_node_all(
     timeout: int,
     verbose: bool = False,
     max_workers: int = 4,
+    hw_shapes: Optional[dict[str, tuple[Any, ...]]] = None,
 ) -> list[tuple[list[Node], str, SymTensor]]:
     """Synthesize ALL valid hw-only replacements for *node*.
 
@@ -4173,6 +4290,14 @@ def _lower_node_all(
     (new_nodes, output_hw_id, output_hw_sym) triples – one per valid sketch.
     """
     input_syms = [sym for sym, _ in hw_input_pairs]
+    concrete_input_shapes = (
+        {
+            id(sym): hw_shapes[hw_id]
+            for sym, hw_id in hw_input_pairs
+            if hw_shapes is not None and hw_id in hw_shapes
+        }
+        if hw_shapes is not None else None
+    )
 
     local_target: Optional[SymTensor] = None
     try:
@@ -4193,6 +4318,8 @@ def _lower_node_all(
         effective_target, pool,
         max_hw_size=max_hw_size, timeout=timeout, verbose=verbose,
         max_workers=max_workers,
+        concrete_input_shapes=concrete_input_shapes,
+        required_shape=node.shape,
     )
 
     if not found_sketches:
@@ -4250,6 +4377,7 @@ def lower_nu_graph(
 
     hw_nodes: list[Node] = []           # accumulate lowered nodes
     hw_syms: dict[str, SymTensor] = {}  # hw_node_id -> SymTensor
+    hw_shapes: dict[str, tuple[Any, ...]] = {}  # hw_node_id -> concrete output shape
     node_id_map: dict[str, str] = {}    # orig_id -> hw_id
 
     if verbose:
@@ -4270,6 +4398,8 @@ def lower_nu_graph(
             if node.op == "input":
                 hw_nodes.append(Node(node.id, node.op, list(node.inputs), dict(node.attrs), node.shape))
                 hw_syms[node.id] = orig_syms[node.id]
+                if node.shape is not None:
+                    hw_shapes[node.id] = tuple(node.shape)
                 node_id_map[node.id] = node.id
             else:
                 new_inputs = [node_id_map.get(inp, inp) for inp in node.inputs]
@@ -4279,6 +4409,8 @@ def lower_nu_graph(
                 new_id = _gen_id(node.op)
                 hw_nodes.append(Node(new_id, node.op, new_inputs, dict(node.attrs), node.shape))
                 hw_syms[new_id] = out_sym
+                if node.shape is not None:
+                    hw_shapes[new_id] = tuple(node.shape)
                 node_id_map[node.id] = new_id
 
         if not synthesis:
@@ -4308,6 +4440,7 @@ def lower_nu_graph(
                 max_hw_size,
                 timeout,
                 verbose=verbose,
+                hw_shapes=hw_shapes,
             )
 
         level_results: list[Optional[tuple[list[Node], str, SymTensor]]]
@@ -4334,6 +4467,8 @@ def lower_nu_graph(
             new_hw_nodes, output_id, output_sym = result
             hw_nodes.extend(new_hw_nodes)
             hw_syms[output_id] = output_sym
+            if node.shape is not None:
+                hw_shapes[output_id] = tuple(node.shape)
             node_id_map[node.id] = output_id
 
     G_hw = nuGraph(hw_nodes)
@@ -4442,6 +4577,7 @@ def lower_nu_graph_all_variants(
 
     # Canonical lowering state (uses first alt for synthesis nodes)
     hw_syms_can: dict[str, SymTensor] = {}    # canonical hw_id → sym
+    hw_shapes_can: dict[str, tuple[Any, ...]] = {}  # canonical hw_id → concrete shape
     node_id_map_can: dict[str, str] = {}       # orig_id → canonical hw_id
 
     # Per-node alternatives: each entry is a triple
@@ -4472,6 +4608,8 @@ def lower_nu_graph_all_variants(
                 n_copy = Node(node.id, node.op, list(node.inputs),
                               dict(node.attrs), node.shape)
                 hw_syms_can[node.id] = orig_syms[node.id]
+                if node.shape is not None:
+                    hw_shapes_can[node.id] = tuple(node.shape)
                 node_id_map_can[node.id] = node.id
                 per_node_entries[node.id] = [([n_copy], node.id, node.id)]
             else:  # passthrough
@@ -4486,6 +4624,8 @@ def lower_nu_graph_all_variants(
                 new_id = _gen_id(node.op)
                 n_new = Node(new_id, node.op, new_inputs, dict(node.attrs), node.shape)
                 hw_syms_can[new_id] = out_sym
+                if node.shape is not None:
+                    hw_shapes_can[new_id] = tuple(node.shape)
                 node_id_map_can[node.id] = new_id
                 per_node_entries[node.id] = [([n_new], new_id, new_id)]
 
@@ -4513,7 +4653,8 @@ def lower_nu_graph_all_variants(
             nd, tgt, pairs = args
             return _lower_node_all(nd, tgt, pairs,
                                    max_hw_size=max_hw_size, timeout=timeout,
-                                   verbose=verbose, max_workers=max_workers)
+                                   verbose=verbose, max_workers=max_workers,
+                                   hw_shapes=hw_shapes_can)
 
         node_alts_list: list[list[tuple[list[Node], str, SymTensor]]]
         if max_workers > 1 and len(synthesis) > 1:
@@ -4539,6 +4680,8 @@ def lower_nu_graph_all_variants(
             # First alt provides the canonical continuation for downstream nodes
             _, canonical_hw_id, canonical_sym = alts[0]
             hw_syms_can[canonical_hw_id] = canonical_sym
+            if node.shape is not None:
+                hw_shapes_can[canonical_hw_id] = tuple(node.shape)
             node_id_map_can[node.id] = canonical_hw_id
             # Record all alternatives; canonical_hw_id is the same for every entry
             per_node_entries[node.id] = [
@@ -5213,6 +5356,44 @@ def _test_synthesis_verbose_reports_candidate_count() -> None:
     print(" synthesis: verbose output reports candidate_count")
 
 
+def _test_synthesis_concrete_shape_prefilter_skips_solver() -> None:
+    x = SymTensor("x", shape=(4, 8))
+    target_sym = tensor_reduce(dst=None, op=nl.add, data=x, axis=1, keepdims=True)
+    pool = [
+        SketchNode.make_op(
+            "nc_matmul",
+            [SketchNode.make_input(x), SketchNode.make_input(x)],
+            {},
+        )
+    ]
+
+    original_check = _check_equivalent_quiet
+    calls = {"count": 0}
+
+    def _counting_check(lhs: SymTensor, rhs: SymTensor, timeout: int = 3000) -> bool:
+        calls["count"] += 1
+        return original_check(lhs, rhs, timeout=timeout)
+
+    globals()["_check_equivalent_quiet"] = _counting_check
+    try:
+        found = _synthesize_all_from_pool(
+            target_sym,
+            pool,
+            max_hw_size=1,
+            timeout=100,
+            verbose=False,
+            max_workers=1,
+            concrete_input_shapes={id(x): (4, 8)},
+            required_shape=(4, 1),
+        )
+    finally:
+        globals()["_check_equivalent_quiet"] = original_check
+
+    assert found == [], "Expected concrete shape prefilter to reject mismatched sketch"
+    assert calls["count"] == 0, "Expected concrete shape mismatch to skip equivalence solver"
+    print(" synthesis: concrete shape prefilter skips solver for mismatched sketches")
+
+
 def _test_synthesis_pool_filters_templates_by_target_constituents() -> None:
     G = build_kernel_matmul_red_div_graph(4, 8, 16)
     orig_syms = _graph_symbolic_tensors(G)
@@ -5345,6 +5526,7 @@ def run_all_tests() -> None:
     _test_print_graph_includes_symbolic_shapes()
     _test_synthesis_prefers_direct_reduce_candidate()
     _test_synthesis_verbose_reports_candidate_count()
+    _test_synthesis_concrete_shape_prefilter_skips_solver()
     _test_synthesis_pool_filters_templates_by_target_constituents()
     _test_single_operator_sketches_cover_distinct_inputs()
     _test_lower_nu_graph_parallel_levels()
