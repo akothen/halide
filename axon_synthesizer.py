@@ -4245,6 +4245,11 @@ def _sketch_to_graph_nodes(
         child_ids.append(cid)
 
     clean_attrs = {k: v for k, v in sketch.attrs.items() if k != "name"}
+    if sketch.op == "tensor_scalar":
+        if len(child_ids) > 1:
+            clean_attrs["operand0_input_index"] = 1
+        if len(child_ids) > 2 and clean_attrs.get("op1") is not None:
+            clean_attrs["operand1_input_index"] = 2
     # The synthesis pool uses abstract "transpose" so the search does not need
     # to branch over multiple concrete layout ops.  Both evaluation
     # (_invoke_hw_op) and materialization here map "transpose" to nc_transpose,
@@ -5676,6 +5681,8 @@ def _test_single_operator_sketches_cover_distinct_inputs() -> None:
 
 
 def _test_division_broadcast_uses_tensor_scalar_not_tensor_tensor() -> None:
+    from unittest.mock import patch
+
     x = SymTensor("x", shape=(4, 8))
     reduced = SymTensor("tensor_reduce_1080", shape=(4, 1))
 
@@ -5687,9 +5694,8 @@ def _test_division_broadcast_uses_tensor_scalar_not_tensor_tensor() -> None:
         "tensor_tensor divide must require same-shaped operands; broadcasted [4,1] / [4,8] "
         "should be rejected before equivalence checking"
     )
-    assert not _check_equivalent_quiet(target_sym, bad_candidate, timeout=3000), (
-        "broadcasted public divide must not be considered equivalent to "
-        "reciprocal(tensor_tensor(divide(...)))"
+    assert _shape_rejection_reason(target_sym, bad_candidate) == "sketch shape constraints violated", (
+        "broadcasted public divide candidate must be rejected by shape constraints before solver dispatch"
     )
     assert not _sketch_shape_constraints_violated(good_candidate), (
         "tensor_scalar is the broadcast-capable hardware op for divide-like sketches"
@@ -5697,6 +5703,37 @@ def _test_division_broadcast_uses_tensor_scalar_not_tensor_tensor() -> None:
     assert _check_equivalent_quiet(target_sym, good_candidate, timeout=3000), (
         "broadcasted public divide should still match tensor_scalar divide semantics"
     )
+
+    bad_sketch = SketchNode.make_op(
+        "reciprocal",
+        [
+            SketchNode.make_op(
+                "tensor_tensor",
+                [SketchNode.make_input(reduced), SketchNode.make_input(x)],
+                {"op": nl.divide},
+            )
+        ],
+        {},
+    )
+    calls = {"count": 0}
+    original_check = _check_equivalent_quiet
+
+    def _counting_check(lhs: SymTensor, rhs: SymTensor, timeout: int = 3000) -> bool:
+        calls["count"] += 1
+        return original_check(lhs, rhs, timeout=timeout)
+
+    with patch("axon_synthesizer._check_equivalent_quiet", side_effect=_counting_check):
+        found = _synthesize_all_from_pool(
+            target_sym,
+            [bad_sketch],
+            max_hw_size=2,
+            timeout=100,
+            verbose=False,
+            max_workers=1,
+        )
+
+    assert found == [], "invalid tensor_tensor divide sketch must not be accepted for broadcasted div"
+    assert calls["count"] == 0, "shape rejection should skip solver dispatch for invalid tensor_tensor divide sketches"
     print(" synthesis: broadcasted div matches tensor_scalar, not tensor_tensor")
 
 
