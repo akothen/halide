@@ -4007,9 +4007,9 @@ def _shapes_not_provably_equivalent(
         visited_inputs.add(key)
         if expr.op == "input":
             for dim in expr.shape:
-                fact = z3.simplify(dim > z3.IntVal(0))
-                if not z3.is_true(fact):
-                    input_positivity.append(dim > z3.IntVal(0))
+                positivity = dim > z3.IntVal(0)
+                if not z3.is_true(z3.simplify(positivity)):
+                    input_positivity.append(positivity)
             return
         for inp in expr.inputs:
             _collect_input_positivity(inp)
@@ -5893,10 +5893,10 @@ def _test_division_symbolic_shape_rejection() -> None:
     """
     from unittest.mock import patch
 
-    m = z3.Int("sym_m")
-    k = z3.Int("sym_k")
-    x = SymTensor("x_sym", shape=(m, k))
-    reduced = SymTensor("reduced_sym", shape=(m, z3.IntVal(1)))
+    symbolic_m = z3.Int("sym_m")
+    symbolic_k = z3.Int("sym_k")
+    x = SymTensor("x_sym", shape=(symbolic_m, symbolic_k))
+    reduced = SymTensor("reduced_sym", shape=(symbolic_m, z3.IntVal(1)))
 
     target_sym = divide(x, reduced)
 
