@@ -2609,7 +2609,12 @@ def _compile_public_unary(expr: SymExpr, ins: list[Semantics], out_shape: ShapeE
 
 def _shape_public_binary(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
     if len(ins) >= 2:
-        return _shape_tensor_tensor(ins[:2], attrs)
+        # Public binary ops support NumPy-style broadcasting: use broadcast
+        # semantics so the shape rule emits ``Or(a==b, a==1, b==1)`` per-dim
+        # constraints rather than strict equality ``a==b``.  Strict equality
+        # was incorrect for ops like ``div`` whose second operand is a
+        # keep-dims reduce result with a trailing size-1 dimension.
+        return _broadcast_shape(ins[0], ins[1])
     if len(ins) == 1:
         return _shape_same_as_first(ins, attrs)
     return _shape_from_out(attrs.get("out_shape", (z3.IntVal(1),)))
@@ -3963,7 +3968,8 @@ def _shapes_not_provably_equivalent(
     timeout: int = 500,
 ) -> bool:
     """Return True when the candidate's operator shape constraints cannot be
-    proved consistent with all valid inputs defined by input-dimension positivity.
+    proved consistent with all valid inputs, given both input-dimension
+    positivity and the target operation's own shape constraints.
 
     ``_sketch_shape_constraints_violated`` rejects candidates whose shape
     constraints are *trivially False* (``z3.simplify`` returns the False literal).
@@ -3971,26 +3977,44 @@ def _shapes_not_provably_equivalent(
     *symbolically non-trivial* — e.g. ``k == 1`` emitted by
     ``_shape_tensor_tensor`` when one operand has a concrete-1 dimension while
     the other has a symbolic dimension ``k``.  For such constraints a Z3 solver
-    determines whether the constraint is necessarily implied by the positivity
-    facts ``d > 0`` that hold for every input-tensor dimension.  If the solver
-    finds a satisfying assignment (e.g. k = 8) that violates the constraint,
-    the candidate would fail for that input and must be rejected.
+    determines whether the constraint is necessarily implied by the "valid
+    assumption" set, which comprises both the positivity facts ``d > 0`` and
+    the target's own top-level shape constraints.
+
+    Including the target's shape constraints as valid assumptions is essential
+    for broadcast-capable candidates.  For example, when synthesising
+    ``div(x[m, k], reduce[n, 1])`` the target's shape rule (``_broadcast_shape``)
+    emits ``Or(m==n, m==1, n==1)``.  A candidate ``tensor_scalar(x, reduce)``
+    also emits that same broadcast constraint.  Without the target's constraints
+    in the assumption set the check ``SAT(m>0, k>0, n>0, ¬Or(m==n, m==1, n==1))``
+    is SAT (e.g. m=4, n=5), so the candidate would be wrongly rejected.
+    With the target constraint in the assumption set the check becomes UNSAT
+    (the Or is already forced to hold), so the candidate is correctly kept.
+
+    Conversely, a ``tensor_tensor(x, reduce)`` candidate emits the stricter
+    ``m==n ∧ k==1``.  Even with the target's ``Or(m==n, m==1, n==1)`` as an
+    assumption, ``SAT(m>0, k>0, n>0, Or(m==n,…), ¬(m==n ∧ k==1))`` is SAT
+    (e.g. m=n=4, k=8), so that candidate is correctly rejected.
 
     Algorithm
     ---------
     1. Traverse the candidate's SymExpr tree bottom-up and collect ``d > 0``
        for every *symbolic* input dimension (concrete ``IntVal`` dims produce
        trivially-True positivity facts and are skipped).
-    2. Re-run each operator's ``shape_rule`` on the actual child shapes (same
+    2. Run the *target's* top-level shape rule on the target's input shapes and
+       collect every non-trivial fact — these become additional valid assumptions
+       that the checker can rely on.
+    3. Re-run each operator's ``shape_rule`` on the actual child shapes (same
        as ``_sketch_shape_constraints_violated``) and collect every fact that
        *does not* simplify to True or False — these are the non-trivial shape
        constraints that the candidate imposes on its operands.
-    3. Ask Z3: ``input_positivity ∧ ¬(all non-trivial constraints)`` — is this
-       satisfiable?  If SAT there exist valid inputs for which the candidate
-       shape constraints are violated; the candidate is rejected.  If UNSAT,
-       all valid inputs satisfy the constraints; the candidate is kept.  On
-       UNKNOWN (solver timeout) the result is conservatively treated as "not
-       rejected" so that a slow solver never silently drops a valid candidate.
+    4. Ask Z3: ``(positivity ∧ target_constraints) ∧ ¬(all candidate constraints)``
+       — is this satisfiable?  If SAT there exist valid inputs (consistent with
+       the target's preconditions) for which the candidate shape constraints are
+       violated; the candidate is rejected.  If UNSAT, the valid-assumption set
+       implies all candidate constraints; the candidate is kept.  On UNKNOWN
+       (solver timeout) the result is conservatively treated as "not rejected"
+       so that a slow solver never silently drops a valid candidate.
 
     Thread-safety
     -------------
@@ -4013,6 +4037,31 @@ def _shapes_not_provably_equivalent(
             return
         for inp in expr.inputs:
             _collect_input_positivity(inp)
+
+    def _collect_top_level_shape_constraints(expr: SymExpr) -> list[z3.BoolRef]:
+        """Return non-trivial shape constraints from the *top-level* op of expr.
+
+        Only the top-level node is inspected (not its sub-tree) because the
+        target represents a single public op whose shape preconditions define
+        the synthesis problem's valid input domain.
+        """
+        if expr.op == "input":
+            return []
+        shape_rule, _ = _SEMANTICS.get(expr.op, (None, None))
+        if shape_rule is None:
+            return []
+        input_shapes = [ShapeExpr(list(inp.shape)) for inp in expr.inputs]
+        attrs_for_check = {k: v for k, v in expr.attrs.items() if k != "out_shape"}
+        try:
+            result = shape_rule(input_shapes, attrs_for_check)
+        except Exception:
+            return []
+        out = []
+        for constraint in result.ctx.facts:
+            simplified = z3.simplify(constraint)
+            if not z3.is_true(simplified) and not z3.is_false(simplified):
+                out.append(constraint)
+        return out
 
     candidate_shape_constraints: list[z3.BoolRef] = []
     visited_ops: set[int] = set()
@@ -4042,6 +4091,12 @@ def _shapes_not_provably_equivalent(
 
     with _Z3_LOCK:
         _collect_input_positivity(candidate_sym.expr)
+        target_expr = target_sym.expr if target_sym is not None else None
+        target_shape_constraints = (
+            _collect_top_level_shape_constraints(target_expr)
+            if target_expr is not None
+            else []
+        )
         _collect_candidate_shape_constraints(candidate_sym.expr)
 
         if not candidate_shape_constraints:
@@ -4054,12 +4109,18 @@ def _shapes_not_provably_equivalent(
         )
         solver = z3.Solver()
         solver.set("timeout", timeout)
-        if input_positivity:
-            solver.add(z3.And(*input_positivity))
+        # Valid-assumption set: input-dimension positivity PLUS the target's
+        # own shape preconditions.  The latter ensure that broadcast-compatible
+        # candidates are not wrongly rejected when the synthesis uses distinct
+        # symbolic variables for dimensions that are equal at run time.
+        valid_assumptions = input_positivity + target_shape_constraints
+        if valid_assumptions:
+            solver.add(z3.And(*valid_assumptions))
         solver.add(z3.Not(all_constraints))
         result = solver.check()
-        # SAT    → there exist valid inputs where candidate shape constraints fail → reject
-        # UNSAT  → input positivity implies all candidate shape constraints → keep
+        # SAT    → there exist valid inputs (satisfying target preconditions)
+        #          where candidate shape constraints fail → reject
+        # UNSAT  → valid assumptions imply all candidate shape constraints → keep
         # UNKNOWN → solver timed out; be conservative and keep the candidate
         return result == z3.sat
 
@@ -5996,6 +6057,171 @@ def _test_division_symbolic_shape_rejection() -> None:
     )
 
 
+def _test_shapes_not_provably_equivalent_broadcast_compatible_candidate() -> None:
+    """Regression: ``_shapes_not_provably_equivalent`` must not reject a valid
+    ``tensor_scalar`` candidate for ``div`` when the synthesis assigns *distinct*
+    symbolic dimension variables to operands that are equal at run time.
+
+    Scenario
+    --------
+    In ``kernel_matmul_red_div`` the synthesis builds a local target for
+    ``div_1002`` from two previously-lowered hw nodes:
+
+    * ``x_sym``              shape ``(x_d0, x_d1)``   (e.g. 4 × 8)
+    * ``tensor_reduce_1080`` shape ``(y_d0, 1)``       (e.g. 4 × 1)
+
+    Here ``x_d0`` and ``y_d0`` are **distinct** z3 variables even though at
+    run time ``x_d0 == y_d0 == 4``.  The target ``div`` (after Fix 1:
+    ``_shape_public_binary`` uses ``_broadcast_shape``) emits the constraint
+    ``Or(x_d0==y_d0, x_d0==1, y_d0==1)`` as its shape pre-condition.
+
+    The broadcast-capable candidate ``tensor_scalar(x, reduce, op=divide)``
+    emits the same ``Or(...)`` constraint.  Without Fix 2 (including the
+    target's constraint in the valid-assumption set), the old check
+
+        SAT(x_d0>0, x_d1>0, y_d0>0, ¬Or(x_d0==y_d0, x_d0==1, y_d0==1))
+
+    is SAT (x_d0=4, y_d0=5), so the candidate was wrongly rejected.
+
+    With Fix 2 the valid assumptions include the target's ``Or(...)``
+    constraint, making the negated candidate constraint UNSAT → candidate kept.
+
+    Conversely, the strict ``tensor_tensor(x, reduce)`` candidate emits
+    ``x_d0==y_d0 ∧ x_d1==1``.  Even with the target's Or as an assumption,
+    ``SAT(…, Or(x_d0==y_d0,…), ¬(x_d0==y_d0 ∧ x_d1==1))`` is SAT
+    (x_d0=y_d0=4, x_d1=8), so that candidate is correctly rejected.
+    """
+    x_d0 = z3.Int("x_d0")
+    x_d1 = z3.Int("x_d1")
+    y_d0 = z3.Int("y_d0")
+
+    x_sym = SymTensor("x", shape=(x_d0, x_d1))
+    reduce_sym = SymTensor("tensor_reduce_1080", shape=(y_d0, z3.IntVal(1)))
+
+    # Build local target the same way lower_nu_graph_all_variants does:
+    # _sym_expr_from_graph_node(div_node, [x_sym, reduce_sym])
+    div_node = Node(
+        id="div_1002", op="div",
+        inputs=["x", "tensor_reduce_1080"],
+        shape=(4, 8), attrs={},
+    )
+    local_target = _sym_expr_from_graph_node(div_node, [x_sym, reduce_sym])
+
+    # Good candidate: tensor_scalar supports broadcast
+    good = tensor_scalar(dst=None, data=x_sym, op0=nl.divide, operand0=reduce_sym)
+    assert not _shapes_not_provably_equivalent(local_target, good), (
+        "tensor_scalar(x, reduce, op=divide) must NOT be rejected by "
+        "_shapes_not_provably_equivalent when operands use distinct symbolic "
+        "vars — the target's broadcast constraint makes the candidate's "
+        "Or constraint trivially implied"
+    )
+    assert _shape_rejection_reason(local_target, good) is None, (
+        "tensor_scalar must pass all shape pre-filters for the div node "
+        "lowering scenario with distinct symbolic dimension variables"
+    )
+    assert _check_equivalent_quiet(local_target, good, timeout=5000), (
+        "tensor_scalar(x, reduce, op=divide) must be proven equivalent to "
+        "broadcasted div(x, reduce) when x.shape=(x_d0,x_d1), reduce.shape=(y_d0,1)"
+    )
+
+    # Bad candidate: tensor_tensor injects the spurious k==1 constraint
+    bad = tensor_tensor(dst=None, data1=x_sym, data2=reduce_sym, op=nl.divide)
+    assert _shapes_not_provably_equivalent(local_target, bad), (
+        "tensor_tensor(x, reduce, op=divide) must be rejected by "
+        "_shapes_not_provably_equivalent — it injects x_d1==1 which is not "
+        "implied by the target's Or(x_d0==y_d0, …) assumption"
+    )
+    reason = _shape_rejection_reason(local_target, bad)
+    assert reason is not None, (
+        "tensor_tensor must be rejected before the equivalence solver for the "
+        "distinct-symbolic-var div lowering scenario"
+    )
+    assert "provably" in reason.lower(), (
+        f"Expected 'output shape not provably equivalent' rejection, got: {reason!r}"
+    )
+    print(
+        " _shapes_not_provably_equivalent: broadcast-compatible tensor_scalar kept, "
+        "strict tensor_tensor rejected for div with distinct symbolic vars"
+    )
+
+
+def _test_kernel_matmul_red_div_div_node_lowered_via_tensor_scalar() -> None:
+    """Regression: the ``div`` node in ``kernel_matmul_red_div`` variant 0 must
+    be successfully lowered to a ``tensor_scalar`` hw candidate, not fail with
+    'no hw equivalent found'.
+
+    This is the end-to-end regression for the bug described in the problem
+    statement: ``lower_nu_graph_all_variants`` was printing
+    'FAILED: no hw equivalent found for div_1002 op=div' because every
+    candidate (including the correct broadcast ``tensor_scalar``) was rejected
+    by the shape prefilter before reaching the equivalence solver.
+
+    This test exercises the node-level synthesis path directly (without running
+    the full, slow ``lower_nu_graph_all_variants``) by replicating the exact
+    symbolic-tensor setup used during lowering of ``div_1002``.
+    """
+    # Replicate the synthesis context for div_1002 in kernel_matmul_red_div:
+    #   x_sym              : shape = (x_d0, x_d1)
+    #   tensor_reduce_1080 : shape = (y_d0, IntVal(1))
+    #                         (result of tensor_reduce[axis=1, keepdims=True](y))
+    x_d0 = z3.Int("x_d0")
+    x_d1 = z3.Int("x_d1")
+    y_d0 = z3.Int("y_d0")
+
+    x_sym = SymTensor("x", shape=(x_d0, x_d1))
+    reduce_sym = SymTensor("tensor_reduce_1080", shape=(y_d0, z3.IntVal(1)))
+
+    # Build the local target exactly as _lower_node does
+    div_node = Node(
+        id="div_1002", op="div",
+        inputs=["x", "tensor_reduce_1080"],
+        shape=(4, 8), attrs={},
+    )
+    local_target = _sym_expr_from_graph_node(div_node, [x_sym, reduce_sym])
+
+    # Build a synthesis pool containing only the candidates that were failing
+    ts_sketch = SketchNode.make_op(
+        "tensor_scalar",
+        [SketchNode.make_input(x_sym), SketchNode.make_input(reduce_sym)],
+        {"op0": nl.divide},
+    )
+    tt_sketch = SketchNode.make_op(
+        "tensor_tensor",
+        [SketchNode.make_input(x_sym), SketchNode.make_input(reduce_sym)],
+        {"op": nl.divide},
+    )
+
+    found = _synthesize_all_from_pool(
+        local_target,
+        [ts_sketch, tt_sketch],
+        max_hw_size=2,
+        timeout=5000,
+        verbose=False,
+        max_workers=1,
+    )
+
+    assert any(
+        _format_sketch(s) is not None and "tensor_scalar" in _format_sketch(s)
+        for s in found
+    ), (
+        f"div_1002 synthesis must find tensor_scalar as a valid lowering. "
+        f"Found: {[_format_sketch(s) for s in found]}"
+    )
+    assert not any(
+        _format_sketch(s) is not None and "tensor_tensor" in _format_sketch(s)
+        and "tensor_scalar" not in _format_sketch(s)
+        for s in found
+    ), (
+        "tensor_tensor must not be accepted as a valid lowering for div_1002 "
+        "(it injects a spurious k==1 constraint and produces false equivalence)"
+    )
+    print(
+        f" kernel_matmul_red_div div_1002 node-level synthesis: "
+        f"tensor_scalar found, tensor_tensor rejected "
+        f"(found {len(found)} equivalent sketch(es))"
+    )
+
+
 def _test_lower_nu_graph_parallel_levels() -> None:
     def kernel_parallel_reductions(x, y):
         return x.sum(axis=1, keep_dims=True) / y.sum(axis=1, keep_dims=True)
@@ -6041,6 +6267,7 @@ def run_all_tests() -> None:
     _test_single_operator_sketches_cover_distinct_inputs()
     _test_division_broadcast_uses_tensor_scalar_not_tensor_tensor()
     _test_division_symbolic_shape_rejection()
+    _test_shapes_not_provably_equivalent_broadcast_compatible_candidate()
     _test_invoke_hw_op_transpose_uses_nc_transpose_semantics()
     _test_lower_nu_graph_parallel_levels()
     print("\n================ RUNNING SYNTHESIZER TESTS =============")
@@ -6053,6 +6280,7 @@ def run_all_tests() -> None:
     _test_synthesizer_all_variants_lowered()
     _test_lower_nu_graph_all_variants()
     _test_reduce_sum_lowering_no_crash()
+    _test_kernel_matmul_red_div_div_node_lowered_via_tensor_scalar()
     print("=============== ALL TESTS PASSED  =====================\n")
 
 
