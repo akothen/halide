@@ -4045,7 +4045,7 @@ def _shapes_not_provably_equivalent(
         target represents a single public op whose shape preconditions define
         the synthesis problem's valid input domain.
         """
-        if expr is None or expr.op == "input":
+        if expr.op == "input":
             return []
         shape_rule, _ = _SEMANTICS.get(expr.op, (None, None))
         if shape_rule is None:
@@ -4092,7 +4092,11 @@ def _shapes_not_provably_equivalent(
     with _Z3_LOCK:
         _collect_input_positivity(candidate_sym.expr)
         target_expr = target_sym.expr if target_sym is not None else None
-        target_shape_constraints = _collect_top_level_shape_constraints(target_expr)
+        target_shape_constraints = (
+            _collect_top_level_shape_constraints(target_expr)
+            if target_expr is not None
+            else []
+        )
         _collect_candidate_shape_constraints(candidate_sym.expr)
 
         if not candidate_shape_constraints:
