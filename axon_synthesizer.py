@@ -46,6 +46,20 @@ _UF_LOCK = Lock()
 _SEMANTICS_LOCK = Lock()
 _VERBOSE_LOCK = Lock()   # serializes verbose prints from concurrent synthesis threads
 _Z3_LOCK = RLock()       # serializes z3 formula construction (z3.main_ctx is not thread-safe)
+
+
+def _effective_max_workers(max_workers: Optional[int], task_count: int) -> int:
+    """Choose how many threads to launch for a pool of *task_count* items.
+
+    ``max_workers=None`` means "auto": launch one worker per task so sketch
+    synthesis fans out as widely as possible.  Explicit positive ``max_workers``
+    values are still respected.
+    """
+    if task_count <= 1:
+        return 1
+    if max_workers is None:
+        return task_count
+    return builtins.max(1, builtins.min(max_workers, task_count))
 _SYNTHESIS_STATS_LOCK = Lock()
 
 
@@ -4271,7 +4285,7 @@ def _synthesize_all_from_pool(
     max_hw_size: int = 2,
     timeout: int = 3000,
     verbose: bool = False,
-    max_workers: int = 4,
+    max_workers: Optional[int] = None,
 ) -> list[SketchNode]:
     """Like _synthesize_from_pool but returns ALL equivalent sketches.
 
@@ -4378,8 +4392,9 @@ def _synthesize_all_from_pool(
             )
 
     ordered: dict[int, tuple[SketchNode, bool, float]] = {}
-    if max_workers > 1 and len(candidates) > 1:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+    effective_workers = _effective_max_workers(max_workers, len(candidates))
+    if effective_workers > 1 and len(candidates) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
             fs = {executor.submit(_check_one, item): idx
                   for idx, item in enumerate(candidates)}
             for future in concurrent.futures.as_completed(fs):
@@ -4520,7 +4535,7 @@ def _lower_node_all(
     max_hw_size: int,
     timeout: int,
     verbose: bool = False,
-    max_workers: int = 4,
+    max_workers: Optional[int] = None,
 ) -> list[tuple[list[Node], str, SymTensor]]:
     """Synthesize ALL valid hw-only replacements for *node*.
 
@@ -4588,7 +4603,7 @@ def lower_nu_graph(
     max_hw_size: int = 2,
     timeout: int = 3000,
     verbose: bool = False,
-    max_workers: int = 4,
+    max_workers: Optional[int] = None,
 ) -> Optional[nuGraph]:
     """Lower all public ops in *G* to hw ops using sketch-driven synthesis.
 
@@ -4683,8 +4698,9 @@ def lower_nu_graph(
             )
 
         level_results: list[Optional[tuple[list[Node], str, SymTensor]]]
-        if max_workers > 1 and len(synthesis) > 1:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        effective_workers = _effective_max_workers(max_workers, len(synthesis))
+        if effective_workers > 1 and len(synthesis) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
                 futures = [executor.submit(_synth, args) for args in synthesis_args]
                 level_results_tmp: list[Optional[tuple[list[Node], str, SymTensor]]] = []
                 for i_f, future in enumerate(futures):
@@ -4721,7 +4737,7 @@ def lower_nu_graph_variants(
     max_hw_size: int = 2,
     timeout: int = 3000,
     verbose: bool = False,
-    max_workers: int = 4,
+    max_workers: Optional[int] = None,
 ) -> list[Optional[nuGraph]]:
     """Lower every variant in *variants* to hardware ops.
 
@@ -4772,7 +4788,7 @@ def lower_nu_graph_all_variants(
     max_hw_size: int = 2,
     timeout: int = 3000,
     verbose: bool = False,
-    max_workers: int = 4,
+    max_workers: Optional[int] = None,
     max_variants: int = 256,
 ) -> list[nuGraph]:
     """Lower *G* to hardware discovering every valid sketch choice per node.
@@ -4905,8 +4921,9 @@ def lower_nu_graph_all_variants(
                                    verbose=verbose, max_workers=max_workers)
 
         node_alts_list: list[list[tuple[list[Node], str, SymTensor]]]
-        if max_workers > 1 and len(synthesis) > 1:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        effective_workers = _effective_max_workers(max_workers, len(synthesis))
+        if effective_workers > 1 and len(synthesis) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
                 futures = [executor.submit(_synth, args) for args in synthesis_args]
                 node_alts_list_tmp: list[list[tuple[list[Node], str, SymTensor]]] = []
                 for i_f, future in enumerate(futures):
@@ -4997,7 +5014,7 @@ def synthesize_hw_graph(
     max_hw_size: int = 2,
     timeout: int = 3000,
     verbose: bool = False,
-    max_workers: int = 4,
+    max_workers: Optional[int] = None,
 ) -> list[nuGraph]:
     """Generate all variant orderings of *G* and lower each to hw ops.
 
@@ -5717,6 +5734,50 @@ def _test_synthesis_verbose_reports_candidate_count() -> None:
     print(" synthesis: verbose output reports candidate_count")
 
 
+def _test_synthesis_auto_maximizes_sketch_workers() -> None:
+    from unittest.mock import patch
+
+    G = build_kernel_matmul_red_div_graph(4, 8, 16)
+    variants = nu_graph_generation_z3(G, verbose=False)
+    gv = variants[0]
+    reduce_node = _nodes_by_op(gv, "reduce_sum")[0]
+    orig_syms = _graph_symbolic_tensors(gv)
+    input_syms = [orig_syms[inp_id] for inp_id in reduce_node.inputs]
+    target_sym = orig_syms[reduce_node.id]
+    pool = _build_synthesis_pool(reduce_node.op, reduce_node.attrs, input_syms)
+
+    real_executor = concurrent.futures.ThreadPoolExecutor
+    observed: dict[str, int] = {}
+
+    def _recording_executor(*args: Any, **kwargs: Any) -> concurrent.futures.ThreadPoolExecutor:
+        if args:
+            observed["max_workers"] = args[0]
+        else:
+            observed["max_workers"] = kwargs["max_workers"]
+        return real_executor(*args, **kwargs)
+
+    with patch("axon_synthesizer.concurrent.futures.ThreadPoolExecutor", side_effect=_recording_executor):
+        _synthesize_all_from_pool(
+            target_sym,
+            pool,
+            max_hw_size=2,
+            timeout=100,
+            verbose=False,
+        )
+
+    candidate_count = _last_synthesis_stats.get("candidate_count", 0)
+    expected_workers = _effective_max_workers(None, candidate_count)
+    assert candidate_count > 1, "Expected multiple candidate sketches for reduce_sum"
+    assert observed.get("max_workers") == expected_workers, (
+        f"Expected sketch-level synthesis to auto-launch {expected_workers} worker(s), "
+        f"got {observed.get('max_workers')}"
+    )
+    print(
+        f" synthesis: auto sketch-level threading launches {observed['max_workers']} "
+        f"worker(s) for {candidate_count} candidate sketch(es)"
+    )
+
+
 def _test_synthesis_symbolic_shape_prefilter_skips_solver() -> None:
     from unittest.mock import patch
 
@@ -6401,6 +6462,7 @@ def run_all_tests() -> None:
     _test_print_graph_includes_symbolic_shapes()
     _test_synthesis_prefers_direct_reduce_candidate()
     _test_synthesis_verbose_reports_candidate_count()
+    _test_synthesis_auto_maximizes_sketch_workers()
     _test_synthesis_symbolic_shape_prefilter_skips_solver()
     _test_sketch_shape_constraints_violated_rejected_early()
     _test_synthesis_pool_filters_templates_by_target_constituents()
