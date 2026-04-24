@@ -2067,7 +2067,7 @@ def tensor_scalar(dst, data, op0, operand0, reverse0=False, op1=None, operand1=N
         inputs.append(operand1)
     elif operand1 is not None:
         attrs["operand1_const"] = operand1
-    return _new_sym_tensor("tensor_scalar", inputs, attrs, _default_out_shape(dst, data))
+    return _new_sym_tensor("tensor_scalar", inputs, attrs, _tensor_scalar_out_shape(dst, data, operand0, operand1))
 
 
 @semantics_hw()
@@ -2262,7 +2262,14 @@ def _compile_copy(expr: SymExpr, ins: list[Semantics], out_shape: ShapeExpr) -> 
 
 
 def _shape_tensor_tensor(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
-    return _broadcast_shape(ins[0], ins[1])
+    a, b = ins
+    ctx = _shape_ctx(*a.dims, *b.dims)
+    if a.rank != b.rank:
+        ctx.add(z3.BoolVal(False))
+        return ShapeResult(ShapeExpr(list(a.dims)), ctx)
+    for adim, bdim in zip(a.dims, b.dims):
+        ctx.add(adim == bdim)
+    return ShapeResult(ShapeExpr(list(a.dims)), ctx)
 
 
 def _compile_tensor_tensor(expr: SymExpr, ins: list[Semantics], out_shape: ShapeExpr) -> Semantics:
@@ -2270,22 +2277,39 @@ def _compile_tensor_tensor(expr: SymExpr, ins: list[Semantics], out_shape: Shape
     out_fn = _tensor_function(f"V_{expr.name}", out_shape.rank)
     ctx = a.ctx.merged(b.ctx)
     idx = [z3.Int(f"{expr.name}_i{k}") for k in range(out_shape.rank)]
-    av = _call_broadcasted(a, out_shape, idx)
-    bv = _call_broadcasted(b, out_shape, idx)
+    av = a.fn(*idx)
+    bv = b.fn(*idx)
     ctx.add(z3.ForAll(idx, out_fn(*idx) == _apply_binary(expr.attrs.get("op"), av, bv)))
     return Semantics(expr.name, out_shape, out_fn, ctx)
 
 
 def _shape_tensor_scalar(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
     data = ins[0]
-    ctx = Context([d > 0 for d in data.dims])
+    out = ShapeResult(ShapeExpr(list(data.dims)), Context([d > 0 for d in data.dims]))
     if len(ins) > 1:
-        b0 = _broadcast_shape(data, ins[1])
-        ctx.extend(b0.ctx.facts)
+        out = _broadcast_shape(out.out, ins[1])
     if len(ins) > 2:
-        b1 = _broadcast_shape(data, ins[2])
-        ctx.extend(b1.ctx.facts)
-    return ShapeResult(ShapeExpr(list(data.dims)), ctx)
+        b1 = _broadcast_shape(out.out, ins[2])
+        out.ctx.extend(b1.ctx.facts)
+        out = ShapeResult(b1.out, out.ctx)
+    return out
+
+
+def _tensor_scalar_out_shape(
+    dst: Any,
+    data: SymTensor,
+    operand0: Any,
+    operand1: Any = None,
+) -> tuple[Any, ...]:
+    if isinstance(dst, SymTensor):
+        return dst.shape
+    with _Z3_LOCK:
+        out = ShapeExpr(list(data.shape))
+        if _is_sym_tensor(operand0):
+            out = _broadcast_shape(out, ShapeExpr(list(operand0.shape))).out
+        if _is_sym_tensor(operand1):
+            out = _broadcast_shape(out, ShapeExpr(list(operand1.shape))).out
+        return tuple(z3.simplify(dim) for dim in out.dims)
 
 
 def _operand_value(
@@ -3639,7 +3663,10 @@ def _invoke_hw_op(op: str, input_syms: list[SymTensor], attrs: dict[str, Any]) -
         if op == "tensor_copy":
             return tensor_copy(dst=None, src=input_syms[0])
         if op == "transpose":
-            return transpose(input_syms[0])
+            # Evaluate using nc_transpose (the hardware op that
+            # _sketch_to_graph_nodes emits) so that equivalence checking and
+            # materialization use the same semantics.
+            return nc_transpose(dst=None, data=input_syms[0])
         if op == "tensor_partition_reduce":
             reduce_op_attr = attrs.get("op", nl.add)
             return tensor_partition_reduce(dst=None, op=reduce_op_attr, data=input_syms[0])
@@ -4235,10 +4262,15 @@ def _sketch_to_graph_nodes(
         child_ids.append(cid)
 
     clean_attrs = {k: v for k, v in sketch.attrs.items() if k != "name"}
-    # The synthesis pool uses an abstract transpose so search does not branch
-    # over multiple concrete layout ops; materialize it here as nc_transpose,
-    # the canonical hardware transpose used throughout lowering because it is
-    # the standard transpose primitive already used by synthesized hw graphs.
+    if sketch.op == "tensor_scalar":
+        if len(child_ids) > 1:
+            clean_attrs["operand0_input_index"] = 1
+        if len(child_ids) > 2 and clean_attrs.get("op1") is not None:
+            clean_attrs["operand1_input_index"] = 2
+    # The synthesis pool uses abstract "transpose" so the search does not need
+    # to branch over multiple concrete layout ops.  Both evaluation
+    # (_invoke_hw_op) and materialization here map "transpose" to nc_transpose,
+    # keeping equivalence checking and the emitted graph node consistent.
     materialized_op = "nc_transpose" if sketch.op == "transpose" else sketch.op
     new_id = _gen_id(materialized_op)
     new_nodes.append(Node(id=new_id, op=materialized_op, inputs=child_ids, attrs=clean_attrs))
@@ -5524,6 +5556,54 @@ def _test_sketch_shape_constraints_violated_rejected_early() -> None:
     )
 
 
+def _test_invoke_hw_op_transpose_uses_nc_transpose_semantics() -> None:
+    """Regression test: _invoke_hw_op for op='transpose' must use nc_transpose
+    semantics so that equivalence checking and graph materialization are
+    consistent.
+
+    Before the fix, _invoke_hw_op evaluated 'transpose' via the public
+    transpose() op while _sketch_to_graph_nodes emitted nc_transpose; this
+    mismatch caused the synthesizer to reject the valid candidate
+    nc_matmul(transpose(IN:x), IN:w) for public matmul(x, w).
+    """
+    # Shapes: x [4, 8], w [8, 16] → matmul output [4, 16]
+    x = SymTensor("x", shape=(4, 8))
+    w = SymTensor("w", shape=(8, 16))
+
+    # Target: public matmul(x, w) internally computes nc_matmul(nc_transpose(x), w)
+    target_sym = matmul(x, w)
+
+    # Candidate sketch: nc_matmul(transpose(IN:x), IN:w)
+    # With the fix, 'transpose' evaluates as nc_transpose, making this
+    # semantically identical to the target.
+    sketch = SketchNode.make_op(
+        "nc_matmul",
+        [
+            SketchNode.make_op("transpose", [SketchNode.make_input(x)], {}),
+            SketchNode.make_input(w),
+        ],
+        {},
+    )
+    candidate_sym = _eval_sketch(sketch)
+    assert candidate_sym is not None, "Sketch nc_matmul(transpose(x), w) should evaluate"
+
+    # Shape check: candidate must not be rejected pre-solver
+    assert not _sketch_shape_constraints_violated(candidate_sym), (
+        "nc_matmul(transpose([4,8]), [8,16]) has matching contraction dims and "
+        "must not be rejected by shape constraints"
+    )
+
+    # Equivalence: the sketch must be accepted as equivalent to public matmul
+    assert _check_equivalent_quiet(target_sym, candidate_sym, timeout=3000), (
+        "nc_matmul(transpose(IN:x), IN:w) must be equivalent to matmul(x, w) — "
+        "_invoke_hw_op 'transpose' must use nc_transpose semantics"
+    )
+    print(
+        " synthesis: nc_matmul(transpose(IN), IN) correctly accepted as "
+        "equivalent to public matmul (transpose evaluates as nc_transpose)"
+    )
+
+
 def _test_synthesis_pool_filters_templates_by_target_constituents() -> None:
     G = build_kernel_matmul_red_div_graph(4, 8, 16)
     orig_syms = _graph_symbolic_tensors(G)
@@ -5617,6 +5697,63 @@ def _test_single_operator_sketches_cover_distinct_inputs() -> None:
     print(" synthesis: single-op sketches cover distinct concrete inputs")
 
 
+def _test_division_broadcast_uses_tensor_scalar_not_tensor_tensor() -> None:
+    from unittest.mock import patch
+
+    x = SymTensor("x", shape=(4, 8))
+    reduced = SymTensor("tensor_reduce_1080", shape=(4, 1))
+
+    target_sym = divide(x, reduced)
+    bad_candidate = reciprocal(dst=None, data=tensor_tensor(dst=None, data1=reduced, data2=x, op=nl.divide))
+    good_candidate = tensor_scalar(dst=None, data=x, op0=nl.divide, operand0=reduced)
+
+    assert _sketch_shape_constraints_violated(bad_candidate), (
+        "tensor_tensor divide must require same-shaped operands; broadcasted [4,1] / [4,8] "
+        "should be rejected before equivalence checking"
+    )
+    assert _shape_rejection_reason(target_sym, bad_candidate) == "sketch shape constraints violated", (
+        "broadcasted public divide candidate must be rejected by shape constraints before solver dispatch"
+    )
+    assert not _sketch_shape_constraints_violated(good_candidate), (
+        "tensor_scalar is the broadcast-capable hardware op for divide-like sketches"
+    )
+    assert _check_equivalent_quiet(target_sym, good_candidate, timeout=3000), (
+        "broadcasted public divide should still match tensor_scalar divide semantics"
+    )
+
+    bad_sketch = SketchNode.make_op(
+        "reciprocal",
+        [
+            SketchNode.make_op(
+                "tensor_tensor",
+                [SketchNode.make_input(reduced), SketchNode.make_input(x)],
+                {"op": nl.divide},
+            )
+        ],
+        {},
+    )
+    calls = {"count": 0}
+    original_check = _check_equivalent_quiet
+
+    def _counting_check(lhs: SymTensor, rhs: SymTensor, timeout: int = 3000) -> bool:
+        calls["count"] += 1
+        return original_check(lhs, rhs, timeout=timeout)
+
+    with patch("axon_synthesizer._check_equivalent_quiet", side_effect=_counting_check):
+        found = _synthesize_all_from_pool(
+            target_sym,
+            [bad_sketch],
+            max_hw_size=2,
+            timeout=100,
+            verbose=False,
+            max_workers=1,
+        )
+
+    assert found == [], "invalid tensor_tensor divide sketch must not be accepted for broadcasted div"
+    assert calls["count"] == 0, "shape rejection should skip solver dispatch for invalid tensor_tensor divide sketches"
+    print(" synthesis: broadcasted div matches tensor_scalar, not tensor_tensor")
+
+
 def _test_lower_nu_graph_parallel_levels() -> None:
     def kernel_parallel_reductions(x, y):
         return x.sum(axis=1, keep_dims=True) / y.sum(axis=1, keep_dims=True)
@@ -5660,6 +5797,8 @@ def run_all_tests() -> None:
     _test_sketch_shape_constraints_violated_rejected_early()
     _test_synthesis_pool_filters_templates_by_target_constituents()
     _test_single_operator_sketches_cover_distinct_inputs()
+    _test_division_broadcast_uses_tensor_scalar_not_tensor_tensor()
+    _test_invoke_hw_op_transpose_uses_nc_transpose_semantics()
     _test_lower_nu_graph_parallel_levels()
     print("\n================ RUNNING SYNTHESIZER TESTS =============")
     _test_synthesizer_matmul_red_div()
