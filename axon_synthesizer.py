@@ -53,9 +53,11 @@ def _effective_max_workers(max_workers: Optional[int], task_count: int) -> int:
 
     ``max_workers=None`` means "auto": launch one worker per task so sketch
     synthesis fans out as widely as possible.  Explicit positive ``max_workers``
-    values are still respected.  Non-positive ``task_count`` values collapse to
-    1 worker, and explicit non-positive ``max_workers`` values are clamped up to
-    1.
+    values are still respected.  ``task_count <= 1`` collapses to 1 worker, and
+    explicit non-positive ``max_workers`` values are clamped up to 1.
+
+    Returns:
+        The computed number of workers to launch.
     """
     if task_count <= 1:
         return 1
@@ -4667,7 +4669,7 @@ def lower_nu_graph(
                 hw_id = node_id_map.get(inp_id, inp_id)
                 hw_sym = hw_syms.get(hw_id)
                 if hw_sym is None:
-                    missing_inputs.append(f"{inp_id}->{hw_id}")
+                    missing_inputs.append(f"'{inp_id}' (resolved to '{hw_id}')")
                     continue
                 hw_input_pairs.append((hw_sym, hw_id))
             if missing_inputs:
@@ -4892,7 +4894,7 @@ def lower_nu_graph_all_variants(
                 hw_id = node_id_map_can.get(inp_id, inp_id)
                 hw_sym = hw_syms_can.get(hw_id)
                 if hw_sym is None:
-                    missing_inputs.append(f"{inp_id}->{hw_id}")
+                    missing_inputs.append(f"'{inp_id}' (resolved to '{hw_id}')")
                     continue
                 hw_input_pairs.append((hw_sym, hw_id))
             if missing_inputs:
@@ -5748,17 +5750,39 @@ def _test_synthesis_auto_maximizes_sketch_workers() -> None:
     target_sym = orig_syms[reduce_node.id]
     pool = _build_synthesis_pool(reduce_node.op, reduce_node.attrs, input_syms)
 
-    real_executor = concurrent.futures.ThreadPoolExecutor
     observed: dict[str, int] = {}
+
+    class _RecordingExecutor:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            if args:
+                observed["max_workers"] = args[0]
+            else:
+                observed["max_workers"] = kwargs["max_workers"]
+
+        def __enter__(self) -> "_RecordingExecutor":
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+            return False
+
+        def submit(
+            self, fn: Callable[..., Any], *args: Any, **kwargs: Any
+        ) -> concurrent.futures.Future:
+            fut: concurrent.futures.Future = concurrent.futures.Future()
+            try:
+                fut.set_result(fn(*args, **kwargs))
+            except Exception as exc:
+                fut.set_exception(exc)
+            return fut
 
     def _recording_executor_factory(
         *args: Any, **kwargs: Any
-    ) -> concurrent.futures.ThreadPoolExecutor:
+    ) -> "_RecordingExecutor":
         if args:
             observed["max_workers"] = args[0]
         else:
             observed["max_workers"] = kwargs["max_workers"]
-        return real_executor(*args, **kwargs)
+        return _RecordingExecutor(*args, **kwargs)
 
     patch_target = f"{__name__}.concurrent.futures.ThreadPoolExecutor"
     with patch(patch_target, side_effect=_recording_executor_factory):
