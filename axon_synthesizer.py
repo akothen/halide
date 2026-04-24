@@ -4935,9 +4935,15 @@ def lower_nu_graph_all_variants(
         # Synthesise all nodes at this level in parallel (node-level parallelism)
         def _synth(args: SynthArgs) -> list[tuple[list[Node], str, SymTensor]]:
             nd, tgt, pairs = args
-            return _lower_node_all(nd, tgt, pairs,
-                                   max_hw_size=max_hw_size, timeout=timeout,
-                                   verbose=verbose, max_workers=max_workers)
+            # As in lower_nu_graph(), serialise the entire node-lowering call
+            # behind _Z3_LOCK. lower_nu_graph_all_variants still evaluates Z3-
+            # backed SymTensor / Sketch trees inside worker threads, and Z3's
+            # ref-counting can race across threads during object destruction
+            # even when explicit solver calls already hold _Z3_LOCK.
+            with _Z3_LOCK:
+                return _lower_node_all(nd, tgt, pairs,
+                                       max_hw_size=max_hw_size, timeout=timeout,
+                                       verbose=verbose, max_workers=max_workers)
 
         node_alts_list: list[list[tuple[list[Node], str, SymTensor]]]
         effective_workers = _effective_max_workers(max_workers, len(synthesis))
@@ -5256,7 +5262,12 @@ def _test_reduce_sum_lowering_no_crash() -> None:
     ), \
         "reduce_sum in kernel_matmul_red_div variant 0 should use keep_dims=True"
 
-    hw_variants = lower_nu_graph_all_variants(gv, max_hw_size=2, timeout=5000)
+    hw_variants = lower_nu_graph_all_variants(
+        gv,
+        max_hw_size=2,
+        timeout=5000,
+        max_workers=2,
+    )
     assert hw_variants, \
         "reduce_sum_lowering regression: lower_nu_graph_all_variants returned no results"
     for i, g_hw in enumerate(hw_variants):
@@ -5348,7 +5359,12 @@ def _test_matmul_1003_multi_input_synthesis() -> None:
     # fails to synthesize, the function returns [] with a verbose diagnostic
     # naming the missing input ID, so synthesis of matmul never proceeds
     # with a truncated hw_input_pairs.
-    hw_variants = lower_nu_graph_all_variants(gv, max_hw_size=2, timeout=5000)
+    hw_variants = lower_nu_graph_all_variants(
+        gv,
+        max_hw_size=2,
+        timeout=5000,
+        max_workers=2,
+    )
     assert hw_variants, (
         "matmul_1003 regression: lower_nu_graph_all_variants returned no results "
         "for variant 0 of kernel_matmul_red_div — matmul may have received "
