@@ -3045,14 +3045,14 @@ _register_public_semantics()
 
 
 
-class AxonArray:
+class DummyArray:
     def __init__(self, node_id: str, shape: tuple[int, ...], nodes: Optional[list[Any]] = None):
         self.node_id = node_id
         self.shape = shape
         self.nodes = list(nodes) if nodes is not None else [_make_input_node(node_id, shape)]
 
     @staticmethod
-    def _merge_nodes(inputs: list["AxonArray"]) -> list[Any]:
+    def _merge_nodes(inputs: list["DummyArray"]) -> list[Any]:
         merged: list[Any] = []
         seen: set[str] = set()
         for inp in inputs:
@@ -3064,69 +3064,69 @@ class AxonArray:
         return merged
 
     @staticmethod
-    def _from_op(op: str, inputs: list["AxonArray"], out_shape: tuple[int, ...], attrs: Optional[dict[str, Any]] = None) -> "AxonArray":
+    def _from_op(op: str, inputs: list["DummyArray"], out_shape: tuple[int, ...], attrs: Optional[dict[str, Any]] = None) -> "DummyArray":
         node_id = _gen_id(op)
-        nodes = AxonArray._merge_nodes(inputs)
+        nodes = DummyArray._merge_nodes(inputs)
         nodes.append(Node(id=node_id, op=op, inputs=[inp.node_id for inp in inputs], attrs=dict(attrs or {})))
-        return AxonArray(node_id, out_shape, nodes)
+        return DummyArray(node_id, out_shape, nodes)
 
-    def _binary_op(self, other: Any, op: str) -> "AxonArray":
+    def _binary_op(self, other: Any, op: str) -> "DummyArray":
         if op == "matmul":
-            if not isinstance(other, AxonArray):
-                raise TypeError("matmul expects AxonArray operand")
+            if not isinstance(other, DummyArray):
+                raise TypeError("matmul expects DummyArray operand")
             if len(self.shape) != 2 or len(other.shape) != 2:
                 raise ValueError("matmul expects rank-2 inputs")
             if not _dims_equal(self.shape[1], other.shape[0]):
                 raise ValueError("matmul expects compatible inner dimensions")
-            return AxonArray._from_op(op, [self, other], (self.shape[0], other.shape[1]))
+            return DummyArray._from_op(op, [self, other], (self.shape[0], other.shape[1]))
 
-        if isinstance(other, AxonArray):
+        if isinstance(other, DummyArray):
             out_shape = tuple(_normalize_dim(d) for d in _public_broadcast_shape_tuple(self.shape, other.shape))
-            return AxonArray._from_op(op, [self, other], out_shape)
+            return DummyArray._from_op(op, [self, other], out_shape)
         else:
             out_shape = self.shape
-            return AxonArray._from_op(op, [self], out_shape, {"scalar": other})
+            return DummyArray._from_op(op, [self], out_shape, {"scalar": other})
 
-    def __add__(self, other: Any) -> "AxonArray":
+    def __add__(self, other: Any) -> "DummyArray":
         return self._binary_op(other, "add")
 
-    def __mul__(self, other: Any) -> "AxonArray":
+    def __mul__(self, other: Any) -> "DummyArray":
         return self._binary_op(other, "mul")
 
-    def __truediv__(self, other: Any) -> "AxonArray":
+    def __truediv__(self, other: Any) -> "DummyArray":
         return self._binary_op(other, "div")
 
-    def __matmul__(self, other: Any) -> "AxonArray":
+    def __matmul__(self, other: Any) -> "DummyArray":
         return self._binary_op(other, "matmul")
 
-    def sum(self, axis: Any = None, keep_dims: bool = False) -> "AxonArray":
+    def sum(self, axis: Any = None, keep_dims: bool = False) -> "DummyArray":
         out_shape = _public_reduce_out_shape(self.shape, axis, keep_dims)
-        return AxonArray._from_op(
+        return DummyArray._from_op(
             "reduce_sum",
             [self],
             tuple(_normalize_dim(d) for d in out_shape),
             {"axis": axis, "keep_dims": keep_dims},
         )
 
-    def broadcast_like(self, other: "AxonArray") -> "AxonArray":
-        return AxonArray._from_op("broadcast", [self, other], other.shape)
+    def broadcast_like(self, other: "DummyArray") -> "DummyArray":
+        return DummyArray._from_op("broadcast", [self, other], other.shape)
 
-    def sqrt(self) -> "AxonArray":
-        return AxonArray._from_op("sqrt", [self], self.shape)
+    def sqrt(self) -> "DummyArray":
+        return DummyArray._from_op("sqrt", [self], self.shape)
 
-    def exp(self) -> "AxonArray":
-        return AxonArray._from_op("exp", [self], self.shape)
+    def exp(self) -> "DummyArray":
+        return DummyArray._from_op("exp", [self], self.shape)
 
-    def transpose(self) -> "AxonArray":
+    def transpose(self) -> "DummyArray":
         if len(self.shape) == 2:
-            return AxonArray._from_op("transpose", [self], (self.shape[1], self.shape[0]))
-        return AxonArray._from_op("transpose", [self], self.shape)
+            return DummyArray._from_op("transpose", [self], (self.shape[1], self.shape[0]))
+        return DummyArray._from_op("transpose", [self], self.shape)
 
-    def relu(self) -> "AxonArray":
-        return AxonArray._from_op("relu", [self], self.shape)
+    def relu(self) -> "DummyArray":
+        return DummyArray._from_op("relu", [self], self.shape)
 
-    def silu(self) -> "AxonArray":
-        return AxonArray._from_op("silu", [self], self.shape)
+    def silu(self) -> "DummyArray":
+        return DummyArray._from_op("silu", [self], self.shape)
 
 
 @dataclass(eq=True, frozen=True)
@@ -5456,38 +5456,38 @@ def _test_matmul_1003_multi_input_synthesis() -> None:
     )
 
 
-def kernel_matmul_red_div(x: AxonArray, y: AxonArray, w: AxonArray) -> AxonArray:
+def kernel_matmul_red_div(x: DummyArray, y: DummyArray, w: DummyArray) -> DummyArray:
     rec = y.sum(axis=1, keep_dims=True)
     return (x / rec) @ w
 
 
-def kernel_matmul_red_mul(x: AxonArray, y: AxonArray, w: AxonArray) -> AxonArray:
+def kernel_matmul_red_mul(x: DummyArray, y: DummyArray, w: DummyArray) -> DummyArray:
     rec = y.sum(axis=1, keep_dims=True)
     return (x * rec) @ w
 
 
-def kernel_broadcast_row_bias_add(x: AxonArray, y: AxonArray, w: AxonArray) -> AxonArray:
+def kernel_broadcast_row_bias_add(x: DummyArray, y: DummyArray, w: DummyArray) -> DummyArray:
     bias = y.sum(axis=1, keep_dims=True)
     bias_b = bias.broadcast_like(x)
     z = x + bias_b
     return z @ w
 
 
-def kernel_reduce_mul_broadcast(x: AxonArray, y: AxonArray, w: AxonArray) -> AxonArray:
+def kernel_reduce_mul_broadcast(x: DummyArray, y: DummyArray, w: DummyArray) -> DummyArray:
     rec = y.sum(axis=1, keep_dims=True)
     z = x * rec
     z_b = z.broadcast_like(x)
     return z_b @ w
 
 
-def kernel_reduce_broadcast_mul(x: AxonArray, y: AxonArray, w: AxonArray) -> AxonArray:
+def kernel_reduce_broadcast_mul(x: DummyArray, y: DummyArray, w: DummyArray) -> DummyArray:
     rec = y.sum(axis=1, keep_dims=True)
     rec_b = rec.broadcast_like(x)
     z = x * rec_b
     return z @ w
 
 
-def kernel_rmsnorm_matmul(x: AxonArray, y: AxonArray, w: AxonArray) -> AxonArray:
+def kernel_rmsnorm_matmul(x: DummyArray, y: DummyArray, w: DummyArray) -> DummyArray:
     yy = y * y
     rec = yy.sum(axis=1, keep_dims=True)
     rms = rec.sqrt()
@@ -5495,39 +5495,39 @@ def kernel_rmsnorm_matmul(x: AxonArray, y: AxonArray, w: AxonArray) -> AxonArray
     return norm @ w
   
 
-def kernel_softmax_matmul(x: AxonArray, w: AxonArray) -> AxonArray:
+def kernel_softmax_matmul(x: DummyArray, w: DummyArray) -> DummyArray:
     ex = x.exp()
     den = ex.sum(axis=1, keep_dims=True)
     probs = ex / den
     return probs @ w
 
 
-def kernel_transpose_matmul(x: AxonArray, w: AxonArray) -> AxonArray:
+def kernel_transpose_matmul(x: DummyArray, w: DummyArray) -> DummyArray:
     xt = x.transpose()
     return xt @ w
 
 
-def kernel_matmul_transpose(x: AxonArray, w: AxonArray) -> AxonArray:
+def kernel_matmul_transpose(x: DummyArray, w: DummyArray) -> DummyArray:
     z = x @ w
     return z.transpose()
 
 
-def kernel_relu_matmul(x: AxonArray, w: AxonArray) -> AxonArray:
+def kernel_relu_matmul(x: DummyArray, w: DummyArray) -> DummyArray:
     return x.relu() @ w
 
 
-def kernel_silu_matmul(x: AxonArray, w: AxonArray) -> AxonArray:
+def kernel_silu_matmul(x: DummyArray, w: DummyArray) -> DummyArray:
     return x.silu() @ w
 
 
-def _graph_from_axon_array(out: AxonArray) -> nuGraph:
+def _graph_from_axon_array(out: DummyArray) -> nuGraph:
     G = nuGraph([Node(id=n.id, op=n.op, inputs=list(n.inputs), attrs=dict(n.attrs)) for n in out.nodes])
     annotate_shapes_concrete(G)
     return G
 
 
-def _build_graph_from_kernel(kernel: Callable[..., AxonArray], *inputs: tuple[str, tuple[int, ...]]) -> nuGraph:
-    args = [AxonArray(name, shape) for name, shape in inputs]
+def _build_graph_from_kernel(kernel: Callable[..., DummyArray], *inputs: tuple[str, tuple[int, ...]]) -> nuGraph:
+    args = [DummyArray(name, shape) for name, shape in inputs]
     out = kernel(*args)
     return _graph_from_axon_array(out)
 
@@ -6876,7 +6876,7 @@ def run_all_tests() -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Axon synthesizer tracing and in-file test runner")
+    parser = argparse.ArgumentParser(description="Dummy synthesizer tracing and in-file test runner")
     parser.add_argument(
         "--run-tests",
         action="store_true",
