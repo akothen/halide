@@ -4700,14 +4700,21 @@ def lower_nu_graph(
 
         def _synth(args: SynthArgs) -> Optional[tuple[list[Node], str, SymTensor]]:
             nd, tgt, pairs = args
-            return _lower_node(
-                nd,
-                tgt,
-                pairs,
-                max_hw_size,
-                timeout,
-                verbose=verbose,
-            )
+            # z3.main_ctx() is not thread-safe: Z3_inc_ref/Z3_dec_ref can race
+            # when multiple threads concurrently create or destroy Z3 AST objects
+            # (e.g. via __del__).  Hold _Z3_LOCK for the entire _lower_node call
+            # so that all Z3 object creation, solver work, and object destruction
+            # (including __del__ of temporaries) are serialised.  _Z3_LOCK is an
+            # RLock so nested acquisitions from the same thread still succeed.
+            with _Z3_LOCK:
+                return _lower_node(
+                    nd,
+                    tgt,
+                    pairs,
+                    max_hw_size,
+                    timeout,
+                    verbose=verbose,
+                )
 
         level_results: list[Optional[tuple[list[Node], str, SymTensor]]]
         effective_workers = _effective_max_workers(max_workers, len(synthesis))
