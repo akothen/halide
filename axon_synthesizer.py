@@ -12,7 +12,6 @@ from enum import Enum
 from itertools import combinations, permutations, product as _iproduct
 from threading import Lock, RLock
 from typing import Any, Callable, Optional, List
-from unittest.mock import patch
 
 import z3
 
@@ -3693,6 +3692,8 @@ def _template_constituents(sketch: SketchNode) -> frozenset[str]:
             _operand_to_expr(sketch.attrs.get("reduce_op", nl.add)),
         })
     if sketch.op in ("dma_copy", "tensor_copy"):
+        # Concrete layout ops can still appear in materialized/lowered sketches
+        # even though the synthesis pool prefers abstract transpose templates.
         return frozenset({"copy"})
     if sketch.op in ("dma_transpose", "nc_transpose"):
         return frozenset({"transpose", "copy"})
@@ -3857,11 +3858,11 @@ def _check_equivalent_quiet(
 
 
 def _shapes_incompatible_symbolically(lhs: SymTensor, rhs: SymTensor) -> bool:
-    """Return True when the symbolic output shapes are obviously incompatible."""
+    """Return True when symbolic shapes differ in a trivially decidable way."""
     if lhs.rank != rhs.rank:
         return True
     for ldim, rdim in zip(lhs.shape, rhs.shape):
-        if z3.is_false(z3.simplify(ldim == rdim)):
+        if z3.is_int_value(ldim) and z3.is_int_value(rdim) and ldim.as_long() != rdim.as_long():
             return True
     return False
 
@@ -4171,7 +4172,8 @@ def _sketch_to_graph_nodes(
     clean_attrs = {k: v for k, v in sketch.attrs.items() if k != "name"}
     # The synthesis pool uses an abstract transpose so search does not branch
     # over multiple concrete layout ops; materialize it here as nc_transpose,
-    # the canonical hardware transpose used throughout lowering.
+    # the canonical hardware transpose used throughout lowering because it is
+    # the standard transpose primitive already used by synthesized hw graphs.
     materialized_op = "nc_transpose" if sketch.op == "transpose" else sketch.op
     new_id = _gen_id(materialized_op)
     new_nodes.append(Node(id=new_id, op=materialized_op, inputs=child_ids, attrs=clean_attrs))
@@ -5306,6 +5308,8 @@ def _test_synthesis_verbose_reports_candidate_count() -> None:
 
 
 def _test_synthesis_symbolic_shape_prefilter_skips_solver() -> None:
+    from unittest.mock import patch
+
     x = SymTensor("x", shape=(4, 8))
     target_sym = tensor_reduce(dst=None, op=nl.add, data=x, axis=1, keepdims=True)
     pool = [
@@ -5323,7 +5327,7 @@ def _test_synthesis_symbolic_shape_prefilter_skips_solver() -> None:
         calls["count"] += 1
         return original_check(lhs, rhs, timeout=timeout)
 
-    with patch(f"{__name__}._check_equivalent_quiet", side_effect=_counting_check):
+    with patch.object(sys.modules[__name__], "_check_equivalent_quiet", side_effect=_counting_check):
         found = _synthesize_all_from_pool(
             target_sym,
             pool,
