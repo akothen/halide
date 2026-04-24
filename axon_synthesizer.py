@@ -5287,13 +5287,16 @@ def _test_matmul_1003_multi_input_synthesis() -> None:
     assert "w" in matmul_node.inputs, (
         f"matmul node must have 'w' as one of its inputs, got {matmul_node.inputs!r}"
     )
-    # The previous assertions guarantee exactly 2 inputs with one being 'w',
-    # so next() is safe here and will find the non-'w' input.
-    upstream_input = next(i for i in matmul_node.inputs if i != "w")
+    upstream_input = next((i for i in matmul_node.inputs if i != "w"), None)
+    assert upstream_input is not None, (
+        f"matmul node must have a non-'w' upstream input; inputs={matmul_node.inputs!r}"
+    )
 
     # Confirm the upstream input comes from a synthesis node (not a bare input),
     # which means it must be resolved through hw_syms_can during lowering.
-    upstream_node = next((n for n in gv.nodes if n.id == upstream_input), None)
+    # Build a lookup dict once to avoid a linear scan per lookup.
+    node_by_id = {n.id: n for n in gv.nodes}
+    upstream_node = node_by_id.get(upstream_input)
     assert upstream_node is not None, (
         f"Upstream input '{upstream_input}' not found in variant graph"
     )
