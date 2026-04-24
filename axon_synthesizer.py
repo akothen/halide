@@ -46,6 +46,31 @@ _UF_LOCK = Lock()
 _SEMANTICS_LOCK = Lock()
 _VERBOSE_LOCK = Lock()   # serializes verbose prints from concurrent synthesis threads
 _Z3_LOCK = RLock()       # serializes z3 formula construction (z3.main_ctx is not thread-safe)
+
+
+def _effective_max_workers(max_workers: Optional[int], task_count: int) -> int:
+    """Choose how many threads to launch for a pool of *task_count* items.
+
+    ``max_workers=None`` means "auto": launch one worker per task so sketch
+    synthesis fans out as widely as possible.  Explicit positive ``max_workers``
+    values are still respected.  ``task_count <= 1`` collapses to 1 worker, and
+    explicit non-positive ``max_workers`` values are clamped up to 1.  Explicit
+    values larger than ``task_count`` are clamped down to ``task_count``.
+
+    Returns:
+        The computed number of workers to launch.
+    """
+    if task_count <= 1:
+        return 1
+    if max_workers is None:
+        return task_count
+    return builtins.max(1, builtins.min(max_workers, task_count))
+
+
+def _format_resolved_input(inp_id: str, hw_id: str) -> str:
+    if inp_id == hw_id:
+        return f"'{inp_id}'"
+    return f"'{inp_id}' (resolved to '{hw_id}')"
 _SYNTHESIS_STATS_LOCK = Lock()
 
 
@@ -4271,7 +4296,7 @@ def _synthesize_all_from_pool(
     max_hw_size: int = 2,
     timeout: int = 3000,
     verbose: bool = False,
-    max_workers: int = 4,
+    max_workers: Optional[int] = None,
 ) -> list[SketchNode]:
     """Like _synthesize_from_pool but returns ALL equivalent sketches.
 
@@ -4378,8 +4403,9 @@ def _synthesize_all_from_pool(
             )
 
     ordered: dict[int, tuple[SketchNode, bool, float]] = {}
-    if max_workers > 1 and len(candidates) > 1:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+    effective_workers = _effective_max_workers(max_workers, len(candidates))
+    if effective_workers > 1 and len(candidates) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
             fs = {executor.submit(_check_one, item): idx
                   for idx, item in enumerate(candidates)}
             for future in concurrent.futures.as_completed(fs):
@@ -4520,7 +4546,7 @@ def _lower_node_all(
     max_hw_size: int,
     timeout: int,
     verbose: bool = False,
-    max_workers: int = 4,
+    max_workers: Optional[int] = None,
 ) -> list[tuple[list[Node], str, SymTensor]]:
     """Synthesize ALL valid hw-only replacements for *node*.
 
@@ -4588,7 +4614,7 @@ def lower_nu_graph(
     max_hw_size: int = 2,
     timeout: int = 3000,
     verbose: bool = False,
-    max_workers: int = 4,
+    max_workers: Optional[int] = None,
 ) -> Optional[nuGraph]:
     """Lower all public ops in *G* to hw ops using sketch-driven synthesis.
 
@@ -4645,12 +4671,28 @@ def lower_nu_graph(
         synthesis_args: list[SynthArgs] = []
         for node in synthesis:
             hw_input_pairs: list[tuple[SymTensor, str]] = []
+            missing_inputs: list[str] = []
             for inp_id in node.inputs:
                 hw_id = node_id_map.get(inp_id, inp_id)
                 hw_sym = hw_syms.get(hw_id)
                 if hw_sym is None:
-                    return None
+                    missing_inputs.append(_format_resolved_input(inp_id, hw_id))
+                    continue
                 hw_input_pairs.append((hw_sym, hw_id))
+            if missing_inputs:
+                if verbose:
+                    print(
+                        f"[lower_nu_graph] cannot synthesize '{node.id}' op={node.op}: "
+                        f"missing lowered inputs {missing_inputs}"
+                    )
+                return None
+            if verbose:
+                with _VERBOSE_LOCK:
+                    print(
+                        f"[lower_nu_graph] synthesizing '{node.id}' op={node.op} "
+                        f"orig_inputs={node.inputs} "
+                        f"resolved_hw_inputs={[hw_id for _, hw_id in hw_input_pairs]}"
+                    )
             target_sym = orig_syms.get(node.id)
             if target_sym is None:
                 return None
@@ -4668,8 +4710,9 @@ def lower_nu_graph(
             )
 
         level_results: list[Optional[tuple[list[Node], str, SymTensor]]]
-        if max_workers > 1 and len(synthesis) > 1:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        effective_workers = _effective_max_workers(max_workers, len(synthesis))
+        if effective_workers > 1 and len(synthesis) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
                 futures = [executor.submit(_synth, args) for args in synthesis_args]
                 level_results_tmp: list[Optional[tuple[list[Node], str, SymTensor]]] = []
                 for i_f, future in enumerate(futures):
@@ -4706,7 +4749,7 @@ def lower_nu_graph_variants(
     max_hw_size: int = 2,
     timeout: int = 3000,
     verbose: bool = False,
-    max_workers: int = 4,
+    max_workers: Optional[int] = None,
 ) -> list[Optional[nuGraph]]:
     """Lower every variant in *variants* to hardware ops.
 
@@ -4757,7 +4800,7 @@ def lower_nu_graph_all_variants(
     max_hw_size: int = 2,
     timeout: int = 3000,
     verbose: bool = False,
-    max_workers: int = 4,
+    max_workers: Optional[int] = None,
     max_variants: int = 256,
 ) -> list[nuGraph]:
     """Lower *G* to hardware discovering every valid sketch choice per node.
@@ -4854,12 +4897,29 @@ def lower_nu_graph_all_variants(
         synthesis_args: list[SynthArgs] = []
         for node in synthesis:
             hw_input_pairs: list[tuple[SymTensor, str]] = []
+            missing_inputs: list[str] = []
             for inp_id in node.inputs:
                 hw_id = node_id_map_can.get(inp_id, inp_id)
                 hw_sym = hw_syms_can.get(hw_id)
                 if hw_sym is None:
-                    return []
+                    missing_inputs.append(_format_resolved_input(inp_id, hw_id))
+                    continue
                 hw_input_pairs.append((hw_sym, hw_id))
+            if missing_inputs:
+                if verbose:
+                    print(
+                        f"[lower_nu_graph_all_variants] cannot synthesize '{node.id}' "
+                        f"op={node.op}: missing lowered inputs {missing_inputs}"
+                    )
+                return []
+            if verbose:
+                with _VERBOSE_LOCK:
+                    print(
+                        f"[lower_nu_graph_all_variants] synthesizing '{node.id}' "
+                        f"op={node.op} "
+                        f"orig_inputs={node.inputs} "
+                        f"resolved_hw_inputs={[hw_id for _, hw_id in hw_input_pairs]}"
+                    )
             t_sym = orig_syms.get(node.id)
             if t_sym is None:
                 return []
@@ -4873,8 +4933,9 @@ def lower_nu_graph_all_variants(
                                    verbose=verbose, max_workers=max_workers)
 
         node_alts_list: list[list[tuple[list[Node], str, SymTensor]]]
-        if max_workers > 1 and len(synthesis) > 1:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        effective_workers = _effective_max_workers(max_workers, len(synthesis))
+        if effective_workers > 1 and len(synthesis) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
                 futures = [executor.submit(_synth, args) for args in synthesis_args]
                 node_alts_list_tmp: list[list[tuple[list[Node], str, SymTensor]]] = []
                 for i_f, future in enumerate(futures):
@@ -4965,7 +5026,7 @@ def synthesize_hw_graph(
     max_hw_size: int = 2,
     timeout: int = 3000,
     verbose: bool = False,
-    max_workers: int = 4,
+    max_workers: Optional[int] = None,
 ) -> list[nuGraph]:
     """Generate all variant orderings of *G* and lower each to hw ops.
 
@@ -5206,6 +5267,114 @@ def _test_reduce_sum_lowering_no_crash() -> None:
     print(f" synthesizer: reduce_sum lowering (regression) — "
           f"{len(hw_variants)} hw variant(s) produced, all equivalent")
 
+
+def _test_matmul_1003_multi_input_synthesis() -> None:
+    """Regression test for the failure mode where ``matmul_1003`` in variant 0
+    of ``kernel_matmul_red_div`` was synthesized with only the ``w`` operand
+    instead of both ``div_1002`` and ``w``.
+
+    Root cause: when an upstream synthesis node (``div_1002``) had its hw sym
+    missing from ``hw_syms_can``, downstream synthesis proceeded with a
+    truncated ``hw_input_pairs`` list, leaving only ``IN:w`` in the synthesis
+    pool and causing 'no hw equivalent found for matmul_1003'.
+
+    This test:
+      1. Extracts variant 0 of ``kernel_matmul_red_div``, which has the
+         structure ``reduce_sum → div → matmul``.
+      2. Asserts the graph contains a ``matmul`` node with two inputs
+         (``div_*`` and ``w``), confirming it's a true multi-input op.
+      3. Runs ``lower_nu_graph_all_variants`` and asserts it succeeds – i.e.
+         the lowering does NOT fail because matmul received incomplete inputs.
+      4. Verifies every returned hw graph uses only hw ops and that at least
+         one contains ``nc_matmul`` (confirming matmul was actually lowered,
+         not skipped).
+      5. Spot-checks equivalence of the first returned hw graph.
+
+    The test would fail with the pre-fix code where:
+      - ``div_1002`` synthesis failed (producing no hw sym),
+      - the downstream matmul synthesis therefore received only ``IN:w``, and
+      - all 162 sketch candidates were not equivalent, so lowering returned [].
+    """
+    G = build_kernel_matmul_red_div_graph(4, 8, 16)
+    variants = nu_graph_generation_z3(G, verbose=False)
+    assert variants, "kernel_matmul_red_div should produce at least one variant"
+
+    gv = variants[0]
+
+    # Confirm variant 0 has the expected multi-input matmul structure.
+    matmul_nodes = _nodes_by_op(gv, "matmul")
+    assert matmul_nodes, (
+        "Variant 0 of kernel_matmul_red_div must contain a 'matmul' node"
+    )
+    matmul_node = matmul_nodes[0]
+    assert len(matmul_node.inputs) == 2, (
+        f"matmul node in variant 0 must have exactly 2 inputs, "
+        f"got {matmul_node.inputs!r}"
+    )
+    # One input must be 'w' (the weight tensor), the other is the upstream
+    # synthesis node (div or similar) that must have been resolved.
+    assert "w" in matmul_node.inputs, (
+        f"matmul node must have 'w' as one of its inputs, got {matmul_node.inputs!r}"
+    )
+    upstream_input = next((i for i in matmul_node.inputs if i != "w"), None)
+    assert upstream_input is not None, (
+        f"matmul node must have a non-'w' upstream input; inputs={matmul_node.inputs!r}"
+    )
+
+    # Confirm the upstream input comes from a synthesis node (not a bare input),
+    # which means it must be resolved through hw_syms_can during lowering.
+    # Build a lookup dict once to avoid a linear scan per lookup.
+    node_by_id = {n.id: n for n in gv.nodes}
+    upstream_node = node_by_id.get(upstream_input)
+    assert upstream_node is not None, (
+        f"Upstream input '{upstream_input}' not found in variant graph"
+    )
+    assert upstream_node.op != "input", (
+        f"Upstream input '{upstream_input}' to matmul is a raw graph input, "
+        f"not a synthesis node; the test requires a derived node to stress the "
+        f"hw_syms_can resolution path"
+    )
+
+    # Run the full lowering and assert it succeeds with BOTH inputs resolved.
+    # The negative scenario (incomplete inputs) is guarded by the defensive
+    # validation in lower_nu_graph_all_variants: if the upstream div node
+    # fails to synthesize, the function returns [] with a verbose diagnostic
+    # naming the missing input ID, so synthesis of matmul never proceeds
+    # with a truncated hw_input_pairs.
+    hw_variants = lower_nu_graph_all_variants(gv, max_hw_size=2, timeout=5000)
+    assert hw_variants, (
+        "matmul_1003 regression: lower_nu_graph_all_variants returned no results "
+        "for variant 0 of kernel_matmul_red_div — matmul may have received "
+        f"incomplete inputs (only 'w' instead of both '{upstream_input}' and 'w')"
+    )
+
+    for i, g_hw in enumerate(hw_variants):
+        assert _graph_uses_hw_only(g_hw), (
+            f"matmul_1003 regression: hw variant {i} still contains public ops"
+        )
+
+    # At least one hw graph must contain nc_matmul (confirming the matmul was
+    # actually lowered and not silently dropped).
+    assert any(_nodes_by_op(g_hw, "nc_matmul") for g_hw in hw_variants), (
+        "matmul_1003 regression: no hw variant contains 'nc_matmul'; "
+        "matmul may not have been lowered"
+    )
+
+    # Spot-check equivalence of the first returned hw graph.
+    pair = _graph_output_sym_lowered(gv, hw_variants[0])
+    assert pair is not None, (
+        "matmul_1003 regression: could not extract output syms for equivalence check"
+    )
+    orig_sym, hw_sym = pair
+    assert _check_equivalent_quiet(orig_sym, hw_sym, timeout=15000), (
+        "matmul_1003 regression: first lowered hw graph is not equivalent to original"
+    )
+
+    print(
+        f" synthesizer: matmul_1003 multi-input regression — "
+        f"matmul node inputs={matmul_node.inputs!r} (upstream='{upstream_input}'), "
+        f"{len(hw_variants)} hw variant(s) produced, first variant equivalent"
+    )
 
 
 def kernel_matmul_red_div(x: AxonArray, y: AxonArray, w: AxonArray) -> AxonArray:
@@ -5575,6 +5744,72 @@ def _test_synthesis_verbose_reports_candidate_count() -> None:
     assert "sketch " in out and " in " in out, \
         "Expected verbose synthesis output to print each sketch as its check finishes"
     print(" synthesis: verbose output reports candidate_count")
+
+
+def _test_synthesis_auto_maximizes_sketch_workers() -> None:
+    from unittest.mock import patch
+
+    G = build_kernel_matmul_red_div_graph(4, 8, 16)
+    variants = nu_graph_generation_z3(G, verbose=False)
+    gv = variants[0]
+    reduce_node = _nodes_by_op(gv, "reduce_sum")[0]
+    orig_syms = _graph_symbolic_tensors(gv)
+    input_syms = [orig_syms[inp_id] for inp_id in reduce_node.inputs]
+    target_sym = orig_syms[reduce_node.id]
+    pool = _build_synthesis_pool(reduce_node.op, reduce_node.attrs, input_syms)
+
+    observed: dict[str, int] = {}
+
+    class _RecordingExecutor:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> "_RecordingExecutor":
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+            return False
+
+        def submit(
+            self, fn: Callable[..., Any], *args: Any, **kwargs: Any
+        ) -> concurrent.futures.Future:
+            fut: concurrent.futures.Future = concurrent.futures.Future()
+            try:
+                fut.set_result(fn(*args, **kwargs))
+            except Exception as exc:
+                fut.set_exception(exc)
+            return fut
+
+    def _recording_executor_factory(
+        *args: Any, **kwargs: Any
+    ) -> "_RecordingExecutor":
+        if args:
+            observed["max_workers"] = args[0]
+        else:
+            observed["max_workers"] = kwargs["max_workers"]
+        return _RecordingExecutor(*args, **kwargs)
+
+    patch_target = "axon_synthesizer.concurrent.futures.ThreadPoolExecutor"
+    with patch(patch_target, side_effect=_recording_executor_factory):
+        _synthesize_all_from_pool(
+            target_sym,
+            pool,
+            max_hw_size=2,
+            timeout=100,
+            verbose=False,
+        )
+
+    candidate_count = _last_synthesis_stats.get("candidate_count", 0)
+    expected_workers = _effective_max_workers(None, candidate_count)
+    assert candidate_count > 1, "Expected multiple candidate sketches for reduce_sum"
+    assert observed.get("max_workers") == expected_workers, (
+        f"Expected sketch-level synthesis to auto-launch {expected_workers} worker(s), "
+        f"got {observed.get('max_workers')}"
+    )
+    print(
+        f" synthesis: auto sketch-level threading launches {observed['max_workers']} "
+        f"worker(s) for {candidate_count} candidate sketch(es)"
+    )
 
 
 def _test_synthesis_symbolic_shape_prefilter_skips_solver() -> None:
@@ -6261,6 +6496,7 @@ def run_all_tests() -> None:
     _test_print_graph_includes_symbolic_shapes()
     _test_synthesis_prefers_direct_reduce_candidate()
     _test_synthesis_verbose_reports_candidate_count()
+    _test_synthesis_auto_maximizes_sketch_workers()
     _test_synthesis_symbolic_shape_prefilter_skips_solver()
     _test_sketch_shape_constraints_violated_rejected_early()
     _test_synthesis_pool_filters_templates_by_target_constituents()
@@ -6280,6 +6516,7 @@ def run_all_tests() -> None:
     _test_synthesizer_all_variants_lowered()
     _test_lower_nu_graph_all_variants()
     _test_reduce_sum_lowering_no_crash()
+    _test_matmul_1003_multi_input_synthesis()
     _test_kernel_matmul_red_div_div_node_lowered_via_tensor_scalar()
     print("=============== ALL TESTS PASSED  =====================\n")
 
