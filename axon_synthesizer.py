@@ -67,17 +67,6 @@ def _effective_max_workers(max_workers: Optional[int], task_count: int) -> int:
     return builtins.max(1, builtins.min(max_workers, task_count))
 
 
-def _z3_lock_owned_by_current_thread() -> bool:
-    """Return True when the current thread already owns ``_Z3_LOCK``."""
-    is_owned = getattr(_Z3_LOCK, "_is_owned", None)
-    if is_owned is None:
-        return False
-    try:
-        return bool(is_owned())
-    except Exception:
-        return False
-
-
 def _format_resolved_input(inp_id: str, hw_id: str) -> str:
     if inp_id == hw_id:
         return f"'{inp_id}'"
@@ -2065,11 +2054,17 @@ def tensor_reduce(dst, op, data, axis, negate=False, keepdims=False, name=None):
     _ensure_semantics("tensor_reduce", shape_rule, value_rule)
 
     assert _is_sym_tensor(data)
+    out_shape = tuple(
+        _shape_tensor_reduce(
+            [ShapeExpr(list(data.shape))],
+            {"axis": axis, "keepdims": keepdims},
+        ).out.dims
+    )
     return _new_sym_tensor(
         "tensor_reduce",
         [data],
         {"op": op, "axis": axis, "negate": negate, "keepdims": keepdims, "name": name},
-        _default_out_shape(dst, data),
+        out_shape,
     )
 
 
@@ -3928,6 +3923,14 @@ def _check_equivalent_quiet(
         return False
 
 
+def _shapes_match_exactly(lhs: SymTensor, rhs: SymTensor) -> bool:
+    """Return True when two symbolic shapes are syntactically identical."""
+    if lhs.rank != rhs.rank:
+        return False
+    with _Z3_LOCK:
+        return builtins.all(z3.eq(ldim, rdim) for ldim, rdim in zip(lhs.shape, rhs.shape))
+
+
 def _shapes_incompatible_symbolically(lhs: SymTensor, rhs: SymTensor) -> bool:
     """Return True when symbolic shapes differ in a trivially decidable way."""
     if lhs.rank != rhs.rank:
@@ -4415,8 +4418,6 @@ def _synthesize_all_from_pool(
 
     ordered: dict[int, tuple[SketchNode, bool, float]] = {}
     effective_workers = _effective_max_workers(max_workers, len(candidates))
-    if effective_workers > 1 and _z3_lock_owned_by_current_thread():
-        effective_workers = 1
     if effective_workers > 1 and len(candidates) > 1:
         with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
             fs = {executor.submit(_check_one, item): idx
@@ -4601,7 +4602,7 @@ def _lower_node_all(
         id(sym): node_id for sym, node_id in hw_input_pairs
     }
 
-    results: list[tuple[list[Node], str, SymTensor]] = []
+    materialized: list[tuple[SketchNode, list[Node], str, SymTensor]] = []
     for sketch in found_sketches:
         if verbose:
             with _VERBOSE_LOCK:
@@ -4613,9 +4614,17 @@ def _lower_node_all(
         output_sym = _eval_sketch(sketch)
         if output_sym is None:
             continue
-        results.append((new_nodes, output_id, output_sym))
+        materialized.append((sketch, new_nodes, output_id, output_sym))
 
-    return results
+    materialized.sort(
+        key=lambda item: (
+            0 if _shapes_match_exactly(effective_target, item[3]) else 1,
+            item[0].hw_size(),
+            _format_sketch(item[0]),
+        )
+    )
+
+    return [(new_nodes, output_id, output_sym) for _, new_nodes, output_id, output_sym in materialized]
 
 
 # ---------------------------------------------------------------------------
@@ -4825,13 +4834,11 @@ def lower_nu_graph_all_variants(
 ) -> list[nuGraph]:
     """Lower *G* to hardware discovering every valid sketch choice per node.
 
-    Two levels of parallelism are used:
-
-    1. **Node-level**: nodes that sit at the same DAG level (no data
-        dependency between them) are synthesized concurrently via a
-        ThreadPoolExecutor.
-    2. **Sketch-level**: within each node, candidate equivalence checks are
-       dispatched through _synthesize_all_from_pool.
+    Sketch-level parallelism is used within each node by
+    ``_synthesize_all_from_pool``. Node-level synthesis is currently kept
+    serial because concurrent node lowering proved unsafe with the shared Z3
+    context, and holding ``_Z3_LOCK`` across the full node-lowering call would
+    deadlock the inner sketch-level worker pool.
 
     After synthesis the Cartesian product of per-node alternatives is taken.
     Because all valid sketches for a node are semantically equivalent to the
@@ -4945,21 +4952,17 @@ def lower_nu_graph_all_variants(
                 return []
             synthesis_args.append((node, t_sym, hw_input_pairs))
 
-        # Synthesise all nodes at this level in parallel (node-level parallelism)
+        # Synthesise nodes in deterministic order. Sketch-level parallelism
+        # remains enabled inside _lower_node_all(), but node-level synthesis is
+        # kept serial to avoid Z3 shared-context races and nested-lock deadlocks.
         def _synth(args: SynthArgs) -> list[tuple[list[Node], str, SymTensor]]:
             nd, tgt, pairs = args
-            # As in lower_nu_graph(), serialise the entire node-lowering call
-            # behind _Z3_LOCK. lower_nu_graph_all_variants still evaluates Z3-
-            # backed SymTensor / Sketch trees inside worker threads, and Z3's
-            # ref-counting can race across threads during object destruction
-            # even when explicit solver calls already hold _Z3_LOCK.
-            with _Z3_LOCK:
-                return _lower_node_all(nd, tgt, pairs,
-                                       max_hw_size=max_hw_size, timeout=timeout,
-                                       verbose=verbose, max_workers=max_workers)
+            return _lower_node_all(nd, tgt, pairs,
+                                   max_hw_size=max_hw_size, timeout=timeout,
+                                   verbose=verbose, max_workers=max_workers)
 
         node_alts_list: list[list[tuple[list[Node], str, SymTensor]]]
-        effective_workers = _effective_max_workers(max_workers, len(synthesis))
+        effective_workers = 1
         if effective_workers > 1 and len(synthesis) > 1:
             with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
                 futures = [executor.submit(_synth, args) for args in synthesis_args]
@@ -5848,35 +5851,44 @@ def _test_synthesis_auto_maximizes_sketch_workers() -> None:
     )
 
 
-def _test_synthesis_avoids_sketch_threadpool_while_holding_z3_lock() -> None:
+def _test_lower_nu_graph_all_variants_does_not_hold_z3_lock_across_node_lowering() -> None:
     from unittest.mock import patch
 
     G = build_kernel_matmul_red_div_graph(4, 8, 16)
     variants = nu_graph_generation_z3(G, verbose=False)
     gv = variants[0]
-    reduce_node = _nodes_by_op(gv, "reduce_sum")[0]
-    orig_syms = _graph_symbolic_tensors(gv)
-    input_syms = [orig_syms[inp_id] for inp_id in reduce_node.inputs]
-    target_sym = orig_syms[reduce_node.id]
-    pool = _build_synthesis_pool(reduce_node.op, reduce_node.attrs, input_syms)
+    observed: dict[str, bool] = {"held": False, "called": False}
 
-    patch_target = "axon_synthesizer.concurrent.futures.ThreadPoolExecutor"
-    with patch(patch_target) as executor_factory:
-        with _Z3_LOCK:
-            found = _synthesize_all_from_pool(
-                target_sym,
-                pool,
-                max_hw_size=2,
-                timeout=100,
-                verbose=False,
-                max_workers=2,
-            )
+    def _fake_lower_node_all(
+        node: Node,
+        target_sym: SymTensor,
+        hw_input_pairs: list[tuple[SymTensor, str]],
+        max_hw_size: int,
+        timeout: int,
+        verbose: bool = False,
+        max_workers: Optional[int] = None,
+    ) -> list[tuple[list[Node], str, SymTensor]]:
+        observed["called"] = True
+        is_owned = getattr(_Z3_LOCK, "_is_owned", None)
+        observed["held"] = bool(is_owned()) if is_owned is not None else False
+        return []
 
-    assert found, (
-        "Expected synthesis to complete while _Z3_LOCK is held by the caller"
+    with patch("axon_synthesizer._lower_node_all", side_effect=_fake_lower_node_all):
+        lowered = lower_nu_graph_all_variants(
+            gv,
+            max_hw_size=2,
+            timeout=100,
+            verbose=False,
+            max_workers=2,
+        )
+
+    assert observed["called"], "Expected lower_nu_graph_all_variants to invoke _lower_node_all"
+    assert not observed["held"], (
+        "lower_nu_graph_all_variants must not hold _Z3_LOCK across _lower_node_all; "
+        "doing so deadlocks the inner sketch threadpool"
     )
-    executor_factory.assert_not_called()
-    print(" synthesis: sketch threadpool disabled while caller holds _Z3_LOCK")
+    assert lowered == [], "Fake node lowering should cause the graph lowering to fail cleanly"
+    print(" lowering: all-variants node lowering does not hold _Z3_LOCK across _lower_node_all")
 
 
 def _test_synthesis_symbolic_shape_prefilter_skips_solver() -> None:
@@ -6074,6 +6086,22 @@ def _test_invoke_hw_op_transpose_uses_nc_transpose_semantics() -> None:
         " synthesis: nc_matmul(transpose(IN), IN) correctly accepted as "
         "equivalent to public matmul (transpose evaluates as nc_transpose)"
     )
+
+
+def _test_invoke_hw_op_tensor_reduce_preserves_reduced_shape() -> None:
+    y = SymTensor("y", shape=(z3.Int("y_d0"), z3.Int("y_d1")))
+    reduced = _invoke_hw_op(
+        "tensor_reduce",
+        [y],
+        {"op": nl.add, "axis": 1, "keepdims": True},
+    )
+    assert reduced is not None, "tensor_reduce sketch evaluation should produce a SymTensor"
+    assert len(reduced.shape) == 2, "keepdims=True must preserve tensor rank"
+    assert z3.eq(reduced.shape[0], y.shape[0]), "axis=1 reduction must preserve the leading dim"
+    assert z3.is_int_value(reduced.shape[1]) and reduced.shape[1].as_long() == 1, (
+        "axis=1 keepdims reduction must produce a trailing dimension of 1"
+    )
+    print(" synthesis: tensor_reduce sketch evaluation preserves reduced keepdims shape")
 
 
 def _test_synthesis_pool_filters_templates_by_target_constituents() -> None:
@@ -6548,6 +6576,40 @@ def _test_lower_nu_graph_parallel_levels() -> None:
     print(" synthesizer: parallel lower_nu_graph handles independent DAG levels")
 
 
+def _test_lower_node_all_prefers_shape_exact_div_canonical() -> None:
+    G = build_kernel_matmul_red_div_graph(4, 8, 16)
+    gv = nu_graph_generation_z3(G, verbose=False)[0]
+    orig_syms = _graph_symbolic_tensors(gv)
+
+    reduce_node = _nodes_by_op(gv, "reduce_sum")[0]
+    reduce_alts = _lower_node_all(
+        reduce_node,
+        orig_syms[reduce_node.id],
+        [(orig_syms[reduce_node.inputs[0]], reduce_node.inputs[0])],
+        max_hw_size=2,
+        timeout=1000,
+        verbose=False,
+        max_workers=2,
+    )
+    assert reduce_alts, "Expected at least one lowering for reduce_sum"
+
+    div_node = _nodes_by_op(gv, "div")[0]
+    div_alts = _lower_node_all(
+        div_node,
+        orig_syms[div_node.id],
+        [(orig_syms["x"], "x"), (reduce_alts[0][2], reduce_alts[0][1])],
+        max_hw_size=2,
+        timeout=1000,
+        verbose=False,
+        max_workers=2,
+    )
+    assert div_alts, "Expected at least one lowering for div"
+    assert _shapes_match_exactly(orig_syms[div_node.id], div_alts[0][2]), (
+        "Canonical div lowering must preserve the exact target symbolic shape"
+    )
+    print(" lowering: canonical div alternative preserves the exact target shape")
+
+
 def run_all_tests() -> None:
     print("\n================ RUNNING NU-GRAPH TESTS ================")
     _test_expected_variant_counts()
@@ -6564,7 +6626,7 @@ def run_all_tests() -> None:
     _test_synthesis_prefers_direct_reduce_candidate()
     _test_synthesis_verbose_reports_candidate_count()
     _test_synthesis_auto_maximizes_sketch_workers()
-    _test_synthesis_avoids_sketch_threadpool_while_holding_z3_lock()
+    _test_lower_nu_graph_all_variants_does_not_hold_z3_lock_across_node_lowering()
     _test_synthesis_symbolic_shape_prefilter_skips_solver()
     _test_sketch_shape_constraints_violated_rejected_early()
     _test_synthesis_pool_filters_templates_by_target_constituents()
@@ -6573,7 +6635,9 @@ def run_all_tests() -> None:
     _test_division_symbolic_shape_rejection()
     _test_shapes_not_provably_equivalent_broadcast_compatible_candidate()
     _test_invoke_hw_op_transpose_uses_nc_transpose_semantics()
+    _test_invoke_hw_op_tensor_reduce_preserves_reduced_shape()
     _test_lower_nu_graph_parallel_levels()
+    _test_lower_node_all_prefers_shape_exact_div_canonical()
     print("\n================ RUNNING SYNTHESIZER TESTS =============")
     _test_synthesizer_matmul_red_div()
     _test_synthesizer_rmsnorm_matmul()
