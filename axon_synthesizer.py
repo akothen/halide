@@ -5565,7 +5565,7 @@ def _test_invoke_hw_op_transpose_uses_nc_transpose_semantics() -> None:
     )
 
     # Equivalence: the sketch must be accepted as equivalent to public matmul
-    assert _check_equivalent_quiet(target_sym, candidate_sym, timeout=10000), (
+    assert _check_equivalent_quiet(target_sym, candidate_sym, timeout=3000), (
         "nc_matmul(transpose(IN:x), IN:w) must be equivalent to matmul(x, w) — "
         "_invoke_hw_op 'transpose' must use nc_transpose semantics"
     )
