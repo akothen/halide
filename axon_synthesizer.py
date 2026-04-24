@@ -4660,13 +4660,6 @@ def lower_nu_graph(
                         f"missing lowered inputs {missing_inputs}"
                     )
                 return None
-            if len(hw_input_pairs) != len(node.inputs):
-                if verbose:
-                    print(
-                        f"[lower_nu_graph] input count mismatch for '{node.id}' op={node.op}: "
-                        f"expected {len(node.inputs)} inputs, resolved {len(hw_input_pairs)}"
-                    )
-                return None
             if verbose:
                 print(
                     f"[lower_nu_graph] synthesizing '{node.id}' op={node.op} "
@@ -4889,14 +4882,6 @@ def lower_nu_graph_all_variants(
                     print(
                         f"[lower_nu_graph_all_variants] cannot synthesize '{node.id}' "
                         f"op={node.op}: missing lowered inputs {missing_inputs}"
-                    )
-                return []
-            if len(hw_input_pairs) != len(node.inputs):
-                if verbose:
-                    print(
-                        f"[lower_nu_graph_all_variants] input count mismatch for "
-                        f"'{node.id}' op={node.op}: expected {len(node.inputs)} inputs, "
-                        f"resolved {len(hw_input_pairs)}"
                     )
                 return []
             if verbose:
@@ -5302,9 +5287,6 @@ def _test_matmul_1003_multi_input_synthesis() -> None:
         f"matmul node must have 'w' as one of its inputs, got {matmul_node.inputs!r}"
     )
     upstream_input = next(i for i in matmul_node.inputs if i != "w")
-    assert upstream_input != "w", (
-        "matmul node must have a non-'w' upstream input (from div/reduce path)"
-    )
 
     # Run the full lowering and assert it succeeds with BOTH inputs resolved.
     hw_variants = lower_nu_graph_all_variants(gv, max_hw_size=2, timeout=5000)
