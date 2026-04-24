@@ -67,6 +67,17 @@ def _effective_max_workers(max_workers: Optional[int], task_count: int) -> int:
     return builtins.max(1, builtins.min(max_workers, task_count))
 
 
+def _z3_lock_owned_by_current_thread() -> bool:
+    """Return True when the current thread already owns ``_Z3_LOCK``."""
+    is_owned = getattr(_Z3_LOCK, "_is_owned", None)
+    if is_owned is None:
+        return False
+    try:
+        return bool(is_owned())
+    except Exception:
+        return False
+
+
 def _format_resolved_input(inp_id: str, hw_id: str) -> str:
     if inp_id == hw_id:
         return f"'{inp_id}'"
@@ -4404,6 +4415,8 @@ def _synthesize_all_from_pool(
 
     ordered: dict[int, tuple[SketchNode, bool, float]] = {}
     effective_workers = _effective_max_workers(max_workers, len(candidates))
+    if effective_workers > 1 and _z3_lock_owned_by_current_thread():
+        effective_workers = 1
     if effective_workers > 1 and len(candidates) > 1:
         with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
             fs = {executor.submit(_check_one, item): idx
@@ -5835,6 +5848,37 @@ def _test_synthesis_auto_maximizes_sketch_workers() -> None:
     )
 
 
+def _test_synthesis_avoids_sketch_threadpool_while_holding_z3_lock() -> None:
+    from unittest.mock import patch
+
+    G = build_kernel_matmul_red_div_graph(4, 8, 16)
+    variants = nu_graph_generation_z3(G, verbose=False)
+    gv = variants[0]
+    reduce_node = _nodes_by_op(gv, "reduce_sum")[0]
+    orig_syms = _graph_symbolic_tensors(gv)
+    input_syms = [orig_syms[inp_id] for inp_id in reduce_node.inputs]
+    target_sym = orig_syms[reduce_node.id]
+    pool = _build_synthesis_pool(reduce_node.op, reduce_node.attrs, input_syms)
+
+    patch_target = "axon_synthesizer.concurrent.futures.ThreadPoolExecutor"
+    with patch(patch_target) as executor_factory:
+        with _Z3_LOCK:
+            found = _synthesize_all_from_pool(
+                target_sym,
+                pool,
+                max_hw_size=2,
+                timeout=100,
+                verbose=False,
+                max_workers=2,
+            )
+
+    assert found, (
+        "Expected synthesis to complete while _Z3_LOCK is held by the caller"
+    )
+    executor_factory.assert_not_called()
+    print(" synthesis: sketch threadpool disabled while caller holds _Z3_LOCK")
+
+
 def _test_synthesis_symbolic_shape_prefilter_skips_solver() -> None:
     from unittest.mock import patch
 
@@ -6520,6 +6564,7 @@ def run_all_tests() -> None:
     _test_synthesis_prefers_direct_reduce_candidate()
     _test_synthesis_verbose_reports_candidate_count()
     _test_synthesis_auto_maximizes_sketch_workers()
+    _test_synthesis_avoids_sketch_threadpool_while_holding_z3_lock()
     _test_synthesis_symbolic_shape_prefilter_skips_solver()
     _test_sketch_shape_constraints_violated_rejected_early()
     _test_synthesis_pool_filters_templates_by_target_constituents()
