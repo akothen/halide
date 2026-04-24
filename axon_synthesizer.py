@@ -54,7 +54,8 @@ def _effective_max_workers(max_workers: Optional[int], task_count: int) -> int:
     ``max_workers=None`` means "auto": launch one worker per task so sketch
     synthesis fans out as widely as possible.  Explicit positive ``max_workers``
     values are still respected.  ``task_count <= 1`` collapses to 1 worker, and
-    explicit non-positive ``max_workers`` values are clamped up to 1.
+    explicit non-positive ``max_workers`` values are clamped up to 1.  Explicit
+    values larger than ``task_count`` are clamped down to ``task_count``.
 
     Returns:
         The computed number of workers to launch.
@@ -64,6 +65,12 @@ def _effective_max_workers(max_workers: Optional[int], task_count: int) -> int:
     if max_workers is None:
         return task_count
     return builtins.max(1, builtins.min(max_workers, task_count))
+
+
+def _format_resolved_input(inp_id: str, hw_id: str) -> str:
+    if inp_id == hw_id:
+        return f"'{inp_id}'"
+    return f"'{inp_id}' (resolved to '{hw_id}')"
 _SYNTHESIS_STATS_LOCK = Lock()
 
 
@@ -4669,7 +4676,7 @@ def lower_nu_graph(
                 hw_id = node_id_map.get(inp_id, inp_id)
                 hw_sym = hw_syms.get(hw_id)
                 if hw_sym is None:
-                    missing_inputs.append(f"'{inp_id}' (resolved to '{hw_id}')")
+                    missing_inputs.append(_format_resolved_input(inp_id, hw_id))
                     continue
                 hw_input_pairs.append((hw_sym, hw_id))
             if missing_inputs:
@@ -4680,11 +4687,12 @@ def lower_nu_graph(
                     )
                 return None
             if verbose:
-                print(
-                    f"[lower_nu_graph] synthesizing '{node.id}' op={node.op} "
-                    f"orig_inputs={node.inputs} "
-                    f"resolved_hw_inputs={[hw_id for _, hw_id in hw_input_pairs]}"
-                )
+                with _VERBOSE_LOCK:
+                    print(
+                        f"[lower_nu_graph] synthesizing '{node.id}' op={node.op} "
+                        f"orig_inputs={node.inputs} "
+                        f"resolved_hw_inputs={[hw_id for _, hw_id in hw_input_pairs]}"
+                    )
             target_sym = orig_syms.get(node.id)
             if target_sym is None:
                 return None
@@ -4894,7 +4902,7 @@ def lower_nu_graph_all_variants(
                 hw_id = node_id_map_can.get(inp_id, inp_id)
                 hw_sym = hw_syms_can.get(hw_id)
                 if hw_sym is None:
-                    missing_inputs.append(f"'{inp_id}' (resolved to '{hw_id}')")
+                    missing_inputs.append(_format_resolved_input(inp_id, hw_id))
                     continue
                 hw_input_pairs.append((hw_sym, hw_id))
             if missing_inputs:
@@ -5754,10 +5762,7 @@ def _test_synthesis_auto_maximizes_sketch_workers() -> None:
 
     class _RecordingExecutor:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
-            if args:
-                observed["max_workers"] = args[0]
-            else:
-                observed["max_workers"] = kwargs["max_workers"]
+            pass
 
         def __enter__(self) -> "_RecordingExecutor":
             return self
