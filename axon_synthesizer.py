@@ -3639,7 +3639,10 @@ def _invoke_hw_op(op: str, input_syms: list[SymTensor], attrs: dict[str, Any]) -
         if op == "tensor_copy":
             return tensor_copy(dst=None, src=input_syms[0])
         if op == "transpose":
-            return transpose(input_syms[0])
+            # Evaluate using nc_transpose (the hardware op that
+            # _sketch_to_graph_nodes emits) so that equivalence checking and
+            # materialization use the same semantics.
+            return nc_transpose(dst=None, data=input_syms[0])
         if op == "tensor_partition_reduce":
             reduce_op_attr = attrs.get("op", nl.add)
             return tensor_partition_reduce(dst=None, op=reduce_op_attr, data=input_syms[0])
@@ -4235,10 +4238,10 @@ def _sketch_to_graph_nodes(
         child_ids.append(cid)
 
     clean_attrs = {k: v for k, v in sketch.attrs.items() if k != "name"}
-    # The synthesis pool uses an abstract transpose so search does not branch
-    # over multiple concrete layout ops; materialize it here as nc_transpose,
-    # the canonical hardware transpose used throughout lowering because it is
-    # the standard transpose primitive already used by synthesized hw graphs.
+    # The synthesis pool uses abstract "transpose" so the search does not need
+    # to branch over multiple concrete layout ops.  Both evaluation
+    # (_invoke_hw_op) and materialization here map "transpose" to nc_transpose,
+    # keeping equivalence checking and the emitted graph node consistent.
     materialized_op = "nc_transpose" if sketch.op == "transpose" else sketch.op
     new_id = _gen_id(materialized_op)
     new_nodes.append(Node(id=new_id, op=materialized_op, inputs=child_ids, attrs=clean_attrs))
@@ -5524,6 +5527,54 @@ def _test_sketch_shape_constraints_violated_rejected_early() -> None:
     )
 
 
+def _test_invoke_hw_op_transpose_uses_nc_transpose_semantics() -> None:
+    """Regression test: _invoke_hw_op for op='transpose' must use nc_transpose
+    semantics so that equivalence checking and graph materialization are
+    consistent.
+
+    Before the fix, _invoke_hw_op evaluated 'transpose' via the public
+    transpose() op while _sketch_to_graph_nodes emitted nc_transpose; this
+    mismatch caused the synthesizer to reject the valid candidate
+    nc_matmul(transpose(IN:x), IN:w) for public matmul(x, w).
+    """
+    # Shapes: x [4, 8], w [8, 16] → matmul output [4, 16]
+    x = SymTensor("x", shape=(4, 8))
+    w = SymTensor("w", shape=(8, 16))
+
+    # Target: public matmul(x, w) internally computes nc_matmul(nc_transpose(x), w)
+    target_sym = matmul(x, w)
+
+    # Candidate sketch: nc_matmul(transpose(IN:x), IN:w)
+    # With the fix, 'transpose' evaluates as nc_transpose, making this
+    # semantically identical to the target.
+    sketch = SketchNode.make_op(
+        "nc_matmul",
+        [
+            SketchNode.make_op("transpose", [SketchNode.make_input(x)], {}),
+            SketchNode.make_input(w),
+        ],
+        {},
+    )
+    candidate_sym = _eval_sketch(sketch)
+    assert candidate_sym is not None, "Sketch nc_matmul(transpose(x), w) should evaluate"
+
+    # Shape check: candidate must not be rejected pre-solver
+    assert not _sketch_shape_constraints_violated(candidate_sym), (
+        "nc_matmul(transpose([4,8]), [8,16]) has matching contraction dims and "
+        "must not be rejected by shape constraints"
+    )
+
+    # Equivalence: the sketch must be accepted as equivalent to public matmul
+    assert _check_equivalent_quiet(target_sym, candidate_sym, timeout=10000), (
+        "nc_matmul(transpose(IN:x), IN:w) must be equivalent to matmul(x, w) — "
+        "_invoke_hw_op 'transpose' must use nc_transpose semantics"
+    )
+    print(
+        " synthesis: nc_matmul(transpose(IN), IN) correctly accepted as "
+        "equivalent to public matmul (transpose evaluates as nc_transpose)"
+    )
+
+
 def _test_synthesis_pool_filters_templates_by_target_constituents() -> None:
     G = build_kernel_matmul_red_div_graph(4, 8, 16)
     orig_syms = _graph_symbolic_tensors(G)
@@ -5660,6 +5711,7 @@ def run_all_tests() -> None:
     _test_sketch_shape_constraints_violated_rejected_early()
     _test_synthesis_pool_filters_templates_by_target_constituents()
     _test_single_operator_sketches_cover_distinct_inputs()
+    _test_invoke_hw_op_transpose_uses_nc_transpose_semantics()
     _test_lower_nu_graph_parallel_levels()
     print("\n================ RUNNING SYNTHESIZER TESTS =============")
     _test_synthesizer_matmul_red_div()
