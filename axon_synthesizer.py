@@ -1711,7 +1711,10 @@ def nc_matmul(dst, stationary, moving, is_stationary_onezero=False, is_moving_on
             return _shape_from_out(out_shape)
         if lhs.rank >= 2 and rhs.rank >= 2:
             dims = [lhs.dims[-1], rhs.dims[-1]]
-            return ShapeResult(ShapeExpr(dims), _shape_ctx(*lhs.dims, *rhs.dims, *dims))
+            ctx = _shape_ctx(*lhs.dims, *rhs.dims, *dims)
+            # nc_matmul contracts over lhs.dims[0] / rhs.dims[0]; they must agree.
+            ctx.add(lhs.dims[0] == rhs.dims[0])
+            return ShapeResult(ShapeExpr(dims), ctx)
         return ShapeResult(ShapeExpr([lhs.dims[0], rhs.dims[-1] if rhs.rank else z3.IntVal(1)]), _shape_ctx(*lhs.dims, *rhs.dims))
 
     def value_rule(expr: SymExpr, ins: list[Semantics], out_shape: ShapeExpr) -> Semantics:
@@ -3868,6 +3871,65 @@ def _shapes_incompatible_symbolically(lhs: SymTensor, rhs: SymTensor) -> bool:
     return False
 
 
+def _sketch_shape_constraints_violated(candidate_sym: SymTensor) -> bool:
+    """Generic pre-solver check: return True if any op's shape rule produces a
+    trivially-False constraint for the candidate sketch.
+
+    Traverses the SymExpr tree bottom-up.  For each non-input op node the
+    registered shape_rule is called with the *actual input shapes* taken from
+    the sub-expression tree (not from any cached ``out_shape`` attr).  The
+    constraints returned in ``ShapeResult.ctx`` encode the semantic
+    preconditions for that op to be well-formed (e.g. ``nc_matmul`` requires
+    ``stationary.shape[0] == moving.shape[0]``).
+
+    If z3.simplify() reduces any such constraint to ``False`` the sketch is
+    structurally impossible and can be rejected without invoking the expensive
+    equivalence solver.
+
+    The check is conservative: it only fires on constraints that are trivially
+    decidable (``z3.simplify`` returns a Z3 ``False`` literal), so symbolic or
+    otherwise undecidable constraints are never incorrectly rejected.
+    """
+    visited: set[int] = set()
+
+    def check_node(expr: SymExpr) -> bool:
+        key = id(expr)
+        if key in visited:
+            return False
+        visited.add(key)
+
+        if expr.op == "input":
+            return False
+
+        # Check children first (bottom-up)
+        for inp in expr.inputs:
+            if check_node(inp):
+                return True
+
+        shape_rule, _ = _SEMANTICS.get(expr.op, (None, None))
+        if shape_rule is None:
+            return False
+
+        # Use the shapes from the child SymExprs directly.  We intentionally
+        # strip "out_shape" from attrs so the shape_rule takes its full
+        # constraint-generating code path rather than the cached-result early
+        # return (which skips constraint production).
+        input_shapes = [ShapeExpr(list(inp.shape)) for inp in expr.inputs]
+        attrs_for_check = {k: v for k, v in expr.attrs.items() if k != "out_shape"}
+        try:
+            result = shape_rule(input_shapes, attrs_for_check)
+            for constraint in result.ctx.facts:
+                if z3.is_false(z3.simplify(constraint)):
+                    return True
+        except Exception:
+            pass
+
+        return False
+
+    with _Z3_LOCK:
+        return check_node(candidate_sym.expr)
+
+
 def _shape_rejection_reason(
     target_sym: SymTensor,
     candidate_sym: SymTensor,
@@ -3875,6 +3937,8 @@ def _shape_rejection_reason(
     """Return a rejection reason if shape information proves a mismatch."""
     if _shapes_incompatible_symbolically(target_sym, candidate_sym):
         return "symbolic shape mismatch"
+    if _sketch_shape_constraints_violated(candidate_sym):
+        return "sketch shape constraints violated"
     return None
 
 
@@ -5348,6 +5412,118 @@ def _test_synthesis_symbolic_shape_prefilter_skips_solver() -> None:
     print(" synthesis: symbolic shape prefilter skips solver for mismatched sketches")
 
 
+def _test_sketch_shape_constraints_violated_rejected_early() -> None:
+    """Generic sketch-shape-constraint check rejects semantically-impossible sketches
+    pre-solver, without any op-specific logic.
+
+    Regression scenario: in kernel_matmul_red_div(4, 8, 16) the search formerly
+    explored nc_matmul(transpose(IN:reciprocal_1336), IN:w) and spent ~21 s in
+    the equivalence solver before rejecting it.
+
+    Why the old output-shape check missed it:
+      reciprocal_1336 has shape [4, 1]
+      transpose(reciprocal_1336) has shape [1, 4]
+      nc_matmul([1, 4], [8, 16]) produces output shape [4, 16]   ← matches target!
+    So the candidate slips past _shapes_incompatible_symbolically.
+
+    Why the generic check catches it:
+      nc_matmul's shape_rule encodes the requirement lhs.dims[0] == rhs.dims[0]
+      (both inputs must agree on the contraction dimension).
+      Here lhs.dims[0]=1 ≠ rhs.dims[0]=8, so simplify(1 == 8) == False.
+      _sketch_shape_constraints_violated detects this trivially-False constraint
+      by traversing the SymExpr tree and re-applying each op's shape_rule.
+    """
+    from unittest.mock import patch
+
+    # Shapes from build_kernel_matmul_red_div_graph(4, 8, 16):
+    w = SymTensor("w", shape=(8, 16))
+    reciprocal_sym = SymTensor("reciprocal_1336", shape=(4, 1))
+
+    # target: output of (x / rec) @ w  →  shape [4, 16]
+    target_sym = SymTensor("matmul_out", shape=(4, 16))
+
+    # Build the bad sketch: nc_matmul(transpose(reciprocal_1336), w)
+    # stationary = transpose([4,1]) → [1, 4]  (contraction dim = 1)
+    # moving     = [8, 16]                    (contraction dim = 8)
+    # 1 ≠ 8  →  nc_matmul shape rule: lhs.dims[0] == rhs.dims[0] → False
+    bad_sketch = SketchNode.make_op(
+        "nc_matmul",
+        [
+            SketchNode.make_op("transpose", [SketchNode.make_input(reciprocal_sym)], {}),
+            SketchNode.make_input(w),
+        ],
+        {},
+    )
+
+    candidate_sym = _eval_sketch(bad_sketch)
+    assert candidate_sym is not None, "Bad sketch should evaluate to a SymTensor"
+
+    # Output shape [4, 16] matches target — the old check does NOT fire.
+    assert not _shapes_incompatible_symbolically(target_sym, candidate_sym), (
+        "Output shape should match target; only the generic constraint check should fire"
+    )
+
+    # The generic check DOES fire because nc_matmul's shape_rule constraint
+    # lhs.dims[0] == rhs.dims[0] (i.e. 1 == 8) simplifies to False.
+    assert _sketch_shape_constraints_violated(candidate_sym), (
+        "_sketch_shape_constraints_violated should detect the nc_matmul "
+        "contraction-dimension mismatch (1 != 8) via shape_rule traversal"
+    )
+
+    reason = _shape_rejection_reason(target_sym, candidate_sym)
+    assert reason is not None, "Bad sketch should be rejected by _shape_rejection_reason"
+    assert "violated" in reason.lower(), (
+        f"Expected a 'shape constraints violated' rejection reason, got: {reason!r}"
+    )
+
+    # Also verify a sketch whose contraction dims DO match is NOT rejected.
+    x = SymTensor("x", shape=(4, 8))
+    good_sketch = SketchNode.make_op(
+        "nc_matmul",
+        [
+            SketchNode.make_op("transpose", [SketchNode.make_input(x)], {}),
+            SketchNode.make_input(w),
+        ],
+        {},
+    )
+    good_candidate_sym = _eval_sketch(good_sketch)
+    assert good_candidate_sym is not None, "Good sketch should evaluate"
+    assert not _sketch_shape_constraints_violated(good_candidate_sym), (
+        "nc_matmul(transpose([4,8]), [8,16]) has matching contraction dims (8==8) "
+        "and must NOT be rejected by the generic check"
+    )
+
+    # Confirm zero solver calls when only the bad sketch is in the pool
+    original_check = _check_equivalent_quiet
+    calls: dict[str, int] = {"count": 0}
+
+    def _counting_check(lhs: SymTensor, rhs: SymTensor, timeout: int = 3000) -> bool:
+        calls["count"] += 1
+        return original_check(lhs, rhs, timeout=timeout)
+
+    with patch("axon_synthesizer._check_equivalent_quiet", side_effect=_counting_check):
+        found = _synthesize_all_from_pool(
+            target_sym,
+            [bad_sketch],
+            max_hw_size=2,
+            timeout=100,
+            verbose=False,
+            max_workers=1,
+        )
+
+    assert found == [], "The bad sketch must not be accepted as equivalent"
+    assert calls["count"] == 0, (
+        "Expected generic shape-constraint check to skip the equivalence solver entirely"
+    )
+    assert _last_synthesis_stats.get("symbolic_shape_reject_count", 0) >= 1, (
+        "Expected symbolic_shape_reject_count to be incremented for the constraint violation"
+    )
+    print(
+        " synthesis: generic shape-constraint traversal rejects bad nc_matmul sketch "
+        "pre-solver (no equivalence-solver call)"
+    )
+
+
 def _test_synthesis_pool_filters_templates_by_target_constituents() -> None:
     G = build_kernel_matmul_red_div_graph(4, 8, 16)
     orig_syms = _graph_symbolic_tensors(G)
@@ -5481,6 +5657,7 @@ def run_all_tests() -> None:
     _test_synthesis_prefers_direct_reduce_candidate()
     _test_synthesis_verbose_reports_candidate_count()
     _test_synthesis_symbolic_shape_prefilter_skips_solver()
+    _test_sketch_shape_constraints_violated_rejected_early()
     _test_synthesis_pool_filters_templates_by_target_constituents()
     _test_single_operator_sketches_cover_distinct_inputs()
     _test_lower_nu_graph_parallel_levels()
