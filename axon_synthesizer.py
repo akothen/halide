@@ -5789,7 +5789,7 @@ def _test_synthesis_auto_maximizes_sketch_workers() -> None:
             observed["max_workers"] = kwargs["max_workers"]
         return _RecordingExecutor(*args, **kwargs)
 
-    patch_target = f"{__name__}.concurrent.futures.ThreadPoolExecutor"
+    patch_target = "axon_synthesizer.concurrent.futures.ThreadPoolExecutor"
     with patch(patch_target, side_effect=_recording_executor_factory):
         _synthesize_all_from_pool(
             target_sym,
