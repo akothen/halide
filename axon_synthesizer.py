@@ -5286,9 +5286,17 @@ def _test_matmul_1003_multi_input_synthesis() -> None:
     assert "w" in matmul_node.inputs, (
         f"matmul node must have 'w' as one of its inputs, got {matmul_node.inputs!r}"
     )
-    upstream_input = next(i for i in matmul_node.inputs if i != "w")
+    upstream_input = next((i for i in matmul_node.inputs if i != "w"), None)
+    assert upstream_input is not None, (
+        f"matmul node must have a non-'w' upstream input; inputs={matmul_node.inputs!r}"
+    )
 
     # Run the full lowering and assert it succeeds with BOTH inputs resolved.
+    # The negative scenario (incomplete inputs) is guarded by the defensive
+    # validation in lower_nu_graph_all_variants: if the upstream div node
+    # fails to synthesize, the function returns [] with a verbose diagnostic
+    # naming the missing input ID, so synthesis of matmul never proceeds
+    # with a truncated hw_input_pairs.
     hw_variants = lower_nu_graph_all_variants(gv, max_hw_size=2, timeout=5000)
     assert hw_variants, (
         "matmul_1003 regression: lower_nu_graph_all_variants returned no results "
