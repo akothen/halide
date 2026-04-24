@@ -2262,7 +2262,14 @@ def _compile_copy(expr: SymExpr, ins: list[Semantics], out_shape: ShapeExpr) -> 
 
 
 def _shape_tensor_tensor(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
-    return _broadcast_shape(ins[0], ins[1])
+    a, b = ins
+    ctx = _shape_ctx(*a.dims, *b.dims)
+    if a.rank != b.rank:
+        ctx.add(z3.BoolVal(False))
+        return ShapeResult(ShapeExpr(list(a.dims)), ctx)
+    for adim, bdim in zip(a.dims, b.dims):
+        ctx.add(adim == bdim)
+    return ShapeResult(ShapeExpr(list(a.dims)), ctx)
 
 
 def _compile_tensor_tensor(expr: SymExpr, ins: list[Semantics], out_shape: ShapeExpr) -> Semantics:
@@ -2270,8 +2277,8 @@ def _compile_tensor_tensor(expr: SymExpr, ins: list[Semantics], out_shape: Shape
     out_fn = _tensor_function(f"V_{expr.name}", out_shape.rank)
     ctx = a.ctx.merged(b.ctx)
     idx = [z3.Int(f"{expr.name}_i{k}") for k in range(out_shape.rank)]
-    av = _call_broadcasted(a, out_shape, idx)
-    bv = _call_broadcasted(b, out_shape, idx)
+    av = a.fn(*idx)
+    bv = b.fn(*idx)
     ctx.add(z3.ForAll(idx, out_fn(*idx) == _apply_binary(expr.attrs.get("op"), av, bv)))
     return Semantics(expr.name, out_shape, out_fn, ctx)
 
@@ -5668,6 +5675,31 @@ def _test_single_operator_sketches_cover_distinct_inputs() -> None:
     print(" synthesis: single-op sketches cover distinct concrete inputs")
 
 
+def _test_division_broadcast_uses_tensor_scalar_not_tensor_tensor() -> None:
+    x = SymTensor("x", shape=(4, 8))
+    reduced = SymTensor("tensor_reduce_1080", shape=(4, 1))
+
+    target_sym = divide(x, reduced)
+    bad_candidate = reciprocal(dst=None, data=tensor_tensor(dst=None, data1=reduced, data2=x, op=nl.divide))
+    good_candidate = tensor_scalar(dst=None, data=x, op0=nl.divide, operand0=reduced)
+
+    assert _sketch_shape_constraints_violated(bad_candidate), (
+        "tensor_tensor divide must require same-shaped operands; broadcasted [4,1] / [4,8] "
+        "should be rejected before equivalence checking"
+    )
+    assert not _check_equivalent_quiet(target_sym, bad_candidate, timeout=3000), (
+        "broadcasted public divide must not be considered equivalent to "
+        "reciprocal(tensor_tensor(divide(...)))"
+    )
+    assert not _sketch_shape_constraints_violated(good_candidate), (
+        "tensor_scalar is the broadcast-capable hardware op for divide-like sketches"
+    )
+    assert _check_equivalent_quiet(target_sym, good_candidate, timeout=3000), (
+        "broadcasted public divide should still match tensor_scalar divide semantics"
+    )
+    print(" synthesis: broadcasted div matches tensor_scalar, not tensor_tensor")
+
+
 def _test_lower_nu_graph_parallel_levels() -> None:
     def kernel_parallel_reductions(x, y):
         return x.sum(axis=1, keep_dims=True) / y.sum(axis=1, keep_dims=True)
@@ -5711,6 +5743,7 @@ def run_all_tests() -> None:
     _test_sketch_shape_constraints_violated_rejected_early()
     _test_synthesis_pool_filters_templates_by_target_constituents()
     _test_single_operator_sketches_cover_distinct_inputs()
+    _test_division_broadcast_uses_tensor_scalar_not_tensor_tensor()
     _test_invoke_hw_op_transpose_uses_nc_transpose_semantics()
     _test_lower_nu_graph_parallel_levels()
     print("\n================ RUNNING SYNTHESIZER TESTS =============")
