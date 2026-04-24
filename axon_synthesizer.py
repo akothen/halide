@@ -3957,6 +3957,113 @@ def _sketch_shape_constraints_violated(candidate_sym: SymTensor) -> bool:
         return check_node(candidate_sym.expr)
 
 
+def _shapes_not_provably_equivalent(
+    target_sym: SymTensor,
+    candidate_sym: SymTensor,
+    timeout: int = 500,
+) -> bool:
+    """Return True when the candidate's operator shape constraints cannot be
+    proved consistent with all valid inputs defined by input-dimension positivity.
+
+    ``_sketch_shape_constraints_violated`` rejects candidates whose shape
+    constraints are *trivially False* (``z3.simplify`` returns the False literal).
+    This function handles the complementary case: constraints that are
+    *symbolically non-trivial* — e.g. ``k == 1`` emitted by
+    ``_shape_tensor_tensor`` when one operand has a concrete-1 dimension while
+    the other has a symbolic dimension ``k``.  For such constraints a Z3 solver
+    determines whether the constraint is necessarily implied by the positivity
+    facts ``d > 0`` that hold for every input-tensor dimension.  If the solver
+    finds a satisfying assignment (e.g. k = 8) that violates the constraint,
+    the candidate would fail for that input and must be rejected.
+
+    Algorithm
+    ---------
+    1. Traverse the candidate's SymExpr tree bottom-up and collect ``d > 0``
+       for every *symbolic* input dimension (concrete ``IntVal`` dims produce
+       trivially-True positivity facts and are skipped).
+    2. Re-run each operator's ``shape_rule`` on the actual child shapes (same
+       as ``_sketch_shape_constraints_violated``) and collect every fact that
+       *does not* simplify to True or False — these are the non-trivial shape
+       constraints that the candidate imposes on its operands.
+    3. Ask Z3: ``input_positivity ∧ ¬(all non-trivial constraints)`` — is this
+       satisfiable?  If SAT there exist valid inputs for which the candidate
+       shape constraints are violated; the candidate is rejected.  If UNSAT,
+       all valid inputs satisfy the constraints; the candidate is kept.  On
+       UNKNOWN (solver timeout) the result is conservatively treated as "not
+       rejected" so that a slow solver never silently drops a valid candidate.
+
+    Thread-safety
+    -------------
+    All Z3 operations are performed under ``_Z3_LOCK``, consistent with the
+    rest of the synthesis pipeline.
+    """
+    input_positivity: list[z3.BoolRef] = []
+    visited_inputs: set[int] = set()
+
+    def _collect_input_positivity(expr: SymExpr) -> None:
+        key = id(expr)
+        if key in visited_inputs:
+            return
+        visited_inputs.add(key)
+        if expr.op == "input":
+            for dim in expr.shape:
+                fact = z3.simplify(dim > z3.IntVal(0))
+                if not z3.is_true(fact):
+                    input_positivity.append(dim > z3.IntVal(0))
+            return
+        for inp in expr.inputs:
+            _collect_input_positivity(inp)
+
+    candidate_shape_constraints: list[z3.BoolRef] = []
+    visited_ops: set[int] = set()
+
+    def _collect_candidate_shape_constraints(expr: SymExpr) -> None:
+        key = id(expr)
+        if key in visited_ops:
+            return
+        visited_ops.add(key)
+        if expr.op == "input":
+            return
+        for inp in expr.inputs:
+            _collect_candidate_shape_constraints(inp)
+        shape_rule, _ = _SEMANTICS.get(expr.op, (None, None))
+        if shape_rule is None:
+            return
+        input_shapes = [ShapeExpr(list(inp.shape)) for inp in expr.inputs]
+        attrs_for_check = {k: v for k, v in expr.attrs.items() if k != "out_shape"}
+        try:
+            result = shape_rule(input_shapes, attrs_for_check)
+            for constraint in result.ctx.facts:
+                simplified = z3.simplify(constraint)
+                if not z3.is_true(simplified) and not z3.is_false(simplified):
+                    candidate_shape_constraints.append(constraint)
+        except Exception:
+            pass
+
+    with _Z3_LOCK:
+        _collect_input_positivity(candidate_sym.expr)
+        _collect_candidate_shape_constraints(candidate_sym.expr)
+
+        if not candidate_shape_constraints:
+            return False
+
+        all_constraints = (
+            z3.And(*candidate_shape_constraints)
+            if len(candidate_shape_constraints) > 1
+            else candidate_shape_constraints[0]
+        )
+        solver = z3.Solver()
+        solver.set("timeout", timeout)
+        if input_positivity:
+            solver.add(z3.And(*input_positivity))
+        solver.add(z3.Not(all_constraints))
+        result = solver.check()
+        # SAT    → there exist valid inputs where candidate shape constraints fail → reject
+        # UNSAT  → input positivity implies all candidate shape constraints → keep
+        # UNKNOWN → solver timed out; be conservative and keep the candidate
+        return result == z3.sat
+
+
 def _shape_rejection_reason(
     target_sym: SymTensor,
     candidate_sym: SymTensor,
@@ -3966,6 +4073,8 @@ def _shape_rejection_reason(
         return "symbolic shape mismatch"
     if _sketch_shape_constraints_violated(candidate_sym):
         return "sketch shape constraints violated"
+    if _shapes_not_provably_equivalent(target_sym, candidate_sym):
+        return "output shape not provably equivalent to target"
     return None
 
 
@@ -5754,6 +5863,139 @@ def _test_division_broadcast_uses_tensor_scalar_not_tensor_tensor() -> None:
     print(" synthesis: broadcasted div matches tensor_scalar, not tensor_tensor")
 
 
+def _test_division_symbolic_shape_rejection() -> None:
+    """Regression: tensor_tensor divide candidates with symbolically-mismatched
+    operand shapes must be rejected before the equivalence solver is called,
+    even when the mismatch is not trivially detectable by ``z3.simplify``
+    (i.e. a symbolic constraint ``k == 1`` rather than the concrete ``8 == 1``
+    that the existing concrete-shape test already covers).
+
+    Background
+    ----------
+    In the synthesis log for ``kernel_matmul_red_div`` the search found:
+
+      * ``reciprocal(tensor_tensor[op=divide](IN:tensor_reduce_1080, IN:x))``
+      * ``tensor_tensor[op=divide](IN:x, IN:tensor_reduce_1080)``
+      * ``tensor_tensor[op=divide](IN:x, transpose(IN:tensor_reduce_1080))``
+
+    as falsely-equivalent lowerings for ``div_1002``.  With concrete shapes
+    these are caught by ``_sketch_shape_constraints_violated`` (``8==1`` → False),
+    but with the *symbolic* shapes used during synthesis (``x: [m, k]``,
+    ``reduced: [m, 1]``) the constraint ``k == 1`` emitted by
+    ``_shape_tensor_tensor`` does not simplify to False and slips through the
+    pre-filter into the equivalence solver, which then (wrongly) accepts it
+    because the merged context contains ``k == 1``.
+
+    The new ``_shapes_not_provably_equivalent`` guard asks the solver whether
+    ``k == 1`` follows from the input-dimension positivity constraints alone
+    (``m > 0, k > 0``).  The answer is NO (SAT with k = 8), so all such
+    candidates are rejected before any expensive equivalence check is attempted.
+    """
+    from unittest.mock import patch
+
+    m = z3.Int("sym_m")
+    k = z3.Int("sym_k")
+    x = SymTensor("x_sym", shape=(m, k))
+    reduced = SymTensor("reduced_sym", shape=(m, z3.IntVal(1)))
+
+    target_sym = divide(x, reduced)
+
+    # Bad candidates — tensor_tensor requires all dims equal, injecting k == 1
+    bad1 = tensor_tensor(dst=None, data1=x, data2=reduced, op=nl.divide)
+    bad2 = tensor_tensor(dst=None, data1=reduced, data2=x, op=nl.divide)
+    bad3 = reciprocal(
+        dst=None,
+        data=tensor_tensor(dst=None, data1=reduced, data2=x, op=nl.divide),
+    )
+
+    for bad, desc in [
+        (bad1, "tensor_tensor(x, reduced)"),
+        (bad2, "tensor_tensor(reduced, x)"),
+        (bad3, "reciprocal(tensor_tensor(reduced, x))"),
+    ]:
+        # The trivial simplify-based check must NOT fire for symbolic shapes
+        assert not _sketch_shape_constraints_violated(bad), (
+            f"{desc}: _sketch_shape_constraints_violated must not fire for symbolic "
+            f"shapes (constraint k==1 is non-trivial, not z3.is_false)"
+        )
+        # The new solver-backed check MUST detect the illegal restriction
+        assert _shapes_not_provably_equivalent(target_sym, bad), (
+            f"{desc}: _shapes_not_provably_equivalent must detect that k==1 is not "
+            f"implied by input positivity (m>0, k>0)"
+        )
+        reason = _shape_rejection_reason(target_sym, bad)
+        assert reason is not None, (
+            f"{desc}: _shape_rejection_reason must reject this symbolic-shape candidate"
+        )
+        assert "provably" in reason.lower(), (
+            f"{desc}: expected an 'output shape not provably equivalent' rejection, "
+            f"got: {reason!r}"
+        )
+
+    # Good candidate: tensor_scalar is the broadcast-capable op; it adds only
+    # trivially-True broadcast constraints, not k == 1.
+    good = tensor_scalar(dst=None, data=x, op0=nl.divide, operand0=reduced)
+    assert not _shapes_not_provably_equivalent(target_sym, good), (
+        "tensor_scalar(x, op=divide, operand=reduced) must NOT be rejected by "
+        "_shapes_not_provably_equivalent — it has no non-trivial shape constraints"
+    )
+    assert _shape_rejection_reason(target_sym, good) is None, (
+        "tensor_scalar lowering must pass all shape pre-filters"
+    )
+    assert _check_equivalent_quiet(target_sym, good, timeout=5000), (
+        "tensor_scalar(x, op=divide, operand=reduced) must be proven equivalent "
+        "to the broadcasted public divide"
+    )
+
+    # Verify synthesis rejects bad candidates without touching the equivalence solver
+    bad_sketches = [
+        SketchNode.make_op(
+            "tensor_tensor",
+            [SketchNode.make_input(x), SketchNode.make_input(reduced)],
+            {"op": nl.divide},
+        ),
+        SketchNode.make_op(
+            "reciprocal",
+            [
+                SketchNode.make_op(
+                    "tensor_tensor",
+                    [SketchNode.make_input(reduced), SketchNode.make_input(x)],
+                    {"op": nl.divide},
+                )
+            ],
+            {},
+        ),
+    ]
+    calls: dict[str, int] = {"count": 0}
+    original_check = _check_equivalent_quiet
+
+    def _counting_check(lhs: SymTensor, rhs: SymTensor, timeout: int = 3000) -> bool:
+        calls["count"] += 1
+        return original_check(lhs, rhs, timeout=timeout)
+
+    with patch("axon_synthesizer._check_equivalent_quiet", side_effect=_counting_check):
+        found = _synthesize_all_from_pool(
+            target_sym,
+            bad_sketches,
+            max_hw_size=2,
+            timeout=100,
+            verbose=False,
+            max_workers=1,
+        )
+
+    assert found == [], (
+        "Symbolic-shape tensor_tensor divide candidates must not be accepted"
+    )
+    assert calls["count"] == 0, (
+        "_shapes_not_provably_equivalent must prevent equivalence-solver dispatch "
+        "for all symbolic-shape tensor_tensor divide candidates"
+    )
+    print(
+        " synthesis: symbolic-shape tensor_tensor divide candidates rejected before "
+        "equivalence solver by _shapes_not_provably_equivalent"
+    )
+
+
 def _test_lower_nu_graph_parallel_levels() -> None:
     def kernel_parallel_reductions(x, y):
         return x.sum(axis=1, keep_dims=True) / y.sum(axis=1, keep_dims=True)
@@ -5798,6 +6040,7 @@ def run_all_tests() -> None:
     _test_synthesis_pool_filters_templates_by_target_constituents()
     _test_single_operator_sketches_cover_distinct_inputs()
     _test_division_broadcast_uses_tensor_scalar_not_tensor_tensor()
+    _test_division_symbolic_shape_rejection()
     _test_invoke_hw_op_transpose_uses_nc_transpose_semantics()
     _test_lower_nu_graph_parallel_levels()
     print("\n================ RUNNING SYNTHESIZER TESTS =============")
