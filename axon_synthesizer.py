@@ -6218,7 +6218,7 @@ def _test_kernel_matmul_red_div_div_node_lowered_via_tensor_scalar() -> None:
     )
 
 
-
+def _test_lower_nu_graph_parallel_levels() -> None:
     def kernel_parallel_reductions(x, y):
         return x.sum(axis=1, keep_dims=True) / y.sum(axis=1, keep_dims=True)
 
