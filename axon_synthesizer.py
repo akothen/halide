@@ -4645,12 +4645,34 @@ def lower_nu_graph(
         synthesis_args: list[SynthArgs] = []
         for node in synthesis:
             hw_input_pairs: list[tuple[SymTensor, str]] = []
+            missing_inputs: list[str] = []
             for inp_id in node.inputs:
                 hw_id = node_id_map.get(inp_id, inp_id)
                 hw_sym = hw_syms.get(hw_id)
                 if hw_sym is None:
-                    return None
+                    missing_inputs.append(f"{inp_id}->{hw_id}")
+                    continue
                 hw_input_pairs.append((hw_sym, hw_id))
+            if missing_inputs:
+                if verbose:
+                    print(
+                        f"[lower_nu_graph] cannot synthesize '{node.id}' op={node.op}: "
+                        f"missing lowered inputs {missing_inputs}"
+                    )
+                return None
+            if len(hw_input_pairs) != len(node.inputs):
+                if verbose:
+                    print(
+                        f"[lower_nu_graph] input count mismatch for '{node.id}' op={node.op}: "
+                        f"expected {len(node.inputs)} inputs, resolved {len(hw_input_pairs)}"
+                    )
+                return None
+            if verbose:
+                print(
+                    f"[lower_nu_graph] synthesizing '{node.id}' op={node.op} "
+                    f"orig_inputs={node.inputs} "
+                    f"resolved_hw_inputs={[hw_id for _, hw_id in hw_input_pairs]}"
+                )
             target_sym = orig_syms.get(node.id)
             if target_sym is None:
                 return None
@@ -4854,12 +4876,37 @@ def lower_nu_graph_all_variants(
         synthesis_args: list[SynthArgs] = []
         for node in synthesis:
             hw_input_pairs: list[tuple[SymTensor, str]] = []
+            missing_inputs: list[str] = []
             for inp_id in node.inputs:
                 hw_id = node_id_map_can.get(inp_id, inp_id)
                 hw_sym = hw_syms_can.get(hw_id)
                 if hw_sym is None:
-                    return []
+                    missing_inputs.append(f"{inp_id}->{hw_id}")
+                    continue
                 hw_input_pairs.append((hw_sym, hw_id))
+            if missing_inputs:
+                if verbose:
+                    print(
+                        f"[lower_nu_graph_all_variants] cannot synthesize '{node.id}' "
+                        f"op={node.op}: missing lowered inputs {missing_inputs}"
+                    )
+                return []
+            if len(hw_input_pairs) != len(node.inputs):
+                if verbose:
+                    print(
+                        f"[lower_nu_graph_all_variants] input count mismatch for "
+                        f"'{node.id}' op={node.op}: expected {len(node.inputs)} inputs, "
+                        f"resolved {len(hw_input_pairs)}"
+                    )
+                return []
+            if verbose:
+                with _VERBOSE_LOCK:
+                    print(
+                        f"[lower_nu_graph_all_variants] synthesizing '{node.id}' "
+                        f"op={node.op} "
+                        f"orig_inputs={node.inputs} "
+                        f"resolved_hw_inputs={[hw_id for _, hw_id in hw_input_pairs]}"
+                    )
             t_sym = orig_syms.get(node.id)
             if t_sym is None:
                 return []
@@ -5206,6 +5253,94 @@ def _test_reduce_sum_lowering_no_crash() -> None:
     print(f" synthesizer: reduce_sum lowering (regression) — "
           f"{len(hw_variants)} hw variant(s) produced, all equivalent")
 
+
+def _test_matmul_1003_multi_input_synthesis() -> None:
+    """Regression test for the failure mode where ``matmul_1003`` in variant 0
+    of ``kernel_matmul_red_div`` was synthesized with only the ``w`` operand
+    instead of both ``div_1002`` and ``w``.
+
+    Root cause: when an upstream synthesis node (``div_1002``) had its hw sym
+    missing from ``hw_syms_can``, downstream synthesis proceeded with a
+    truncated ``hw_input_pairs`` list, leaving only ``IN:w`` in the synthesis
+    pool and causing 'no hw equivalent found for matmul_1003'.
+
+    This test:
+      1. Extracts variant 0 of ``kernel_matmul_red_div``, which has the
+         structure ``reduce_sum → div → matmul``.
+      2. Asserts the graph contains a ``matmul`` node with two inputs
+         (``div_*`` and ``w``), confirming it's a true multi-input op.
+      3. Runs ``lower_nu_graph_all_variants`` and asserts it succeeds – i.e.
+         the lowering does NOT fail because matmul received incomplete inputs.
+      4. Verifies every returned hw graph uses only hw ops and that at least
+         one contains ``nc_matmul`` (confirming matmul was actually lowered,
+         not skipped).
+      5. Spot-checks equivalence of the first returned hw graph.
+
+    The test would fail with the pre-fix code where:
+      - ``div_1002`` synthesis failed (producing no hw sym),
+      - the downstream matmul synthesis therefore received only ``IN:w``, and
+      - all 162 sketch candidates were not equivalent, so lowering returned [].
+    """
+    G = build_kernel_matmul_red_div_graph(4, 8, 16)
+    variants = nu_graph_generation_z3(G, verbose=False)
+    assert variants, "kernel_matmul_red_div should produce at least one variant"
+
+    gv = variants[0]
+
+    # Confirm variant 0 has the expected multi-input matmul structure.
+    matmul_nodes = _nodes_by_op(gv, "matmul")
+    assert matmul_nodes, (
+        "Variant 0 of kernel_matmul_red_div must contain a 'matmul' node"
+    )
+    matmul_node = matmul_nodes[0]
+    assert len(matmul_node.inputs) == 2, (
+        f"matmul node in variant 0 must have exactly 2 inputs, "
+        f"got {matmul_node.inputs!r}"
+    )
+    # One input must be 'w' (the weight tensor), the other from div/upstream.
+    assert "w" in matmul_node.inputs, (
+        f"matmul node must have 'w' as one of its inputs, got {matmul_node.inputs!r}"
+    )
+    upstream_input = next(i for i in matmul_node.inputs if i != "w")
+    assert upstream_input != "w", (
+        "matmul node must have a non-'w' upstream input (from div/reduce path)"
+    )
+
+    # Run the full lowering and assert it succeeds with BOTH inputs resolved.
+    hw_variants = lower_nu_graph_all_variants(gv, max_hw_size=2, timeout=5000)
+    assert hw_variants, (
+        "matmul_1003 regression: lower_nu_graph_all_variants returned no results "
+        "for variant 0 of kernel_matmul_red_div — matmul may have received "
+        f"incomplete inputs (only 'w' instead of both '{upstream_input}' and 'w')"
+    )
+
+    for i, g_hw in enumerate(hw_variants):
+        assert _graph_uses_hw_only(g_hw), (
+            f"matmul_1003 regression: hw variant {i} still contains public ops"
+        )
+
+    # At least one hw graph must contain nc_matmul (confirming the matmul was
+    # actually lowered and not silently dropped).
+    assert any(_nodes_by_op(g_hw, "nc_matmul") for g_hw in hw_variants), (
+        "matmul_1003 regression: no hw variant contains 'nc_matmul'; "
+        "matmul may not have been lowered"
+    )
+
+    # Spot-check equivalence of the first returned hw graph.
+    pair = _graph_output_sym_lowered(gv, hw_variants[0])
+    assert pair is not None, (
+        "matmul_1003 regression: could not extract output syms for equivalence check"
+    )
+    orig_sym, hw_sym = pair
+    assert _check_equivalent_quiet(orig_sym, hw_sym, timeout=15000), (
+        "matmul_1003 regression: first lowered hw graph is not equivalent to original"
+    )
+
+    print(
+        f" synthesizer: matmul_1003 multi-input regression — "
+        f"matmul node inputs={matmul_node.inputs!r}, "
+        f"{len(hw_variants)} hw variant(s) produced, first variant equivalent"
+    )
 
 
 def kernel_matmul_red_div(x: AxonArray, y: AxonArray, w: AxonArray) -> AxonArray:
@@ -6280,6 +6415,7 @@ def run_all_tests() -> None:
     _test_synthesizer_all_variants_lowered()
     _test_lower_nu_graph_all_variants()
     _test_reduce_sum_lowering_no_crash()
+    _test_matmul_1003_multi_input_synthesis()
     _test_kernel_matmul_red_div_div_node_lowered_via_tensor_scalar()
     print("=============== ALL TESTS PASSED  =====================\n")
 
