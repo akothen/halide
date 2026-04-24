@@ -53,7 +53,9 @@ def _effective_max_workers(max_workers: Optional[int], task_count: int) -> int:
 
     ``max_workers=None`` means "auto": launch one worker per task so sketch
     synthesis fans out as widely as possible.  Explicit positive ``max_workers``
-    values are still respected.
+    values are still respected.  Non-positive ``task_count`` values collapse to
+    1 worker, and explicit non-positive ``max_workers`` values are clamped up to
+    1.
     """
     if task_count <= 1:
         return 1
@@ -5749,14 +5751,17 @@ def _test_synthesis_auto_maximizes_sketch_workers() -> None:
     real_executor = concurrent.futures.ThreadPoolExecutor
     observed: dict[str, int] = {}
 
-    def _recording_executor(*args: Any, **kwargs: Any) -> concurrent.futures.ThreadPoolExecutor:
+    def _recording_executor_factory(
+        *args: Any, **kwargs: Any
+    ) -> concurrent.futures.ThreadPoolExecutor:
         if args:
             observed["max_workers"] = args[0]
         else:
             observed["max_workers"] = kwargs["max_workers"]
         return real_executor(*args, **kwargs)
 
-    with patch("axon_synthesizer.concurrent.futures.ThreadPoolExecutor", side_effect=_recording_executor):
+    patch_target = f"{__name__}.concurrent.futures.ThreadPoolExecutor"
+    with patch(patch_target, side_effect=_recording_executor_factory):
         _synthesize_all_from_pool(
             target_sym,
             pool,
