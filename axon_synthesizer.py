@@ -12,6 +12,7 @@ from enum import Enum
 from itertools import combinations, permutations, product as _iproduct
 from threading import Lock, RLock
 from typing import Any, Callable, Optional, List
+from unittest.mock import patch
 
 import z3
 
@@ -46,6 +47,7 @@ _UF_LOCK = Lock()
 _SEMANTICS_LOCK = Lock()
 _VERBOSE_LOCK = Lock()   # serializes verbose prints from concurrent synthesis threads
 _Z3_LOCK = RLock()       # serializes z3 formula construction (z3.main_ctx is not thread-safe)
+_SYNTHESIS_STATS_LOCK = Lock()
 
 
 def _gen_id(prefix: Optional[str] = None) -> str:
@@ -3854,7 +3856,7 @@ def _check_equivalent_quiet(
         return False
 
 
-def _shape_rejects_symbolically(lhs: SymTensor, rhs: SymTensor) -> bool:
+def _shapes_incompatible_symbolically(lhs: SymTensor, rhs: SymTensor) -> bool:
     """Return True when the symbolic output shapes are obviously incompatible."""
     if lhs.rank != rhs.rank:
         return True
@@ -3869,12 +3871,23 @@ def _shape_rejection_reason(
     candidate_sym: SymTensor,
 ) -> Optional[str]:
     """Return a rejection reason if shape information proves a mismatch."""
-    if _shape_rejects_symbolically(target_sym, candidate_sym):
+    if _shapes_incompatible_symbolically(target_sym, candidate_sym):
         return "symbolic shape mismatch"
     return None
 
 
 _last_synthesis_stats: dict[str, Any] = {}
+
+
+def _reset_synthesis_stats(**stats: Any) -> None:
+    with _SYNTHESIS_STATS_LOCK:
+        _last_synthesis_stats.clear()
+        _last_synthesis_stats.update(stats)
+
+
+def _update_synthesis_stats(**stats: Any) -> None:
+    with _SYNTHESIS_STATS_LOCK:
+        _last_synthesis_stats.update(stats)
 
 
 def _format_sketch(sketch: SketchNode) -> str:
@@ -3920,9 +3933,10 @@ def _synthesize_from_pool(
     seen: set[SketchNode] = {initial}
     symbolic_shape_reject_count = 0
     solver_dispatch_count = 0
-    _last_synthesis_stats.clear()
-    _last_synthesis_stats["symbolic_shape_reject_count"] = 0
-    _last_synthesis_stats["solver_dispatch_count"] = 0
+    _reset_synthesis_stats(
+        symbolic_shape_reject_count=0,
+        solver_dispatch_count=0,
+    )
 
     while worklist:
         sketch = worklist.pop()           # DFS: pop from end
@@ -3956,8 +3970,10 @@ def _synthesize_from_pool(
                     f"    symbolic_shape_reject_count={symbolic_shape_reject_count} "
                     f"solver_dispatch_count={solver_dispatch_count}"
                 )
-            _last_synthesis_stats["symbolic_shape_reject_count"] = symbolic_shape_reject_count
-            _last_synthesis_stats["solver_dispatch_count"] = solver_dispatch_count
+            _update_synthesis_stats(
+                symbolic_shape_reject_count=symbolic_shape_reject_count,
+                solver_dispatch_count=solver_dispatch_count,
+            )
             if equiv:
                 return sketch
             continue
@@ -3979,8 +3995,10 @@ def _synthesize_from_pool(
             seen.add(filled)
             worklist.append(filled)
 
-    _last_synthesis_stats["symbolic_shape_reject_count"] = symbolic_shape_reject_count
-    _last_synthesis_stats["solver_dispatch_count"] = solver_dispatch_count
+    _update_synthesis_stats(
+        symbolic_shape_reject_count=symbolic_shape_reject_count,
+        solver_dispatch_count=solver_dispatch_count,
+    )
     return None
 
 
@@ -4009,10 +4027,11 @@ def _synthesize_all_from_pool(
     seen: set[SketchNode] = {initial}
     candidates: list[tuple[SketchNode, SymTensor]] = []
     symbolic_shape_reject_count = 0
-    _last_synthesis_stats.clear()
-    _last_synthesis_stats["candidate_count"] = 0
-    _last_synthesis_stats["symbolic_shape_reject_count"] = 0
-    _last_synthesis_stats["solver_dispatch_count"] = 0
+    _reset_synthesis_stats(
+        candidate_count=0,
+        symbolic_shape_reject_count=0,
+        solver_dispatch_count=0,
+    )
 
     # Phase 1: expand worklist, collect all complete evaluatable candidates
     while worklist:
@@ -4056,9 +4075,11 @@ def _synthesize_all_from_pool(
             seen.add(filled)
             worklist.append(filled)
 
-    _last_synthesis_stats["candidate_count"] = len(candidates)
-    _last_synthesis_stats["symbolic_shape_reject_count"] = symbolic_shape_reject_count
-    _last_synthesis_stats["solver_dispatch_count"] = len(candidates)
+    _update_synthesis_stats(
+        candidate_count=len(candidates),
+        symbolic_shape_reject_count=symbolic_shape_reject_count,
+        solver_dispatch_count=len(candidates),
+    )
 
     if not candidates:
         return []
@@ -4149,7 +4170,8 @@ def _sketch_to_graph_nodes(
 
     clean_attrs = {k: v for k, v in sketch.attrs.items() if k != "name"}
     # The synthesis pool uses an abstract transpose so search does not branch
-    # over multiple concrete layout ops; materialize it here as nc_transpose.
+    # over multiple concrete layout ops; materialize it here as nc_transpose,
+    # the canonical hardware transpose used throughout lowering.
     materialized_op = "nc_transpose" if sketch.op == "transpose" else sketch.op
     new_id = _gen_id(materialized_op)
     new_nodes.append(Node(id=new_id, op=materialized_op, inputs=child_ids, attrs=clean_attrs))
@@ -5301,8 +5323,7 @@ def _test_synthesis_symbolic_shape_prefilter_skips_solver() -> None:
         calls["count"] += 1
         return original_check(lhs, rhs, timeout=timeout)
 
-    globals()["_check_equivalent_quiet"] = _counting_check
-    try:
+    with patch(f"{__name__}._check_equivalent_quiet", side_effect=_counting_check):
         found = _synthesize_all_from_pool(
             target_sym,
             pool,
@@ -5311,8 +5332,6 @@ def _test_synthesis_symbolic_shape_prefilter_skips_solver() -> None:
             verbose=False,
             max_workers=1,
         )
-    finally:
-        globals()["_check_equivalent_quiet"] = original_check
 
     assert found == [], "Expected symbolic shape prefilter to reject mismatched sketch"
     assert calls["count"] == 0, "Expected symbolic shape mismatch to skip equivalence solver"
