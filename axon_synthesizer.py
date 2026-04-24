@@ -3963,9 +3963,8 @@ def _synthesize_from_pool(
             continue
 
         # Incomplete sketch – fill the first hole with each pool entry.
-        # Iterate in reverse so DFS/LIFO explores pool entries in their
-        # declared priority order instead of visiting the last-added template
-        # first.
+        # Iterate in reverse so the highest-priority templates are appended to
+        # the LIFO worklist last and therefore popped/explored first.
         can_add_hw_op = sketch.hw_size() < max_hw_size
         for pool_entry in reversed(pool):
             # Decide whether this pool entry is allowed at this depth
@@ -4480,7 +4479,7 @@ def lower_nu_graph_all_variants(
     2. **Sketch-level**: within each node, candidate equivalence checks are
        dispatched through _synthesize_all_from_pool.
 
-     After synthesis the Cartesian product of per-node alternatives is taken.
+    After synthesis the Cartesian product of per-node alternatives is taken.
     Because all valid sketches for a node are semantically equivalent to the
     target, downstream nodes are synthesized against the canonical (first)
     alternative, and the remaining combinations are produced by substituting
