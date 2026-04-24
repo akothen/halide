@@ -3861,9 +3861,10 @@ def _shapes_incompatible_symbolically(lhs: SymTensor, rhs: SymTensor) -> bool:
     """Return True when symbolic shapes differ in a trivially decidable way."""
     if lhs.rank != rhs.rank:
         return True
-    for ldim, rdim in zip(lhs.shape, rhs.shape):
-        if z3.is_int_value(ldim) and z3.is_int_value(rdim) and ldim.as_long() != rdim.as_long():
-            return True
+    with _Z3_LOCK:
+        for ldim, rdim in zip(lhs.shape, rhs.shape):
+            if z3.is_int_value(ldim) and z3.is_int_value(rdim) and ldim.as_long() != rdim.as_long():
+                return True
     return False
 
 
@@ -4915,7 +4916,10 @@ def _test_reduce_sum_lowering_no_crash() -> None:
     gv = variants[0]
     reduce_nodes = _nodes_by_op(gv, "reduce_sum")
     assert reduce_nodes, "Variant 0 of kernel_matmul_red_div should contain a reduce_sum node"
-    assert reduce_nodes[0].attrs.get("keep_dims") or reduce_nodes[0].attrs.get("keepdims"), \
+    assert (
+        reduce_nodes[0].attrs.get("keep_dims") is True
+        or reduce_nodes[0].attrs.get("keepdims") is True
+    ), \
         "reduce_sum in kernel_matmul_red_div variant 0 should use keep_dims=True"
 
     hw_variants = lower_nu_graph_all_variants(gv, max_hw_size=2, timeout=5000)
@@ -5327,7 +5331,7 @@ def _test_synthesis_symbolic_shape_prefilter_skips_solver() -> None:
         calls["count"] += 1
         return original_check(lhs, rhs, timeout=timeout)
 
-    with patch.object(sys.modules[__name__], "_check_equivalent_quiet", side_effect=_counting_check):
+    with patch("axon_synthesizer._check_equivalent_quiet", side_effect=_counting_check):
         found = _synthesize_all_from_pool(
             target_sym,
             pool,
