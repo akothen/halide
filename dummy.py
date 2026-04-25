@@ -4735,12 +4735,12 @@ def _lower_node(
             _SYNTHESIS_CACHE[cache_key] = norm
 
     # Map each concrete input SymTensor to its hw node id
-    sym_to_node_id_new: dict[int, str] = {
+    sym_to_node_id: dict[int, str] = {
         id(sym): node_id for sym, node_id in hw_input_pairs
     }
 
-    new_nodes_out: list[Node] = []
-    output_id = _sketch_to_graph_nodes(found, sym_to_node_id_new, new_nodes_out)
+    new_nodes: list[Node] = []
+    output_id = _sketch_to_graph_nodes(found, sym_to_node_id, new_nodes)
     if output_id is None:
         return None
 
@@ -4748,7 +4748,7 @@ def _lower_node(
     if output_sym is None:
         return None
 
-    return new_nodes_out, output_id, output_sym
+    return new_nodes, output_id, output_sym
 
 
 def _lower_node_all(
@@ -4845,7 +4845,7 @@ def _lower_node_all(
             _SYNTHESIS_CACHE_ALL[cache_key] = []
         return []
 
-    sym_to_node_id_new: dict[int, str] = {
+    sym_to_node_id: dict[int, str] = {
         id(sym): node_id for sym, node_id in hw_input_pairs
     }
 
@@ -4855,14 +4855,14 @@ def _lower_node_all(
         if verbose:
             with _VERBOSE_LOCK:
                 print(f"  => FOUND: {_format_sketch(sketch)}")
-        new_nodes_sk: list[Node] = []
-        output_id = _sketch_to_graph_nodes(sketch, sym_to_node_id_new, new_nodes_sk)
+        new_nodes: list[Node] = []
+        output_id = _sketch_to_graph_nodes(sketch, sym_to_node_id, new_nodes)
         if output_id is None:
             continue
         output_sym = _eval_sketch(sketch)
         if output_sym is None:
             continue
-        materialized.append((sketch, new_nodes_sk, output_id, output_sym))
+        materialized.append((sketch, new_nodes, output_id, output_sym))
         norm = _normalize_sketch(sketch, input_syms)
         if norm is not None:
             norms_to_cache.append(norm)
