@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 import argparse
 import concurrent.futures
+import os
 import sys
 import io
 import time
@@ -51,11 +52,13 @@ _Z3_LOCK = RLock()       # serializes z3 formula construction (z3.main_ctx is no
 def _effective_max_workers(max_workers: Optional[int], task_count: int) -> int:
     """Choose how many threads to launch for a pool of *task_count* items.
 
-    ``max_workers=None`` means "auto": launch one worker per task so sketch
-    synthesis fans out as widely as possible.  Explicit positive ``max_workers``
-    values are still respected.  ``task_count <= 1`` collapses to 1 worker, and
-    explicit non-positive ``max_workers`` values are clamped up to 1.  Explicit
-    values larger than ``task_count`` are clamped down to ``task_count``.
+    ``max_workers=None`` means "auto": derive the worker count from the number
+    of logical CPUs reported by ``os.cpu_count()`` (defaulting to 4 when the
+    OS cannot determine the count), clamped to *task_count* so no unnecessary
+    threads are created.  Explicit positive ``max_workers`` values are still
+    respected.  ``task_count <= 1`` collapses to 1 worker, and explicit
+    non-positive ``max_workers`` values are clamped up to 1.  Explicit values
+    larger than ``task_count`` are clamped down to ``task_count``.
 
     Returns:
         The computed number of workers to launch.
@@ -63,7 +66,8 @@ def _effective_max_workers(max_workers: Optional[int], task_count: int) -> int:
     if task_count <= 1:
         return 1
     if max_workers is None:
-        return task_count
+        cpu_count = os.cpu_count() or 4
+        return builtins.max(1, builtins.min(cpu_count, task_count))
     return builtins.max(1, builtins.min(max_workers, task_count))
 
 
@@ -5868,7 +5872,7 @@ def _test_synthesis_auto_maximizes_sketch_workers() -> None:
             observed["max_workers"] = kwargs["max_workers"]
         return _RecordingExecutor(*args, **kwargs)
 
-    patch_target = "axon_synthesizer.concurrent.futures.ThreadPoolExecutor"
+    patch_target = "concurrent.futures.ThreadPoolExecutor"
     with patch(patch_target, side_effect=_recording_executor_factory):
         _synthesize_all_from_pool(
             target_sym,
@@ -5880,15 +5884,74 @@ def _test_synthesis_auto_maximizes_sketch_workers() -> None:
 
     candidate_count = _last_synthesis_stats.get("candidate_count", 0)
     expected_workers = _effective_max_workers(None, candidate_count)
+    cpu_count = os.cpu_count() or 4
     assert candidate_count > 1, "Expected multiple candidate sketches for reduce_sum"
     assert observed.get("max_workers") == expected_workers, (
         f"Expected sketch-level synthesis to auto-launch {expected_workers} worker(s), "
         f"got {observed.get('max_workers')}"
     )
+    # In auto mode the worker count must be CPU-bounded, not equal to task count.
+    assert expected_workers <= cpu_count, (
+        f"Auto workers ({expected_workers}) must not exceed CPU count ({cpu_count})"
+    )
+    assert expected_workers <= candidate_count, (
+        f"Auto workers ({expected_workers}) must not exceed candidate count ({candidate_count})"
+    )
     print(
         f" synthesis: auto sketch-level threading launches {observed['max_workers']} "
-        f"worker(s) for {candidate_count} candidate sketch(es)"
+        f"worker(s) (cpu_count={cpu_count}) for {candidate_count} candidate sketch(es)"
     )
+
+
+def _test_effective_max_workers_uses_cpu_count() -> None:
+    """Unit test: _effective_max_workers(None, N) derives workers from CPU count.
+
+    Validates:
+    - Auto mode (max_workers=None) uses os.cpu_count() (defaulting to 4 when
+      None) clamped to task_count, rather than returning task_count directly.
+    - The fallback of 4 is applied when os.cpu_count() returns None.
+    - Explicit max_workers values are unchanged by this logic.
+    - task_count <= 1 still returns 1 regardless.
+    """
+    from unittest.mock import patch
+
+    # --- auto mode with a known cpu_count ---
+    for fake_cpu in (1, 2, 4, 8, 16):
+        with patch("os.cpu_count", return_value=fake_cpu):
+            for task_count in (1, 2, fake_cpu - 1, fake_cpu, fake_cpu + 5):
+                if task_count < 1:
+                    continue
+                result = _effective_max_workers(None, task_count)
+                expected = builtins.max(1, builtins.min(fake_cpu, task_count))
+                assert result == expected, (
+                    f"cpu={fake_cpu}, tasks={task_count}: "
+                    f"expected {expected}, got {result}"
+                )
+
+    # --- auto mode when os.cpu_count() returns None (fallback = 4) ---
+    with patch("os.cpu_count", return_value=None):
+        fallback = 4
+        for task_count in (1, 2, 3, 4, 10):
+            result = _effective_max_workers(None, task_count)
+            expected = builtins.max(1, builtins.min(fallback, task_count))
+            assert result == expected, (
+                f"None cpu fallback, tasks={task_count}: "
+                f"expected {expected}, got {result}"
+            )
+
+    # --- explicit max_workers is respected unchanged ---
+    assert _effective_max_workers(1, 10) == 1
+    assert _effective_max_workers(3, 10) == 3
+    assert _effective_max_workers(10, 10) == 10
+    assert _effective_max_workers(20, 10) == 10  # clamped to task_count
+    assert _effective_max_workers(0, 10) == 1    # clamped up to 1
+
+    # --- task_count <= 1 always returns 1 ---
+    assert _effective_max_workers(None, 1) == 1
+    assert _effective_max_workers(None, 0) == 1
+    assert _effective_max_workers(5, 1) == 1
+
+    print(" workers: _effective_max_workers uses CPU count in auto mode")
 
 
 def _test_lower_nu_graph_all_variants_does_not_hold_z3_lock_across_node_lowering() -> None:
@@ -5913,7 +5976,7 @@ def _test_lower_nu_graph_all_variants_does_not_hold_z3_lock_across_node_lowering
         observed["held"] = bool(is_owned()) if is_owned is not None else False
         return []
 
-    with patch("axon_synthesizer._lower_node_all", side_effect=_fake_lower_node_all):
+    with patch("__main__._lower_node_all", side_effect=_fake_lower_node_all):
         lowered = lower_nu_graph_all_variants(
             gv,
             max_hw_size=2,
@@ -5951,7 +6014,7 @@ def _test_synthesis_symbolic_shape_prefilter_skips_solver() -> None:
         calls["count"] += 1
         return original_check(lhs, rhs, timeout=timeout)
 
-    with patch("axon_synthesizer._check_equivalent_quiet", side_effect=_counting_check):
+    with patch("__main__._check_equivalent_quiet", side_effect=_counting_check):
         found = _synthesize_all_from_pool(
             target_sym,
             pool,
@@ -6057,7 +6120,7 @@ def _test_sketch_shape_constraints_violated_rejected_early() -> None:
         calls["count"] += 1
         return original_check(lhs, rhs, timeout=timeout)
 
-    with patch("axon_synthesizer._check_equivalent_quiet", side_effect=_counting_check):
+    with patch("__main__._check_equivalent_quiet", side_effect=_counting_check):
         found = _synthesize_all_from_pool(
             target_sym,
             [bad_sketch],
@@ -6279,7 +6342,7 @@ def _test_division_broadcast_uses_tensor_scalar_not_tensor_tensor() -> None:
         calls["count"] += 1
         return original_check(lhs, rhs, timeout=timeout)
 
-    with patch("axon_synthesizer._check_equivalent_quiet", side_effect=_counting_check):
+    with patch("__main__._check_equivalent_quiet", side_effect=_counting_check):
         found = _synthesize_all_from_pool(
             target_sym,
             [bad_sketch],
@@ -6404,7 +6467,7 @@ def _test_division_symbolic_shape_rejection() -> None:
         calls["count"] += 1
         return original_check(lhs, rhs, timeout=timeout)
 
-    with patch("axon_synthesizer._check_equivalent_quiet", side_effect=_counting_check):
+    with patch("__main__._check_equivalent_quiet", side_effect=_counting_check):
         found = _synthesize_all_from_pool(
             target_sym,
             bad_sketches,
@@ -6846,6 +6909,7 @@ def run_all_tests() -> None:
     _test_synthesis_prefers_direct_reduce_candidate()
     _test_synthesis_verbose_reports_candidate_count()
     _test_synthesis_auto_maximizes_sketch_workers()
+    _test_effective_max_workers_uses_cpu_count()
     _test_lower_nu_graph_all_variants_does_not_hold_z3_lock_across_node_lowering()
     _test_synthesis_symbolic_shape_prefilter_skips_solver()
     _test_sketch_shape_constraints_violated_rejected_early()
@@ -6882,6 +6946,15 @@ if __name__ == "__main__":
         action="store_true",
         help="Run in-file nuGraph tests instead of tracing demo kernels",
     )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help=(
+            "Maximum worker threads for sketch checking. "
+            "Default (None) auto-derives from CPU count."
+        ),
+    )
     args = parser.parse_args()
 
     if args.run_tests:
@@ -6917,7 +6990,8 @@ if __name__ == "__main__":
             print(f"--- {kname} :: Variant {vi} :: Lowering to hardware "
                   f"(all sketches, node- & sketch-level parallel) ---")
             hw_variants = lower_nu_graph_all_variants(
-                gv, max_hw_size=2, timeout=3000, verbose=True)
+                gv, max_hw_size=2, timeout=3000, verbose=True,
+                max_workers=args.max_workers)
             if not hw_variants:
                 print(f"  [lowering failed for variant {vi}]")
             else:
