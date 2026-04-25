@@ -5782,8 +5782,10 @@ def kernel_attention(x: DummyArray, w_q: DummyArray, w_k: DummyArray, w_v: Dummy
     v = x @ w_v
     k_t = k.transpose()
     qk = q @ k_t
-    softmax = qk.softmax(axis=1)
-    return softmax @ v
+    ex = qk.exp()
+    den = ex.sum(axis=1, keep_dims=True)
+    probs = ex / den
+    return probs @ v
 
 
 def _graph_from_axon_array(out: DummyArray) -> nuGraph:
@@ -6056,13 +6058,18 @@ def _test_attention_graph() -> None:
     G = build_kernel_attention_graph(4, 8, 16)
     matmuls = _nodes_by_op(G, "matmul")
     transposes = _nodes_by_op(G, "transpose")
-    softmax_nodes = _nodes_by_op(G, "softmax")
+    exp_nodes = _nodes_by_op(G, "exp")
+    reduce_sum_nodes = _nodes_by_op(G, "reduce_sum")
+    div_nodes = _nodes_by_op(G, "div")
     assert len(matmuls) == 5, f"attention should have 5 matmul nodes, got {len(matmuls)}"
     assert len(transposes) == 1, f"attention should have 1 transpose node, got {len(transposes)}"
-    assert len(softmax_nodes) == 1, f"attention should have 1 softmax node, got {len(softmax_nodes)}"
+    assert len(exp_nodes) == 1, f"attention should have 1 exp node, got {len(exp_nodes)}"
+    assert len(reduce_sum_nodes) == 1, f"attention should have 1 reduce_sum node, got {len(reduce_sum_nodes)}"
+    assert len(div_nodes) == 1, f"attention should have 1 div node, got {len(div_nodes)}"
     assert transposes[0].shape == (16, 4), f"k_t shape wrong: {transposes[0].shape}"
-    assert softmax_nodes[0].shape == (4, 4), f"softmax shape wrong: {softmax_nodes[0].shape}"
-    assert softmax_nodes[0].attrs.get("axis") == 1, f"softmax axis wrong: {softmax_nodes[0].attrs}"
+    assert exp_nodes[0].shape == (4, 4), f"exp shape wrong: {exp_nodes[0].shape}"
+    assert reduce_sum_nodes[0].shape == (4, 1), f"reduce_sum shape wrong: {reduce_sum_nodes[0].shape}"
+    assert div_nodes[0].shape == (4, 4), f"div shape wrong: {div_nodes[0].shape}"
     assert matmuls[-1].shape == (4, 16), f"attention output shape wrong: {matmuls[-1].shape}"
     variants = nu_graph_generation_z3(G, verbose=False)
     assert len(variants) >= 1, "attention should emit at least one variant"
