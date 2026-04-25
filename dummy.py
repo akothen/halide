@@ -81,6 +81,25 @@ def _clear_synthesis_caches() -> None:
         _SYNTHESIS_CACHE_ALL.clear()
 
 
+def _start_kernel_synthesis_cache(
+    kernel_name: Optional[str] = None,
+    verbose: bool = False,
+) -> None:
+    """Reset synthesis caches for a new kernel-level lowering session.
+
+    Cache reuse is intentionally preserved across repeated tensor ops and graph
+    variants within a single kernel, but performance measurements should not be
+    biased by work performed for earlier kernels.  This helper clears the
+    caches once at the start of a kernel-level lowering run.
+    """
+    _clear_synthesis_caches()
+    if verbose:
+        if kernel_name is None:
+            print("[synthesis-cache] starting with an empty cache")
+        else:
+            print(f"[synthesis-cache] starting kernel '{kernel_name}' with an empty cache")
+
+
 def _effective_max_workers(max_workers: Optional[int], task_count: int) -> int:
     """Choose how many threads to launch for a pool of *task_count* items.
 
@@ -5042,8 +5061,14 @@ def lower_nu_graph_variants(
 ) -> list[Optional[nuGraph]]:
     """Lower every variant in *variants* to hardware ops.
 
-    Returns a list of the same length; entries that could not be lowered are None.
+    Starts from an empty synthesis cache for the variant set so performance for
+    one kernel is not affected by synthesis work done for earlier kernels, then
+    reuses synthesized tensor-op lowerings across the variants in *variants*.
+
+    Returns a list of the same length; entries that could not be lowered are
+    None.
     """
+    _start_kernel_synthesis_cache(verbose=verbose)
     return [
         lower_nu_graph(
             v,
@@ -5320,8 +5345,10 @@ def synthesize_hw_graph(
     """Generate all variant orderings of *G* and lower each to hw ops.
 
     Returns the list of successfully lowered hw graphs (duplicates removed by
-    graph signature).  Pass *verbose=True* to print all sketches evaluated
-    during synthesis for manual inspection.
+    graph signature).  The underlying variant-lowering pass starts from a fresh
+    synthesis cache for this kernel and then fills it while lowering its
+    variants.  Pass *verbose=True* to print all sketches evaluated during
+    synthesis for manual inspection.
     """
     variants = nu_graph_generation_z3(G)
     lowered = lower_nu_graph_variants(
@@ -7383,6 +7410,46 @@ def _test_lowering_cache_cross_variant_reuse() -> None:
     )
 
 
+def _test_lower_nu_graph_variants_starts_with_fresh_kernel_cache() -> None:
+    """A new kernel-level lowering run should clear stale cache entries first.
+
+    The cache should still fill during the run so variants of the same kernel
+    can reuse synthesized tensor-op lowerings, but unrelated entries left over
+    from a previous kernel must not survive into the next measurement.
+    """
+    G = build_kernel_matmul_red_div_graph(4, 8, 16)
+    variants = nu_graph_generation_z3(G, verbose=False)
+    assert len(variants) >= 2, "kernel_matmul_red_div should emit multiple variants"
+
+    stale_key = ("stale-kernel",)
+    with _SYNTHESIS_CACHE_LOCK:
+        _SYNTHESIS_CACHE[stale_key] = ("INPUT", 0)
+        _SYNTHESIS_CACHE_ALL[stale_key] = [("INPUT", 0)]
+
+    lowered = lower_nu_graph_variants(
+        variants[:2],
+        max_hw_size=2,
+        timeout=5000,
+        verbose=False,
+    )
+    assert builtins.all(g_hw is not None for g_hw in lowered), (
+        "lower_nu_graph_variants should still lower both variants successfully"
+    )
+
+    with _SYNTHESIS_CACHE_LOCK:
+        assert stale_key not in _SYNTHESIS_CACHE, (
+            "Kernel-level lowering should clear stale single-result cache entries first"
+        )
+        assert stale_key not in _SYNTHESIS_CACHE_ALL, (
+            "Kernel-level lowering should clear stale all-results cache entries first"
+        )
+        assert _SYNTHESIS_CACHE, (
+            "Kernel-level lowering should repopulate the cache as variants are synthesized"
+        )
+
+    print(" caching: lower_nu_graph_variants starts each kernel with an empty cache")
+
+
 def _test_lowering_cache_incompatible_key() -> None:
     """Different ops / attrs / input ranks must not share a cache entry."""
     x2 = SymTensor("x", rank=2)
@@ -7505,6 +7572,7 @@ def run_all_tests() -> None:
     _test_lowering_cache_repeated_node_in_graph()
     _test_lowering_cache_all_repeated_node_in_graph()
     _test_lowering_cache_cross_variant_reuse()
+    _test_lower_nu_graph_variants_starts_with_fresh_kernel_cache()
     _test_lowering_cache_incompatible_key()
     _test_lowering_cache_result_equivalence()
     print("\n================ RUNNING SYNTHESIZER TESTS =============")
@@ -7564,6 +7632,7 @@ if __name__ == "__main__":
         print("\n" + "=" * 80)
         print(f"Tracing kernel: {kname}")
         print("=" * 80)
+        _start_kernel_synthesis_cache(kernel_name=kname, verbose=True)
         G0 = builder(4, 8, 16)
         variants = nu_graph_generation_z3(G0, verbose=True)
 
