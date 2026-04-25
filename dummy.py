@@ -3183,6 +3183,9 @@ class DummyArray:
     def silu(self) -> "DummyArray":
         return DummyArray._from_op("silu", [self], self.shape)
 
+    def softmax(self, axis: int = -1) -> "DummyArray":
+        return DummyArray._from_op("softmax", [self], self.shape, {"axis": axis})
+
 
 @dataclass(eq=True, frozen=True)
 class NodeSig:
@@ -5767,6 +5770,22 @@ def kernel_silu_matmul(x: DummyArray, w: DummyArray) -> DummyArray:
     return x.silu() @ w
 
 
+def kernel_silu_mlp(x: DummyArray, w1: DummyArray, w2: DummyArray) -> DummyArray:
+    h = x @ w1
+    a = h.silu()
+    return a @ w2
+
+
+def kernel_attention(x: DummyArray, w_q: DummyArray, w_k: DummyArray, w_v: DummyArray) -> DummyArray:
+    q = x @ w_q
+    k = x @ w_k
+    v = x @ w_v
+    k_t = k.transpose()
+    qk = q @ k_t
+    softmax = qk.softmax(axis=1)
+    return softmax @ v
+
+
 def _graph_from_axon_array(out: DummyArray) -> nuGraph:
     G = nuGraph([Node(id=n.id, op=n.op, inputs=list(n.inputs), attrs=dict(n.attrs)) for n in out.nodes])
     annotate_shapes_concrete(G)
@@ -5821,6 +5840,20 @@ def build_kernel_relu_matmul_graph(M: int, K: int, N: int) -> nuGraph:
 
 def build_kernel_silu_matmul_graph(M: int, K: int, N: int) -> nuGraph:
     return _build_graph_from_kernel(kernel_silu_matmul, ("x", (M, K)), ("w", (K, N)))
+
+
+def build_kernel_silu_mlp_graph(M: int, K: int, N: int) -> nuGraph:
+    return _build_graph_from_kernel(kernel_silu_mlp, ("x", (M, K)), ("w1", (K, N)), ("w2", (N, N)))
+
+
+def build_kernel_attention_graph(M: int, K: int, N: int) -> nuGraph:
+    return _build_graph_from_kernel(
+        kernel_attention,
+        ("x", (M, K)),
+        ("w_q", (K, N)),
+        ("w_k", (K, N)),
+        ("w_v", (K, N)),
+    )
 
 
 def print_graph(G: nuGraph) -> None:
@@ -6003,6 +6036,37 @@ def _test_silu_matmul_graph() -> None:
     variants = nu_graph_generation_z3(G, verbose=False)
     assert len(variants) == 1, f"silu_matmul should not push silu past matmul, got {len(variants)} variants"
     assert graph_signature(variants[0]) == graph_signature(G)
+
+
+def _test_silu_mlp_graph() -> None:
+    G = build_kernel_silu_mlp_graph(4, 8, 16)
+    matmuls = _nodes_by_op(G, "matmul")
+    silu_nodes = _nodes_by_op(G, "silu")
+    assert len(matmuls) == 2, f"silu_mlp should have 2 matmul nodes, got {len(matmuls)}"
+    assert len(silu_nodes) == 1, f"silu_mlp should have 1 silu node, got {len(silu_nodes)}"
+    assert matmuls[0].shape == (4, 16), f"first matmul shape wrong: {matmuls[0].shape}"
+    assert silu_nodes[0].shape == (4, 16), f"silu shape wrong: {silu_nodes[0].shape}"
+    assert matmuls[1].shape == (4, 16), f"second matmul shape wrong: {matmuls[1].shape}"
+    variants = nu_graph_generation_z3(G, verbose=False)
+    assert len(variants) >= 1, "silu_mlp should emit at least one variant"
+    print(" silu_mlp graph builds and runs variant generation")
+
+
+def _test_attention_graph() -> None:
+    G = build_kernel_attention_graph(4, 8, 16)
+    matmuls = _nodes_by_op(G, "matmul")
+    transposes = _nodes_by_op(G, "transpose")
+    softmax_nodes = _nodes_by_op(G, "softmax")
+    assert len(matmuls) == 5, f"attention should have 5 matmul nodes, got {len(matmuls)}"
+    assert len(transposes) == 1, f"attention should have 1 transpose node, got {len(transposes)}"
+    assert len(softmax_nodes) == 1, f"attention should have 1 softmax node, got {len(softmax_nodes)}"
+    assert transposes[0].shape == (16, 4), f"k_t shape wrong: {transposes[0].shape}"
+    assert softmax_nodes[0].shape == (4, 4), f"softmax shape wrong: {softmax_nodes[0].shape}"
+    assert softmax_nodes[0].attrs.get("axis") == 1, f"softmax axis wrong: {softmax_nodes[0].attrs}"
+    assert matmuls[-1].shape == (4, 16), f"attention output shape wrong: {matmuls[-1].shape}"
+    variants = nu_graph_generation_z3(G, verbose=False)
+    assert len(variants) >= 1, "attention should emit at least one variant"
+    print(" attention graph builds and runs variant generation")
 
 
 def _test_print_graph_includes_symbolic_shapes() -> None:
@@ -7550,6 +7614,8 @@ def run_all_tests() -> None:
     _test_matmul_transpose_graph()
     _test_relu_matmul_graph()
     _test_silu_matmul_graph()
+    _test_silu_mlp_graph()
+    _test_attention_graph()
     _test_print_graph_includes_symbolic_shapes()
     _test_synthesis_prefers_direct_reduce_candidate()
     _test_synthesis_verbose_reports_candidate_count()
@@ -7626,6 +7692,8 @@ if __name__ == "__main__":
         ("kernel_matmul_transpose", build_kernel_matmul_transpose_graph),
         ("kernel_relu_matmul", build_kernel_relu_matmul_graph),
         ("kernel_silu_matmul", build_kernel_silu_matmul_graph),
+        ("kernel_silu_mlp", build_kernel_silu_mlp_graph),
+        ("kernel_attention", build_kernel_attention_graph),
     ]
 
     for kname, builder in kernels:
