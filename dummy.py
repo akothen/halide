@@ -48,6 +48,57 @@ _SEMANTICS_LOCK = Lock()
 _VERBOSE_LOCK = Lock()   # serializes verbose prints from concurrent synthesis threads
 _Z3_LOCK = RLock()       # serializes z3 formula construction (z3.main_ctx is not thread-safe)
 
+# ---------------------------------------------------------------------------
+# Synthesis result cache
+# ---------------------------------------------------------------------------
+# Normalized sketch representation: a pure-data tuple that does not hold any
+# SymTensor references, so it is safe to store across calls.
+#   ("INPUT", int)                      – leaf: which input index
+#   ("OP", str, dict, tuple[…, …])      – interior: op name, attrs, children
+_NormSketch = Any
+
+_CACHE_MISS: object = object()          # sentinel: key not yet cached
+
+# Single-result cache (used by _lower_node / lower_nu_graph).
+# Maps (op, frozen_attrs, input_ranks) → None (failure) | _NormSketch (success)
+_SYNTHESIS_CACHE: dict[tuple, Optional[_NormSketch]] = {}
+
+# All-results cache (used by _lower_node_all / lower_nu_graph_all_variants).
+# Maps same key → list[_NormSketch] (empty = all synthesis failed)
+_SYNTHESIS_CACHE_ALL: dict[tuple, list[_NormSketch]] = {}
+
+_SYNTHESIS_CACHE_LOCK = Lock()
+
+
+def _clear_synthesis_caches() -> None:
+    """Discard all cached synthesis results.
+
+    Intended for test isolation.  Calling this before a test that needs to
+    observe first-time synthesis (cache miss) ensures the caches start empty.
+    """
+    with _SYNTHESIS_CACHE_LOCK:
+        _SYNTHESIS_CACHE.clear()
+        _SYNTHESIS_CACHE_ALL.clear()
+
+
+def _start_kernel_synthesis_cache(
+    kernel_name: Optional[str] = None,
+    verbose: bool = False,
+) -> None:
+    """Reset synthesis caches for a new kernel-level lowering session.
+
+    Cache reuse is intentionally preserved across repeated tensor ops and graph
+    variants within a single kernel, but performance measurements should not be
+    biased by work performed for earlier kernels.  This helper clears the
+    caches once at the start of a kernel-level lowering run.
+    """
+    _clear_synthesis_caches()
+    if verbose:
+        if kernel_name is None:
+            print("[synthesis-cache] starting with an empty cache")
+        else:
+            print(f"[synthesis-cache] starting kernel '{kernel_name}' with an empty cache")
+
 
 def _effective_max_workers(max_workers: Optional[int], task_count: int) -> int:
     """Choose how many threads to launch for a pool of *task_count* items.
@@ -4530,6 +4581,82 @@ def _sketch_to_graph_nodes(
 
 
 # ---------------------------------------------------------------------------
+# Lowering cache helpers
+# ---------------------------------------------------------------------------
+
+def _make_lowering_cache_key(
+    op: str,
+    attrs: dict[str, Any],
+    input_syms: list["SymTensor"],
+) -> tuple:
+    """Return a hashable key that uniquely identifies a lowering problem.
+
+    The key is built from the target op name, sorted attribute repr pairs, and
+    the rank of each input tensor.  Concrete node IDs and z3 variable names are
+    deliberately excluded so that structurally identical operations encountered
+    in different graph variants (which may have different generated IDs) map to
+    the same key.
+    """
+    frozen_attrs = tuple(sorted((k, repr(v)) for k, v in attrs.items()))
+    input_ranks = tuple(s.rank for s in input_syms)
+    return (op, frozen_attrs, input_ranks)
+
+
+def _normalize_sketch(
+    sketch: "SketchNode",
+    input_syms: list["SymTensor"],
+) -> Optional[_NormSketch]:
+    """Convert a completed SketchNode into a sym-independent cached form.
+
+    INPUT leaves are replaced by ``("INPUT", i)`` where *i* is the position of
+    the leaf's SymTensor in *input_syms*.  Interior nodes retain their op name
+    and attrs but carry normalized children rather than live SketchNode objects.
+    Returns None if any INPUT leaf cannot be matched to *input_syms*.
+    """
+    if sketch.op == "INPUT":
+        for i, sym in enumerate(input_syms):
+            if sketch.sym is sym:
+                return ("INPUT", i)
+        return None
+    children: list[_NormSketch] = []
+    for child in sketch.children:
+        n = _normalize_sketch(child, input_syms)
+        if n is None:
+            return None
+        children.append(n)
+    # Strip the transient "name" attr so the normalized form is stable.
+    clean_attrs = {k: v for k, v in sketch.attrs.items() if k != "name"}
+    return ("OP", sketch.op, clean_attrs, tuple(children))
+
+
+def _denormalize_sketch(
+    norm: _NormSketch,
+    input_syms: list["SymTensor"],
+) -> Optional["SketchNode"]:
+    """Reconstruct a SketchNode from its normalized form, binding *input_syms*.
+
+    This is the inverse of *_normalize_sketch*: INPUT leaves are replaced by
+    fresh ``SketchNode.make_input(input_syms[i])`` nodes, so the reconstructed
+    sketch refers to the *new* input SymTensors rather than the ones that were
+    live when the sketch was first synthesized.
+    Returns None if any INPUT index is out of range.
+    """
+    if norm[0] == "INPUT":
+        idx = norm[1]
+        if idx < 0 or idx >= len(input_syms):
+            return None
+        return SketchNode.make_input(input_syms[idx])
+    _, op, attrs, children_norm = norm
+    children: list[SketchNode] = []
+    for cn in children_norm:
+        child = _denormalize_sketch(cn, input_syms)
+        if child is None:
+            return None
+        children.append(child)
+    return SketchNode.make_op(op, children, dict(attrs))
+
+
+# ---------------------------------------------------------------------------
 # Per-node lowering
 # ---------------------------------------------------------------------------
 
@@ -4544,8 +4671,46 @@ def _lower_node(
     """Try to synthesize a hw-only replacement for *node*.
 
     Returns (new_nodes, output_hw_id, output_hw_sym) on success, None otherwise.
+
+    Results are cached by a canonical key derived from (op, attrs, input ranks)
+    so that repeated encounters of the same operation – within a single graph or
+    across multiple graph variants – skip synthesis and reuse the stored sketch.
     """
     input_syms = [sym for sym, _ in hw_input_pairs]
+
+    # ------------------------------------------------------------------
+    # Cache look-up
+    # ------------------------------------------------------------------
+    cache_key = _make_lowering_cache_key(node.op, node.attrs, input_syms)
+    with _SYNTHESIS_CACHE_LOCK:
+        cached = _SYNTHESIS_CACHE.get(cache_key, _CACHE_MISS)
+
+    if cached is not _CACHE_MISS:
+        if cached is None:
+            # Cached failure
+            if verbose:
+                print(f"  => CACHE HIT (failure): op={node.op} for '{node.id}'")
+            return None
+        # Cached sketch: rebuild with the new input syms
+        rebuilt = _denormalize_sketch(cached, input_syms)
+        if rebuilt is not None:
+            if verbose:
+                print(f"  => CACHE HIT: {_format_sketch(rebuilt)} for '{node.id}' op={node.op}")
+            sym_to_node_id: dict[int, str] = {
+                id(sym): node_id for sym, node_id in hw_input_pairs
+            }
+            new_nodes: list[Node] = []
+            output_id = _sketch_to_graph_nodes(rebuilt, sym_to_node_id, new_nodes)
+            if output_id is not None:
+                output_sym = _eval_sketch(rebuilt)
+                if output_sym is not None:
+                    return new_nodes, output_id, output_sym
+        # If rebuilding failed (shouldn't happen in practice), fall through
+        # to fresh synthesis so we never silently return None from a hit.
+
+    # ------------------------------------------------------------------
+    # Cache miss – run synthesis
+    # ------------------------------------------------------------------
 
     # Build a LOCAL target sym from the hw inputs: this makes the equivalence
     # check purely local (e.g., nc_matmul(nc_transpose(t), w) ≡ matmul(t, w))
@@ -4574,10 +4739,19 @@ def _lower_node(
     if found is None:
         if verbose:
             print(f"  => FAILED: no hw equivalent found for '{node.id}' op={node.op}")
+        with _SYNTHESIS_CACHE_LOCK:
+            _SYNTHESIS_CACHE[cache_key] = None
         return None
 
     if verbose:
         print(f"  => FOUND: {_format_sketch(found)}")
+
+    # Store the normalized sketch in the cache before materializing graph nodes
+    # so that future calls with equivalent inputs can skip synthesis entirely.
+    norm = _normalize_sketch(found, input_syms)
+    if norm is not None:
+        with _SYNTHESIS_CACHE_LOCK:
+            _SYNTHESIS_CACHE[cache_key] = norm
 
     # Map each concrete input SymTensor to its hw node id
     sym_to_node_id: dict[int, str] = {
@@ -4611,8 +4785,54 @@ def _lower_node_all(
     sketch is found rather than stopping at the first.  Returns a (possibly
     empty) list of
     (new_nodes, output_hw_id, output_hw_sym) triples – one per valid sketch.
+
+    Results are cached by the same canonical key as *_lower_node* so that
+    repeated encounters of the same operation skip synthesis and re-materialise
+    the stored sketches with the new hw input SymTensors.
     """
     input_syms = [sym for sym, _ in hw_input_pairs]
+
+    # ------------------------------------------------------------------
+    # Cache look-up
+    # ------------------------------------------------------------------
+    cache_key = _make_lowering_cache_key(node.op, node.attrs, input_syms)
+    with _SYNTHESIS_CACHE_LOCK:
+        cached_all = _SYNTHESIS_CACHE_ALL.get(cache_key, _CACHE_MISS)
+
+    if cached_all is not _CACHE_MISS:
+        if not cached_all:
+            # Cached failure (empty list)
+            if verbose:
+                with _VERBOSE_LOCK:
+                    print(f"  => CACHE HIT (failure): op={node.op} for '{node.id}'")
+            return []
+        # Rebuild all sketches from the cached normalized forms
+        sym_to_node_id: dict[int, str] = {
+            id(sym): node_id for sym, node_id in hw_input_pairs
+        }
+        materialized_cached: list[tuple[list[Node], str, SymTensor]] = []
+        for norm in cached_all:
+            rebuilt = _denormalize_sketch(norm, input_syms)
+            if rebuilt is None:
+                continue
+            if verbose:
+                with _VERBOSE_LOCK:
+                    print(f"  => CACHE HIT: {_format_sketch(rebuilt)} for '{node.id}' op={node.op}")
+            new_nodes: list[Node] = []
+            output_id = _sketch_to_graph_nodes(rebuilt, sym_to_node_id, new_nodes)
+            if output_id is None:
+                continue
+            output_sym = _eval_sketch(rebuilt)
+            if output_sym is None:
+                continue
+            materialized_cached.append((new_nodes, output_id, output_sym))
+        if materialized_cached:
+            return materialized_cached
+        # Fall through to fresh synthesis if rebuilding failed unexpectedly.
+
+    # ------------------------------------------------------------------
+    # Cache miss – run synthesis
+    # ------------------------------------------------------------------
 
     local_target: Optional[SymTensor] = None
     try:
@@ -4640,6 +4860,8 @@ def _lower_node_all(
         if verbose:
             with _VERBOSE_LOCK:
                 print(f"  => FAILED: no hw equivalent found for '{node.id}' op={node.op}")
+        with _SYNTHESIS_CACHE_LOCK:
+            _SYNTHESIS_CACHE_ALL[cache_key] = []
         return []
 
     sym_to_node_id: dict[int, str] = {
@@ -4647,6 +4869,7 @@ def _lower_node_all(
     }
 
     materialized: list[tuple[SketchNode, list[Node], str, SymTensor]] = []
+    norms_to_cache: list[_NormSketch] = []
     for sketch in found_sketches:
         if verbose:
             with _VERBOSE_LOCK:
@@ -4659,6 +4882,18 @@ def _lower_node_all(
         if output_sym is None:
             continue
         materialized.append((sketch, new_nodes, output_id, output_sym))
+        norm = _normalize_sketch(sketch, input_syms)
+        if norm is not None:
+            norms_to_cache.append(norm)
+
+    # Store normalized sketches before sorting (sort order is deterministic)
+    if norms_to_cache:
+        with _SYNTHESIS_CACHE_LOCK:
+            _SYNTHESIS_CACHE_ALL[cache_key] = norms_to_cache
+    elif found_sketches:
+        # All found sketches failed to materialize / normalize – treat as failure
+        with _SYNTHESIS_CACHE_LOCK:
+            _SYNTHESIS_CACHE_ALL[cache_key] = []
 
     materialized.sort(
         key=lambda item: (
@@ -4826,8 +5061,14 @@ def lower_nu_graph_variants(
 ) -> list[Optional[nuGraph]]:
     """Lower every variant in *variants* to hardware ops.
 
-    Returns a list of the same length; entries that could not be lowered are None.
+    Starts from an empty synthesis cache for the variant set so performance for
+    one kernel is not affected by synthesis work done for earlier kernels, then
+    reuses synthesized tensor-op lowerings across the variants in *variants*.
+
+    Returns a list of the same length; entries that could not be lowered are
+    None.
     """
+    _start_kernel_synthesis_cache(verbose=verbose)
     return [
         lower_nu_graph(
             v,
@@ -5104,8 +5345,10 @@ def synthesize_hw_graph(
     """Generate all variant orderings of *G* and lower each to hw ops.
 
     Returns the list of successfully lowered hw graphs (duplicates removed by
-    graph signature).  Pass *verbose=True* to print all sketches evaluated
-    during synthesis for manual inspection.
+    graph signature).  The underlying variant-lowering pass starts from a fresh
+    synthesis cache for this kernel and then fills it while lowering its
+    variants.  Pass *verbose=True* to print all sketches evaluated during
+    synthesis for manual inspection.
     """
     variants = nu_graph_generation_z3(G)
     lowered = lower_nu_graph_variants(
@@ -6893,6 +7136,408 @@ def _test_lower_node_all_prefers_shape_exact_div_canonical() -> None:
     print(" lowering: canonical div alternative preserves the exact target shape")
 
 
+# ---------------------------------------------------------------------------
+# Caching tests
+# ---------------------------------------------------------------------------
+
+def _test_lowering_cache_key_derivation() -> None:
+    """Unit test: _make_lowering_cache_key returns distinct keys for distinct
+    problems and equal keys for structurally identical problems."""
+    x_sym = SymTensor("x", rank=2)
+    y_sym = SymTensor("y", rank=2)
+    w_sym = SymTensor("w", rank=2)
+
+    # Same op/attrs/input-ranks → same key regardless of variable names.
+    key1 = _make_lowering_cache_key("reduce_sum", {"axis": 1, "keep_dims": True}, [x_sym])
+    key2 = _make_lowering_cache_key("reduce_sum", {"axis": 1, "keep_dims": True}, [y_sym])
+    assert key1 == key2, (
+        "Cache keys for reduce_sum with identical attrs and same input rank "
+        "must be equal even when symbolic variable names differ"
+    )
+
+    # Different axis → different key.
+    key3 = _make_lowering_cache_key("reduce_sum", {"axis": 0, "keep_dims": True}, [x_sym])
+    assert key1 != key3, "Cache keys must differ when attrs differ (axis=1 vs axis=0)"
+
+    # Different op → different key.
+    key4 = _make_lowering_cache_key("matmul", {"axis": 1, "keep_dims": True}, [x_sym])
+    assert key1 != key4, "Cache keys must differ when the op differs"
+
+    # Different number of inputs → different key.
+    key5 = _make_lowering_cache_key("reduce_sum", {"axis": 1, "keep_dims": True}, [x_sym, y_sym])
+    assert key1 != key5, "Cache keys must differ when the number of inputs differs"
+
+    # Different input rank → different key.
+    z_rank3 = SymTensor("z", rank=3)
+    key6 = _make_lowering_cache_key("reduce_sum", {"axis": 1, "keep_dims": True}, [z_rank3])
+    assert key1 != key6, "Cache keys must differ when input ranks differ"
+
+    # Two-input key is stable across different sym names.
+    key_mm_1 = _make_lowering_cache_key("matmul", {}, [x_sym, w_sym])
+    key_mm_2 = _make_lowering_cache_key("matmul", {}, [y_sym, w_sym])
+    assert key_mm_1 == key_mm_2, (
+        "Two-input matmul key must be equal regardless of sym variable names"
+    )
+    print(" caching: _make_lowering_cache_key distinguishes all expected problem variants")
+
+
+def _test_lowering_cache_normalize_denormalize() -> None:
+    """Unit test: _normalize_sketch / _denormalize_sketch round-trip."""
+    sym0 = SymTensor("in0", rank=2)
+    sym1 = SymTensor("in1", rank=2)
+    input_syms = [sym0, sym1]
+
+    # Build: nc_matmul(transpose(IN:sym0), IN:sym1)
+    leaf0 = SketchNode.make_input(sym0)
+    leaf1 = SketchNode.make_input(sym1)
+    inner = SketchNode.make_op("transpose", [leaf0], {})
+    outer = SketchNode.make_op("nc_matmul", [inner, leaf1], {})
+
+    norm = _normalize_sketch(outer, input_syms)
+    assert norm is not None, "_normalize_sketch returned None for a valid sketch"
+    assert norm == ("OP", "nc_matmul", {}, (
+        ("OP", "transpose", {}, (("INPUT", 0),)),
+        ("INPUT", 1),
+    )), f"Unexpected normalized form: {norm}"
+
+    # Round-trip with original syms
+    rebuilt = _denormalize_sketch(norm, input_syms)
+    assert rebuilt is not None, "_denormalize_sketch returned None"
+    assert rebuilt.op == "nc_matmul", f"Expected nc_matmul, got {rebuilt.op}"
+    assert rebuilt.children[0].op == "transpose"
+    assert rebuilt.children[0].children[0].op == "INPUT"
+    assert rebuilt.children[0].children[0].sym is sym0
+    assert rebuilt.children[1].op == "INPUT"
+    assert rebuilt.children[1].sym is sym1
+
+    # Round-trip with DIFFERENT syms (simulates cache reuse in another variant)
+    new_sym0 = SymTensor("x_v2", rank=2)
+    new_sym1 = SymTensor("w_v2", rank=2)
+    rebuilt2 = _denormalize_sketch(norm, [new_sym0, new_sym1])
+    assert rebuilt2 is not None, "_denormalize_sketch returned None for new syms"
+    assert rebuilt2.children[0].children[0].sym is new_sym0, (
+        "Rebuilt sketch must bind the new input sym at index 0"
+    )
+    assert rebuilt2.children[1].sym is new_sym1, (
+        "Rebuilt sketch must bind the new input sym at index 1"
+    )
+
+    # Out-of-range index returns None
+    bad = _denormalize_sketch(("INPUT", 5), [sym0])
+    assert bad is None, "Out-of-range INPUT index should return None"
+
+    print(" caching: _normalize_sketch / _denormalize_sketch round-trip correctly")
+
+
+def _test_lowering_cache_repeated_node_in_graph() -> None:
+    """A graph with two structurally identical synthesis nodes should populate
+    the cache on the first synthesis and reuse it on the second.
+
+    We build a graph where x and y both undergo the same reduce_sum (axis=1,
+    keep_dims=True) and verify:
+      1. Both nodes lower successfully.
+      2. After lowering the cache contains the expected key.
+      3. Re-running the lowering with a different pair of same-rank inputs
+         produces a cache hit (not a fresh synthesis run).
+    """
+    def kernel_dual_reduce(x, y):
+        return x.sum(axis=1, keep_dims=True) + y.sum(axis=1, keep_dims=True)
+
+    G = _build_graph_from_kernel(
+        kernel_dual_reduce,
+        ("x", (4, 8)),
+        ("y", (4, 8)),
+    )
+
+    # Ensure there are two reduce_sum nodes (the kernel above must produce them)
+    reduce_nodes = _nodes_by_op(G, "reduce_sum")
+    assert len(reduce_nodes) >= 2, (
+        f"Expected >= 2 reduce_sum nodes in dual-reduce graph, got {len(reduce_nodes)}"
+    )
+
+    # Clear caches so this test is not influenced by earlier test runs.
+    _clear_synthesis_caches()
+
+    G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000, verbose=False)
+    assert G_hw is not None, "lower_nu_graph returned None for dual-reduce kernel"
+    assert _graph_uses_hw_only(G_hw), (
+        "Lowered dual-reduce graph still contains public ops"
+    )
+
+    # The reduce_sum key should now be in the cache.
+    first_reduce = reduce_nodes[0]
+    orig_syms = _graph_symbolic_tensors(G)
+    inp_sym = orig_syms[first_reduce.inputs[0]]
+    expected_key = _make_lowering_cache_key(
+        first_reduce.op, first_reduce.attrs, [inp_sym]
+    )
+    with _SYNTHESIS_CACHE_LOCK:
+        cached = _SYNTHESIS_CACHE.get(expected_key, _CACHE_MISS)
+    assert cached is not _CACHE_MISS, (
+        "Cache should contain an entry for reduce_sum after lowering"
+    )
+    assert cached is not None, (
+        "Cached entry for reduce_sum must be a successful result, not None"
+    )
+
+    # Run a second lowering with fresh symbolic inputs of the same rank.
+    # The second call should hit the cache (same key) and produce a valid result.
+    new_sym = SymTensor("p", rank=2)
+    fake_node = Node(id="reduce_sum_test", op=first_reduce.op,
+                     inputs=["p"], attrs=dict(first_reduce.attrs))
+    fake_target = _sym_expr_from_graph_node(fake_node, [new_sym])
+    result = _lower_node(
+        fake_node, fake_target,
+        [(new_sym, "p")],
+        max_hw_size=2, timeout=5000,
+    )
+    assert result is not None, (
+        "Second _lower_node call (expected cache hit) returned None"
+    )
+    new_nodes, output_id, output_sym = result
+    assert output_sym is not None, "Output sym must not be None on cache hit"
+
+    print(" caching: repeated reduce_sum node hits the cache and returns a valid result")
+
+
+def _test_lowering_cache_all_repeated_node_in_graph() -> None:
+    """_lower_node_all should also populate and reuse _SYNTHESIS_CACHE_ALL."""
+    def kernel_dual_reduce(x, y):
+        return x.sum(axis=1, keep_dims=True) + y.sum(axis=1, keep_dims=True)
+
+    G = _build_graph_from_kernel(
+        kernel_dual_reduce,
+        ("x", (4, 8)),
+        ("y", (4, 8)),
+    )
+    reduce_nodes = _nodes_by_op(G, "reduce_sum")
+    assert reduce_nodes, "Expected at least one reduce_sum node"
+    first_reduce = reduce_nodes[0]
+    orig_syms = _graph_symbolic_tensors(G)
+
+    _clear_synthesis_caches()
+
+    inp_sym = orig_syms[first_reduce.inputs[0]]
+    alts1 = _lower_node_all(
+        first_reduce,
+        orig_syms[first_reduce.id],
+        [(inp_sym, first_reduce.inputs[0])],
+        max_hw_size=2,
+        timeout=5000,
+        verbose=False,
+        max_workers=None,
+    )
+    assert alts1, "_lower_node_all returned no alternatives for reduce_sum"
+
+    expected_key = _make_lowering_cache_key(
+        first_reduce.op, first_reduce.attrs, [inp_sym]
+    )
+    with _SYNTHESIS_CACHE_LOCK:
+        cached_all = _SYNTHESIS_CACHE_ALL.get(expected_key, _CACHE_MISS)
+    assert cached_all is not _CACHE_MISS, (
+        "SYNTHESIS_CACHE_ALL should contain an entry for reduce_sum after _lower_node_all"
+    )
+    assert cached_all, "Cached all-alternatives must be non-empty"
+
+    # Second call with a fresh sym of the same rank → should use the cache.
+    new_sym = SymTensor("q", rank=2)
+    fake_node2 = Node(id="reduce_sum_test2", op=first_reduce.op,
+                      inputs=["q"], attrs=dict(first_reduce.attrs))
+    fake_target2 = _sym_expr_from_graph_node(fake_node2, [new_sym])
+    alts2 = _lower_node_all(
+        fake_node2, fake_target2,
+        [(new_sym, "q")],
+        max_hw_size=2,
+        timeout=5000,
+        verbose=False,
+    )
+    assert alts2, "Cache-hit _lower_node_all returned no alternatives"
+    assert len(alts2) == len(alts1), (
+        f"Cache hit must return same number of alternatives as original synthesis "
+        f"(got {len(alts2)}, expected {len(alts1)})"
+    )
+
+    print(" caching: _lower_node_all populates and reuses SYNTHESIS_CACHE_ALL correctly")
+
+
+def _test_lowering_cache_cross_variant_reuse() -> None:
+    """Lower two variants of the same graph; the second variant should reuse
+    cached sketches produced while lowering the first variant.
+
+    We verify that (a) both variants lower successfully, (b) they produce
+    hw-only graphs, and (c) the cache is populated after the first variant so
+    the second variant does not re-run synthesis from scratch.
+    """
+    G = build_kernel_matmul_red_div_graph(4, 8, 16)
+    variants = nu_graph_generation_z3(G, verbose=False)
+    assert len(variants) >= 2, (
+        f"kernel_matmul_red_div should have >= 2 variants, got {len(variants)}"
+    )
+
+    _clear_synthesis_caches()
+
+    # Lower the first variant; this populates the cache.
+    G_hw0 = lower_nu_graph(variants[0], max_hw_size=2, timeout=5000, verbose=False)
+    assert G_hw0 is not None, "lower_nu_graph failed for variant 0"
+    assert _graph_uses_hw_only(G_hw0), "Variant 0 still has public ops after lowering"
+
+    # The cache should now contain entries for ops in the first variant.
+    with _SYNTHESIS_CACHE_LOCK:
+        cache_size_after_v0 = len(_SYNTHESIS_CACHE)
+    assert cache_size_after_v0 > 0, "Cache should be non-empty after lowering variant 0"
+
+    # Lower the second variant; synthesis should be served from the cache.
+    G_hw1 = lower_nu_graph(variants[1], max_hw_size=2, timeout=5000, verbose=False)
+    assert G_hw1 is not None, (
+        "lower_nu_graph failed for variant 1 (cache-hit path)"
+    )
+    assert _graph_uses_hw_only(G_hw1), (
+        "Variant 1 still has public ops after lowering (cache-hit path)"
+    )
+
+    # The cache should not have grown substantially when lowering the second
+    # variant (all keys should already be present from variant 0).
+    with _SYNTHESIS_CACHE_LOCK:
+        cache_size_after_v1 = len(_SYNTHESIS_CACHE)
+    assert cache_size_after_v1 == cache_size_after_v0, (
+        f"Cache grew from {cache_size_after_v0} to {cache_size_after_v1} entries "
+        f"when lowering variant 1 – expected reuse of cached sketches, not new synthesis"
+    )
+
+    print(
+        f" caching: cross-variant reuse – lowered 2 variants with "
+        f"{cache_size_after_v0} cached synthesis result(s), no new synthesis on variant 1"
+    )
+
+
+def _test_lower_nu_graph_variants_starts_with_fresh_kernel_cache() -> None:
+    """A new kernel-level lowering run should clear stale cache entries first.
+
+    The cache should still fill during the run so variants of the same kernel
+    can reuse synthesized tensor-op lowerings, but unrelated entries left over
+    from a previous kernel must not survive into the next measurement.
+    """
+    G = build_kernel_matmul_red_div_graph(4, 8, 16)
+    variants = nu_graph_generation_z3(G, verbose=False)
+    assert len(variants) >= 2, "kernel_matmul_red_div should emit multiple variants"
+
+    stale_key = ("stale-kernel",)
+    with _SYNTHESIS_CACHE_LOCK:
+        _SYNTHESIS_CACHE[stale_key] = ("INPUT", 0)
+        _SYNTHESIS_CACHE_ALL[stale_key] = [("INPUT", 0)]
+
+    lowered = lower_nu_graph_variants(
+        variants[:2],
+        max_hw_size=2,
+        timeout=5000,
+        verbose=False,
+    )
+    assert builtins.all(g_hw is not None for g_hw in lowered), (
+        "lower_nu_graph_variants should still lower both variants successfully"
+    )
+
+    with _SYNTHESIS_CACHE_LOCK:
+        assert stale_key not in _SYNTHESIS_CACHE, (
+            "Kernel-level lowering should clear stale single-result cache entries first"
+        )
+        assert stale_key not in _SYNTHESIS_CACHE_ALL, (
+            "Kernel-level lowering should clear stale all-results cache entries first"
+        )
+        assert _SYNTHESIS_CACHE, (
+            "Kernel-level lowering should repopulate the cache as variants are synthesized"
+        )
+
+    print(" caching: lower_nu_graph_variants starts each kernel with an empty cache")
+
+
+def _test_lowering_cache_incompatible_key() -> None:
+    """Different ops / attrs / input ranks must not share a cache entry."""
+    x2 = SymTensor("x", rank=2)
+    x3 = SymTensor("x", rank=3)
+    y2 = SymTensor("y", rank=2)
+
+    # Different ops
+    k1 = _make_lowering_cache_key("reduce_sum", {"axis": 1}, [x2])
+    k2 = _make_lowering_cache_key("matmul", {"axis": 1}, [x2, y2])
+    assert k1 != k2, "reduce_sum and matmul must have distinct cache keys"
+
+    # Same op, different attrs
+    k3 = _make_lowering_cache_key("reduce_sum", {"axis": 0}, [x2])
+    k4 = _make_lowering_cache_key("reduce_sum", {"axis": 1}, [x2])
+    assert k3 != k4, "reduce_sum with axis=0 and axis=1 must have distinct keys"
+
+    # Same op/attrs, different input rank
+    k5 = _make_lowering_cache_key("reduce_sum", {"axis": 1}, [x2])
+    k6 = _make_lowering_cache_key("reduce_sum", {"axis": 1}, [x3])
+    assert k5 != k6, "reduce_sum on rank-2 vs rank-3 input must have distinct keys"
+
+    print(" caching: incompatible lowering problems have distinct cache keys")
+
+
+def _test_lowering_cache_result_equivalence() -> None:
+    """Cached lowering result must be semantically equivalent to the original.
+
+    We lower the same operation twice (with different generated node IDs but
+    identical op/attrs/ranks), clearing the cache in between to get a fresh
+    synthesis for comparison.  Both results must be individually equivalent to
+    the original target expression.
+    """
+    def kernel_single_reduce(x):
+        return x.sum(axis=1, keep_dims=True)
+
+    G = _build_graph_from_kernel(
+        kernel_single_reduce,
+        ("x", (4, 8)),
+    )
+    reduce_nodes = _nodes_by_op(G, "reduce_sum")
+    assert reduce_nodes, "Expected at least one reduce_sum node"
+    reduce_node = reduce_nodes[0]
+    orig_syms = _graph_symbolic_tensors(G)
+    inp_sym = orig_syms[reduce_node.inputs[0]]
+
+    # --- First lowering (fresh synthesis) ---
+    _clear_synthesis_caches()
+    result1 = _lower_node(
+        reduce_node,
+        orig_syms[reduce_node.id],
+        [(inp_sym, reduce_node.inputs[0])],
+        max_hw_size=2,
+        timeout=5000,
+    )
+    assert result1 is not None, "First _lower_node call failed"
+    _, _, out_sym1 = result1
+
+    # Verify the first result is equivalent to the target.
+    target_sym = orig_syms[reduce_node.id]
+    assert _check_equivalent_quiet(target_sym, out_sym1, timeout=15000), (
+        "First (non-cached) lowering result is not equivalent to the target"
+    )
+
+    # --- Second lowering with a fresh sym of same rank (should hit cache) ---
+    new_sym = SymTensor("x_fresh", rank=2)
+    fake_node = Node(id="reduce_fresh", op=reduce_node.op,
+                     inputs=["x_fresh"], attrs=dict(reduce_node.attrs))
+    new_target = _sym_expr_from_graph_node(fake_node, [new_sym])
+    result2 = _lower_node(
+        fake_node, new_target,
+        [(new_sym, "x_fresh")],
+        max_hw_size=2,
+        timeout=5000,
+    )
+    assert result2 is not None, "Second _lower_node call (cache-hit path) failed"
+    _, _, out_sym2 = result2
+
+    # The cache-hit result must be equivalent to the new target expression.
+    assert _check_equivalent_quiet(new_target, out_sym2, timeout=15000), (
+        "Cached lowering result is not equivalent to the (new-sym) target expression"
+    )
+
+    print(
+        " caching: cached lowering result is semantically equivalent "
+        "to the original target expression"
+    )
+
+
 def run_all_tests() -> None:
     print("\n================ RUNNING NU-GRAPH TESTS ================")
     _test_expected_variant_counts()
@@ -6922,6 +7567,14 @@ def run_all_tests() -> None:
     _test_invoke_hw_op_tensor_reduce_preserves_reduced_shape()
     _test_lower_nu_graph_parallel_levels()
     _test_lower_node_all_prefers_shape_exact_div_canonical()
+    _test_lowering_cache_key_derivation()
+    _test_lowering_cache_normalize_denormalize()
+    _test_lowering_cache_repeated_node_in_graph()
+    _test_lowering_cache_all_repeated_node_in_graph()
+    _test_lowering_cache_cross_variant_reuse()
+    _test_lower_nu_graph_variants_starts_with_fresh_kernel_cache()
+    _test_lowering_cache_incompatible_key()
+    _test_lowering_cache_result_equivalence()
     print("\n================ RUNNING SYNTHESIZER TESTS =============")
     _test_synthesizer_matmul_red_div()
     _test_synthesizer_rmsnorm_matmul()
@@ -6979,6 +7632,7 @@ if __name__ == "__main__":
         print("\n" + "=" * 80)
         print(f"Tracing kernel: {kname}")
         print("=" * 80)
+        _start_kernel_synthesis_cache(kernel_name=kname, verbose=True)
         G0 = builder(4, 8, 16)
         variants = nu_graph_generation_z3(G0, verbose=True)
 
