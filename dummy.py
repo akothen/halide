@@ -5338,7 +5338,7 @@ def lower_nu_graph_all_variants(
     return results
 
 
-def _print_phase_variants(phase_name: str, graphs: list[nuGraph]) -> None:
+def _print_synthesis_phase_variants(phase_name: str, graphs: list[nuGraph]) -> None:
     """Print the current synthesized graph variants for one pipeline phase."""
     print(f"[synthesize_hw_graph] {phase_name}: {len(graphs)} variant(s)")
     for idx, graph in enumerate(graphs):
@@ -5372,7 +5372,7 @@ def synthesize_hw_graph(
     # ------------------------------------------------------------------
     variants = nu_graph_generation_z3(G)
     if verbose:
-        _print_phase_variants("pre-lowering", variants)
+        _print_synthesis_phase_variants("pre-lowering", variants)
     lowered = lower_nu_graph_variants(
         variants,
         max_hw_size=max_hw_size,
@@ -5391,23 +5391,23 @@ def synthesize_hw_graph(
         seen.add(sig)
         results.append(g_hw)
     if verbose:
-        _print_phase_variants("post-lowering", results)
+        _print_synthesis_phase_variants("post-lowering", results)
 
     # ------------------------------------------------------------------
     # Phase 2: post-lowering node-swap variant generation on hw graphs
     # ------------------------------------------------------------------
     # Iterate over a snapshot of Phase-1 results so that any graphs added
     # during Phase 2 are not themselves re-processed in this loop.
-    phase2_new: list[nuGraph] = []
+    phase2_variants: list[nuGraph] = []
     for g_hw in list(results):
         for g_hw_variant in nu_graph_generation_z3(g_hw):
             sig = graph_signature(g_hw_variant)
             if sig not in seen:
                 seen.add(sig)
-                phase2_new.append(g_hw_variant)
-    results.extend(phase2_new)
+                phase2_variants.append(g_hw_variant)
+    results.extend(phase2_variants)
     if verbose:
-        _print_phase_variants("post-swap/propagation", results)
+        _print_synthesis_phase_variants("post-swap/propagation", results)
 
     return results
 
@@ -6148,7 +6148,10 @@ def _test_print_graph_groups_nodes_by_topological_level() -> None:
 
     assert x_idx < mul_idx, "Expected input x to print before derived nodes"
     assert y_idx < mul_idx, "Expected input y to print before derived nodes"
-    assert w_idx < mul_idx, "Expected late-declared input w to print before derived nodes"
+    assert w_idx < mul_idx, (
+        "Expected input w, which appears later in G.nodes storage order, "
+        "to print before derived nodes"
+    )
     print(" print_graph: groups nodes by topological level for readability")
 
 
