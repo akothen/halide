@@ -5904,7 +5904,8 @@ def print_graph(G: nuGraph) -> None:
     except (KeyError, z3.Z3Exception):
         symbolic_shapes = {}
         sym_shape_fallback = "unavailable"
-    for i, n in enumerate(G.nodes):
+    ordered_nodes = [node for level in _build_dag_levels(G) for node in level]
+    for i, n in enumerate(ordered_nodes):
         sym_shape = symbolic_shapes.get(n.id)
         sym_shape_str = _format_shape(sym_shape) if sym_shape is not None else sym_shape_fallback
         print(
@@ -6130,6 +6131,25 @@ def _test_print_graph_includes_symbolic_shapes() -> None:
     assert "sym_shape=(x_d0, x_d1)" in x_line
     assert "shape=(4, 16)" in out_line
     assert "sym_shape=(x_d0, w_d1)" in out_line
+
+
+def _test_print_graph_groups_nodes_by_topological_level() -> None:
+    G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        print_graph(G)
+    out = buf.getvalue()
+    lines = out.splitlines()
+
+    x_idx = next(i for i, line in enumerate(lines) if "id=x" in line and "op=input" in line)
+    y_idx = next(i for i, line in enumerate(lines) if "id=y" in line and "op=input" in line)
+    w_idx = next(i for i, line in enumerate(lines) if "id=w" in line and "op=input" in line)
+    mul_idx = next(i for i, line in enumerate(lines) if "id=mul_" in line and "op=mul" in line)
+
+    assert x_idx < mul_idx, "Expected input x to print before derived nodes"
+    assert y_idx < mul_idx, "Expected input y to print before derived nodes"
+    assert w_idx < mul_idx, "Expected late-declared input w to print before derived nodes"
+    print(" print_graph: groups nodes by topological level for readability")
 
 
 def _test_synthesis_prefers_direct_reduce_candidate() -> None:
@@ -7850,6 +7870,7 @@ def run_all_tests() -> None:
     _test_silu_mlp_graph()
     _test_attention_graph()
     _test_print_graph_includes_symbolic_shapes()
+    _test_print_graph_groups_nodes_by_topological_level()
     _test_synthesis_prefers_direct_reduce_candidate()
     _test_synthesis_verbose_reports_candidate_count()
     _test_synthesis_auto_maximizes_sketch_workers()
