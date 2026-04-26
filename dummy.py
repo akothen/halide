@@ -5388,11 +5388,11 @@ def synthesize_hw_graph(
     # during Phase 2 are not themselves re-processed in this loop.
     phase2_new: list[nuGraph] = []
     for g_hw in list(results):
-        for g_sw in nu_graph_generation_z3(g_hw):
-            sig = graph_signature(g_sw)
+        for g_hw_variant in nu_graph_generation_z3(g_hw):
+            sig = graph_signature(g_hw_variant)
             if sig not in seen:
                 seen.add(sig)
-                phase2_new.append(g_sw)
+                phase2_new.append(g_hw_variant)
     results.extend(phase2_new)
 
     return results
