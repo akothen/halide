@@ -5338,6 +5338,13 @@ def lower_nu_graph_all_variants(
     return results
 
 
+def _print_phase_variants(phase_name: str, graphs: list[nuGraph]) -> None:
+    print(f"[synthesize_hw_graph] {phase_name}: {len(graphs)} variant(s)")
+    for idx, graph in enumerate(graphs):
+        print(f"  --- {phase_name} variant {idx} ---")
+        print_graph(graph)
+
+
 def synthesize_hw_graph(
     G: nuGraph,
     max_hw_size: int = 2,
@@ -5359,12 +5366,6 @@ def synthesize_hw_graph(
     *verbose=True* to print all sketches evaluated during synthesis for manual
     inspection.
     """
-    def _print_phase_variants(phase_name: str, graphs: list[nuGraph]) -> None:
-        print(f"[synthesize_hw_graph] {phase_name}: {len(graphs)} variant(s)")
-        for idx, graph in enumerate(graphs):
-            print(f"  --- {phase_name} variant {idx} ---")
-            print_graph(graph)
-
     # ------------------------------------------------------------------
     # Phase 1: variant generation + lowering of the original graph
     # ------------------------------------------------------------------
@@ -7705,17 +7706,17 @@ def _test_synthesize_hw_graph_post_lowering_swap_variants() -> None:
     # --------------------------------------------------------------------------
     hw_gen_call_sigs: list[str] = []
 
-    def _mocked_nu_gen(G_arg: nuGraph, verbose: bool = False) -> list[nuGraph]:
-        sig = graph_signature(G_arg)
+    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False) -> list[nuGraph]:
+        sig = graph_signature(graph)
         if sig == sig_original:
-            return [G_arg]          # Phase-1: one variant (the original graph)
+            return [graph]          # Phase-1: one variant (the original graph)
         # Phase-2: called on a lowered hw graph.
         hw_gen_call_sigs.append(sig)
         if sig == sig_a:
             return [hw_graph_a, hw_extra]
         if sig == sig_b:
             return [hw_graph_b]
-        return [G_arg]
+        return [graph]
 
     # Mock lower_nu_graph_variants to return two predefined hw graphs.
     def _mocked_lower(variants, max_hw_size=2, timeout=3000,
@@ -7796,15 +7797,15 @@ def _test_synthesize_hw_graph_verbose_prints_phase_variants() -> None:
     sig_lowered_a = graph_signature(lowered_a)
     sig_lowered_b = graph_signature(lowered_b)
 
-    def _mocked_nu_gen(G_arg: nuGraph, verbose: bool = False) -> list[nuGraph]:
-        sig = graph_signature(G_arg)
+    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False) -> list[nuGraph]:
+        sig = graph_signature(graph)
         if sig == sig_original:
-            return [G_arg, phase1_variant]
+            return [graph, phase1_variant]
         if sig == sig_lowered_a:
             return [lowered_a, phase2_extra]
         if sig == sig_lowered_b:
             return [lowered_b]
-        return [G_arg]
+        return [graph]
 
     def _mocked_lower(variants, max_hw_size=2, timeout=3000,
                       verbose=False, max_workers=None):
