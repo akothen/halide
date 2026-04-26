@@ -5339,7 +5339,11 @@ def lower_nu_graph_all_variants(
 
 
 def _print_synthesis_phase_variants(phase_name: str, graphs: list[nuGraph]) -> None:
-    """Print the current synthesized graph variants for one pipeline phase."""
+    """Print synthesized graph variants for one named phase of the pipeline.
+
+    Intended for the phase boundaries in ``synthesize_hw_graph`` such as
+    pre-lowering, post-lowering, and post-swap/propagation.
+    """
     print(f"[synthesize_hw_graph] {phase_name}: {len(graphs)} variant(s)")
     for idx, graph in enumerate(graphs):
         print(f"  --- {phase_name} variant {idx} ---")
@@ -5904,8 +5908,8 @@ def print_graph(G: nuGraph) -> None:
     except (KeyError, z3.Z3Exception):
         symbolic_shapes = {}
         sym_shape_fallback = "unavailable"
-    ordered_nodes = [node for level in _build_dag_levels(G) for node in level]
-    for i, n in enumerate(ordered_nodes):
+    topologically_ordered_nodes = [node for level in _build_dag_levels(G) for node in level]
+    for i, n in enumerate(topologically_ordered_nodes):
         sym_shape = symbolic_shapes.get(n.id)
         sym_shape_str = _format_shape(sym_shape) if sym_shape is not None else sym_shape_fallback
         print(
