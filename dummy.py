@@ -7854,24 +7854,23 @@ if __name__ == "__main__":
         print("=" * 80)
         _start_kernel_synthesis_cache(kernel_name=kname, verbose=True)
         G0 = builder(4, 8, 16)
-        variants = nu_graph_generation_z3(G0, verbose=True)
-
-        print(f"Found {len(variants)} variant(s) for {kname}\n")
-        for vi, gv in enumerate(variants):
-            print(f"=== {kname} :: Variant {vi} ===")
-            print_graph(gv)
-            print()
-            print(f"--- {kname} :: Variant {vi} :: Lowering to hardware "
-                  f"(all sketches, node- & sketch-level parallel) ---")
-            hw_variants = lower_nu_graph_all_variants(
-                gv, max_hw_size=2, timeout=3000, verbose=True,
-                max_workers=args.max_workers)
-            if not hw_variants:
-                print(f"  [lowering failed for variant {vi}]")
-            else:
-                print(f"--- {kname} :: Variant {vi} :: "
-                      f"{len(hw_variants)} lowered hw graph(s) ---")
-                for hi, g_hw in enumerate(hw_variants):
-                    print(f"  +-- hw variant {hi} ---")
-                    print_graph(g_hw)
-            print()
+        print(f"=== {kname} :: Original graph ===")
+        print_graph(G0)
+        print()
+        print(f"--- {kname} :: synthesize_hw_graph "
+              f"(all variants, including post-lowering hw swaps) ---")
+        hw_variants = synthesize_hw_graph(
+            G0,
+            max_hw_size=2,
+            timeout=3000,
+            verbose=True,
+            max_workers=args.max_workers,
+        )
+        if not hw_variants:
+            print(f"  [synthesis failed for {kname}]")
+        else:
+            print(f"--- {kname} :: {len(hw_variants)} synthesized hw graph(s) ---")
+            for hi, g_hw in enumerate(hw_variants):
+                print(f"  +-- hw variant {hi} ---")
+                print_graph(g_hw)
+        print()
