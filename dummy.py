@@ -5339,6 +5339,7 @@ def lower_nu_graph_all_variants(
 
 
 def _print_phase_variants(phase_name: str, graphs: list[nuGraph]) -> None:
+    """Print the current synthesized graph variants for one pipeline phase."""
     print(f"[synthesize_hw_graph] {phase_name}: {len(graphs)} variant(s)")
     for idx, graph in enumerate(graphs):
         print(f"  --- {phase_name} variant {idx} ---")
@@ -7809,7 +7810,10 @@ def _test_synthesize_hw_graph_verbose_prints_phase_variants() -> None:
 
     def _mocked_lower(variants, max_hw_size=2, timeout=3000,
                       verbose=False, max_workers=None):
-        assert len(variants) == 2, "Expected both pre-lowering variants to be lowered"
+        assert len(variants) == 2, (
+            "Mocked lowering should receive both pre-lowering variants so the "
+            "verbose phase printer can show the full pre-lowering set"
+        )
         return [lowered_a, lowered_b]
 
     buf = io.StringIO()
