@@ -3496,12 +3496,13 @@ def z3_equivalent_order(
     rhs = new_tensors.get(op2.id)
     if lhs is None or rhs is None:
         return False
-    rhs_node = _node_by_id(G_new, op2.id)
-    if rhs_node is None:
-        return False
-    input_syms = [new_tensors[input_id] for input_id in rhs_node.inputs if input_id in new_tensors]
-    if _shape_rejection_reason(lhs, rhs, input_syms=input_syms) is not None:
-        return False
+    if _graph_uses_hw_only(G_cur) and _graph_uses_hw_only(G_new):
+        rhs_node = _node_by_id(G_new, op2.id)
+        if rhs_node is None:
+            return False
+        input_syms = [new_tensors[input_id] for input_id in rhs_node.inputs if input_id in new_tensors]
+        if _shape_rejection_reason(lhs, rhs, input_syms=input_syms) is not None:
+            return False
     return check_equivalent(
         lhs,
         rhs,
