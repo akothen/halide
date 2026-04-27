@@ -7872,7 +7872,7 @@ def _test_synthesize_hw_graph_post_lowering_swap_variants() -> None:
         return [hw_graph_a, hw_graph_b]
 
     with (
-        patch(f"{__name__}.nu_graph_generation_z3",  side_effect=_mocked_nu_gen),
+        patch(f"{__name__}.nu_graph_generation_z3", side_effect=_mocked_nu_gen),
         patch(f"{__name__}.lower_nu_graph_variants", side_effect=_mocked_lower),
     ):
         hw_results = synthesize_hw_graph(G, max_hw_size=2, timeout=5000)
