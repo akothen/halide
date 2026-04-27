@@ -5338,6 +5338,18 @@ def lower_nu_graph_all_variants(
     return results
 
 
+def _print_synthesis_phase_variants(phase_name: str, graphs: list[nuGraph]) -> None:
+    """Print synthesized graph variants for one named phase of the pipeline.
+
+    Intended for the phase boundaries in ``synthesize_hw_graph`` such as
+    pre-lowering, post-lowering, and post-swap/propagation.
+    """
+    print(f"[synthesize_hw_graph] {phase_name}: {len(graphs)} variant(s)")
+    for idx, graph in enumerate(graphs):
+        print(f"  --- {phase_name} variant {idx} ---")
+        print_graph(graph)
+
+
 def synthesize_hw_graph(
     G: nuGraph,
     max_hw_size: int = 2,
@@ -5347,13 +5359,24 @@ def synthesize_hw_graph(
 ) -> list[nuGraph]:
     """Generate all variant orderings of *G* and lower each to hw ops.
 
-    Returns the list of successfully lowered hw graphs (duplicates removed by
-    graph signature).  The underlying variant-lowering pass starts from a fresh
-    synthesis cache for this kernel and then fills it while lowering its
-    variants.  Pass *verbose=True* to print all sketches evaluated during
-    synthesis for manual inspection.
+    Phase 1: generate nuGraph variants from the original public-op graph via
+    ``nu_graph_generation_z3``, then lower each to a hardware-only graph.
+
+    Phase 2: once all hardware graphs have been collected, run
+    ``nu_graph_generation_z3`` again on every distinct lowered hardware graph to
+    discover additional swap-derived variants among the hardware ops.  Any new
+    variants found are appended to the results.
+
+    All returned graphs are deduplicated by graph signature.  Pass
+    *verbose=True* to print all sketches evaluated during synthesis for manual
+    inspection.
     """
+    # ------------------------------------------------------------------
+    # Phase 1: variant generation + lowering of the original graph
+    # ------------------------------------------------------------------
     variants = nu_graph_generation_z3(G)
+    if verbose:
+        _print_synthesis_phase_variants("pre-lowering", variants)
     lowered = lower_nu_graph_variants(
         variants,
         max_hw_size=max_hw_size,
@@ -5371,6 +5394,25 @@ def synthesize_hw_graph(
             continue
         seen.add(sig)
         results.append(g_hw)
+    if verbose:
+        _print_synthesis_phase_variants("post-lowering", results)
+
+    # ------------------------------------------------------------------
+    # Phase 2: post-lowering node-swap variant generation on hw graphs
+    # ------------------------------------------------------------------
+    # Iterate over a snapshot of Phase-1 results so that any graphs added
+    # during Phase 2 are not themselves re-processed in this loop.
+    phase2_variants: list[nuGraph] = []
+    for g_hw in list(results):
+        for g_hw_variant in nu_graph_generation_z3(g_hw):
+            sig = graph_signature(g_hw_variant)
+            if sig not in seen:
+                seen.add(sig)
+                phase2_variants.append(g_hw_variant)
+    results.extend(phase2_variants)
+    if verbose:
+        _print_synthesis_phase_variants("post-swap/propagation", results)
+
     return results
 
 
@@ -5866,7 +5908,8 @@ def print_graph(G: nuGraph) -> None:
     except (KeyError, z3.Z3Exception):
         symbolic_shapes = {}
         sym_shape_fallback = "unavailable"
-    for i, n in enumerate(G.nodes):
+    topologically_ordered_nodes = [node for level in _build_dag_levels(G) for node in level]
+    for i, n in enumerate(topologically_ordered_nodes):
         sym_shape = symbolic_shapes.get(n.id)
         sym_shape_str = _format_shape(sym_shape) if sym_shape is not None else sym_shape_fallback
         print(
@@ -6092,6 +6135,28 @@ def _test_print_graph_includes_symbolic_shapes() -> None:
     assert "sym_shape=(x_d0, x_d1)" in x_line
     assert "shape=(4, 16)" in out_line
     assert "sym_shape=(x_d0, w_d1)" in out_line
+
+
+def _test_print_graph_groups_nodes_by_topological_level() -> None:
+    G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        print_graph(G)
+    out = buf.getvalue()
+    lines = out.splitlines()
+
+    x_idx = next(i for i, line in enumerate(lines) if "id=x" in line and "op=input" in line)
+    y_idx = next(i for i, line in enumerate(lines) if "id=y" in line and "op=input" in line)
+    w_idx = next(i for i, line in enumerate(lines) if "id=w" in line and "op=input" in line)
+    mul_idx = next(i for i, line in enumerate(lines) if "id=mul_" in line and "op=mul" in line)
+
+    assert x_idx < mul_idx, "Expected input x to print before derived nodes"
+    assert y_idx < mul_idx, "Expected input y to print before derived nodes"
+    assert w_idx < mul_idx, (
+        "Expected input w, which appears later in G.nodes storage order, "
+        "to print before derived nodes"
+    )
+    print(" print_graph: groups nodes by topological level for readability")
 
 
 def _test_synthesis_prefers_direct_reduce_candidate() -> None:
@@ -7609,6 +7674,194 @@ def _test_lowering_cache_result_equivalence() -> None:
     )
 
 
+def _test_synthesize_hw_graph_post_lowering_swap_variants() -> None:
+    """Regression test: synthesize_hw_graph runs nu_graph_generation_z3 on
+    each distinct lowered hw graph and includes any newly-discovered
+    swap-derived variants in the final result.
+
+    This test demonstrates that a lowered hardware graph can produce additional
+    variants when passed back through nu_graph_generation_z3.  Both
+    ``nu_graph_generation_z3`` and ``lower_nu_graph_variants`` are mocked so
+    the test is fast and entirely deterministic — it does not depend on the
+    real Z3-based equivalence checker finding a valid hw-op swap.
+
+    Properties verified:
+      1. nu_graph_generation_z3 is called on every distinct lowered hw graph
+         (Phase-2 call).
+      2. New variants returned by those Phase-2 calls are appended to the
+         final results.
+      3. Variants already present in the Phase-1 results are NOT added again
+         (deduplication by graph signature).
+      4. The final result count equals the Phase-1 count plus newly injected
+         extras, with no duplicates.
+    """
+    from unittest.mock import patch
+
+    # --------------------------------------------------------------------------
+    # Build three distinct hw-only graphs as test fixtures.
+    # --------------------------------------------------------------------------
+    def _make_hw_graph(tag: str) -> nuGraph:
+        x = Node(id="x", op="input", inputs=[], attrs={}, shape=(4, 8))
+        w = Node(id="w", op="input", inputs=[], attrs={}, shape=(8, 16))
+        out = Node(id=f"nc_matmul_{tag}", op="nc_matmul",
+                   inputs=["x", "w"], attrs={}, shape=(4, 16))
+        return nuGraph([x, w, out])
+
+    hw_graph_a = _make_hw_graph("aaa")
+    hw_graph_b = _make_hw_graph("bbb")
+    hw_extra   = _make_hw_graph("extra")   # extra variant produced by Phase-2
+
+    sig_a     = graph_signature(hw_graph_a)
+    sig_b     = graph_signature(hw_graph_b)
+    sig_extra = graph_signature(hw_extra)
+
+    # Sanity: all three fixtures must have distinct signatures.
+    assert len({sig_a, sig_b, sig_extra}) == 3, (
+        "Test fixtures must have three distinct graph signatures"
+    )
+
+    # Original (public-op) entry-point graph used as the argument to
+    # synthesize_hw_graph.  No actual synthesis will be performed since both
+    # nu_graph_generation_z3 and lower_nu_graph_variants are mocked.
+    G = build_kernel_transpose_matmul_graph(4, 8, 16)
+    sig_original = graph_signature(G)
+
+    # --------------------------------------------------------------------------
+    # Mock nu_graph_generation_z3:
+    #   - Called on the original graph (Phase 1)  → [G]  (one variant)
+    #   - Called on hw_graph_a (Phase 2)           → [hw_graph_a, hw_extra]
+    #   - Called on hw_graph_b (Phase 2)           → [hw_graph_b]
+    # --------------------------------------------------------------------------
+    hw_gen_call_sigs: list[str] = []
+
+    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False) -> list[nuGraph]:
+        sig = graph_signature(graph)
+        if sig == sig_original:
+            return [graph]          # Phase-1: one variant (the original graph)
+        # Phase-2: called on a lowered hw graph.
+        hw_gen_call_sigs.append(sig)
+        if sig == sig_a:
+            return [hw_graph_a, hw_extra]
+        if sig == sig_b:
+            return [hw_graph_b]
+        return [graph]
+
+    # Mock lower_nu_graph_variants to return two predefined hw graphs.
+    def _mocked_lower(variants, max_hw_size=2, timeout=3000,
+                      verbose=False, max_workers=None):
+        return [hw_graph_a, hw_graph_b]
+
+    with (
+        patch("__main__.nu_graph_generation_z3",  side_effect=_mocked_nu_gen),
+        patch("__main__.lower_nu_graph_variants", side_effect=_mocked_lower),
+    ):
+        hw_results = synthesize_hw_graph(G, max_hw_size=2, timeout=5000)
+
+    # Phase-2 must have been invoked once for each distinct Phase-1 hw graph.
+    assert len(hw_gen_call_sigs) == 2, (
+        f"Expected Phase-2 nu_graph_generation_z3 calls for 2 hw graphs, "
+        f"got {len(hw_gen_call_sigs)}: {hw_gen_call_sigs}"
+    )
+    assert set(hw_gen_call_sigs) == {sig_a, sig_b}, (
+        "Phase-2 must be called on hw_graph_a and hw_graph_b; "
+        f"got calls for: {hw_gen_call_sigs}"
+    )
+
+    result_sigs = {graph_signature(g) for g in hw_results}
+
+    # hw_graph_a and hw_graph_b (Phase-1) must both appear.
+    assert sig_a in result_sigs, "hw_graph_a must be in final results"
+    assert sig_b in result_sigs, "hw_graph_b must be in final results"
+
+    # hw_extra (Phase-2 injection) must also appear.
+    assert sig_extra in result_sigs, (
+        "Post-lowering swap variant (hw_extra) must be included in final results"
+    )
+
+    # No duplicates.
+    assert len(hw_results) == len(result_sigs), (
+        "synthesize_hw_graph must not return duplicate graphs"
+    )
+
+    # Exactly 3 results: hw_graph_a + hw_graph_b + hw_extra.
+    assert len(hw_results) == 3, (
+        f"Expected 3 results (2 Phase-1 + 1 Phase-2 extra), got {len(hw_results)}"
+    )
+
+    print(
+        " synthesize_hw_graph: post-lowering swap variants — "
+        "Phase-1 hw graphs: 2, Phase-2 new: 1, total: 3"
+    )
+
+
+def _test_synthesize_hw_graph_verbose_prints_phase_variants() -> None:
+    G = build_kernel_transpose_matmul_graph(4, 8, 16)
+    phase1_variant = G.clone()
+    phase1_variant.nodes[-1] = Node(
+        phase1_variant.nodes[-1].id,
+        phase1_variant.nodes[-1].op,
+        list(phase1_variant.nodes[-1].inputs),
+        {**phase1_variant.nodes[-1].attrs, "phase": "pre"},
+        phase1_variant.nodes[-1].shape,
+    )
+
+    lowered_a = nuGraph([
+        Node("x", "input", [], {"shape": (4, 8)}, (4, 8)),
+        Node("y", "input", [], {"shape": (8, 16)}, (8, 16)),
+        Node("hw_a", "tensor_matmul", ["x", "y"], {"phase": "lowered_a"}, (4, 16)),
+    ])
+    lowered_b = nuGraph([
+        Node("x", "input", [], {"shape": (4, 8)}, (4, 8)),
+        Node("y", "input", [], {"shape": (8, 16)}, (8, 16)),
+        Node("hw_b", "tensor_matmul", ["x", "y"], {"phase": "lowered_b"}, (4, 16)),
+    ])
+    phase2_extra = nuGraph([
+        Node("x", "input", [], {"shape": (4, 8)}, (4, 8)),
+        Node("y", "input", [], {"shape": (8, 16)}, (8, 16)),
+        Node("hw_extra", "tensor_matmul", ["x", "y"], {"phase": "phase2_extra"}, (4, 16)),
+    ])
+
+    sig_original = graph_signature(G)
+    sig_lowered_a = graph_signature(lowered_a)
+    sig_lowered_b = graph_signature(lowered_b)
+
+    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False) -> list[nuGraph]:
+        sig = graph_signature(graph)
+        if sig == sig_original:
+            return [graph, phase1_variant]
+        if sig == sig_lowered_a:
+            return [lowered_a, phase2_extra]
+        if sig == sig_lowered_b:
+            return [lowered_b]
+        return [graph]
+
+    def _mocked_lower(variants, max_hw_size=2, timeout=3000,
+                      verbose=False, max_workers=None):
+        assert len(variants) == 2, (
+            "Mocked lowering should receive both pre-lowering variants so the "
+            "verbose phase printer can show the full pre-lowering set"
+        )
+        return [lowered_a, lowered_b]
+
+    buf = io.StringIO()
+    with (
+        patch("__main__.nu_graph_generation_z3", side_effect=_mocked_nu_gen),
+        patch("__main__.lower_nu_graph_variants", side_effect=_mocked_lower),
+        redirect_stdout(buf),
+    ):
+        hw_results = synthesize_hw_graph(G, max_hw_size=2, timeout=5000, verbose=True)
+
+    out = buf.getvalue()
+    assert "[synthesize_hw_graph] pre-lowering: 2 variant(s)" in out
+    assert "[synthesize_hw_graph] post-lowering: 2 variant(s)" in out
+    assert "[synthesize_hw_graph] post-swap/propagation: 3 variant(s)" in out
+    assert "phase': 'pre'" in out
+    assert "phase': 'lowered_a'" in out
+    assert "phase': 'phase2_extra'" in out
+    assert len(hw_results) == 3
+    print(" synthesize_hw_graph: verbose output prints phased variants")
+
+
 def run_all_tests() -> None:
     print("\n================ RUNNING NU-GRAPH TESTS ================")
     _test_expected_variant_counts()
@@ -7624,6 +7877,7 @@ def run_all_tests() -> None:
     _test_silu_mlp_graph()
     _test_attention_graph()
     _test_print_graph_includes_symbolic_shapes()
+    _test_print_graph_groups_nodes_by_topological_level()
     _test_synthesis_prefers_direct_reduce_candidate()
     _test_synthesis_verbose_reports_candidate_count()
     _test_synthesis_auto_maximizes_sketch_workers()
@@ -7662,6 +7916,8 @@ def run_all_tests() -> None:
     _test_kernel_matmul_red_div_div_node_lowered_via_tensor_scalar()
     _test_matmul_with_complex_input_sym_not_rejected()
     _test_matmul_missing_input_guard()
+    _test_synthesize_hw_graph_post_lowering_swap_variants()
+    _test_synthesize_hw_graph_verbose_prints_phase_variants()
     print("=============== ALL TESTS PASSED  =====================\n")
 
 
@@ -7709,24 +7965,23 @@ if __name__ == "__main__":
         print("=" * 80)
         _start_kernel_synthesis_cache(kernel_name=kname, verbose=True)
         G0 = builder(4, 8, 16)
-        variants = nu_graph_generation_z3(G0, verbose=True)
-
-        print(f"Found {len(variants)} variant(s) for {kname}\n")
-        for vi, gv in enumerate(variants):
-            print(f"=== {kname} :: Variant {vi} ===")
-            print_graph(gv)
-            print()
-            print(f"--- {kname} :: Variant {vi} :: Lowering to hardware "
-                  f"(all sketches, node- & sketch-level parallel) ---")
-            hw_variants = lower_nu_graph_all_variants(
-                gv, max_hw_size=2, timeout=3000, verbose=True,
-                max_workers=args.max_workers)
-            if not hw_variants:
-                print(f"  [lowering failed for variant {vi}]")
-            else:
-                print(f"--- {kname} :: Variant {vi} :: "
-                      f"{len(hw_variants)} lowered hw graph(s) ---")
-                for hi, g_hw in enumerate(hw_variants):
-                    print(f"  +-- hw variant {hi} ---")
-                    print_graph(g_hw)
-            print()
+        print(f"=== {kname} :: Original graph ===")
+        print_graph(G0)
+        print()
+        print(f"--- {kname} :: synthesize_hw_graph "
+              f"(all variants, including post-lowering hw swaps) ---")
+        hw_variants = synthesize_hw_graph(
+            G0,
+            max_hw_size=2,
+            timeout=3000,
+            verbose=True,
+            max_workers=args.max_workers,
+        )
+        if not hw_variants:
+            print(f"  [synthesis failed for {kname}]")
+        else:
+            print(f"--- {kname} :: {len(hw_variants)} synthesized hw graph(s) ---")
+            for hi, g_hw in enumerate(hw_variants):
+                print(f"  +-- hw variant {hi} ---")
+                print_graph(g_hw)
+        print()
