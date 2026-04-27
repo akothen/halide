@@ -390,6 +390,16 @@ def _broadcast_shape(a: ShapeExpr, b: ShapeExpr) -> ShapeResult:
     return ShapeResult(ShapeExpr(out), ctx)
 
 
+def _broadcast_to_shape(src: ShapeExpr, target: ShapeExpr) -> ShapeResult:
+    rank = builtins.max(src.rank, target.rank)
+    sd = [z3.IntVal(1)] * (rank - src.rank) + list(src.dims)
+    td = [z3.IntVal(1)] * (rank - target.rank) + list(target.dims)
+    ctx = Context([d > 0 for d in sd + td])
+    for sdim, tdim in zip(sd, td):
+        ctx.add(z3.Or(sdim == tdim, sdim == 1))
+    return ShapeResult(ShapeExpr(list(td)), ctx)
+
+
 def _broadcast_indices(src: Semantics, out_shape: ShapeExpr, indices: list[z3.ArithRef]) -> list[z3.ArithRef]:
     src_dims = list(src.shape.dims)
     if len(indices) < out_shape.rank:
@@ -2372,14 +2382,12 @@ def _compile_tensor_tensor(expr: SymExpr, ins: list[Semantics], out_shape: Shape
 
 def _shape_tensor_scalar(ins: list[ShapeExpr], attrs: dict[str, Any]) -> ShapeResult:
     data = ins[0]
-    out = ShapeResult(ShapeExpr(list(data.dims)), Context([d > 0 for d in data.dims]))
+    ctx = Context([d > 0 for d in data.dims])
     if len(ins) > 1:
-        out = _broadcast_shape(out.out, ins[1])
+        ctx.extend(_broadcast_to_shape(ins[1], data).ctx.facts)
     if len(ins) > 2:
-        b1 = _broadcast_shape(out.out, ins[2])
-        out.ctx.extend(b1.ctx.facts)
-        out = ShapeResult(b1.out, out.ctx)
-    return out
+        ctx.extend(_broadcast_to_shape(ins[2], data).ctx.facts)
+    return ShapeResult(ShapeExpr(list(data.dims)), ctx)
 
 
 def _tensor_scalar_out_shape(
@@ -2390,13 +2398,7 @@ def _tensor_scalar_out_shape(
 ) -> tuple[Any, ...]:
     if isinstance(dst, SymTensor):
         return dst.shape
-    with _Z3_LOCK:
-        out = ShapeExpr(list(data.shape))
-        if _is_sym_tensor(operand0):
-            out = _broadcast_shape(out, ShapeExpr(list(operand0.shape))).out
-        if _is_sym_tensor(operand1):
-            out = _broadcast_shape(out, ShapeExpr(list(operand1.shape))).out
-        return tuple(z3.simplify(dim) for dim in out.dims)
+    return tuple(data.shape)
 
 
 def _operand_value(
@@ -4205,6 +4207,14 @@ def _shapes_not_provably_equivalent(
             return
         for inp in expr.inputs:
             _collect_candidate_shape_constraints(inp)
+        # tensor_scalar is intentionally directional: data drives the output
+        # tile shape, while operand0/operand1 broadcast *into* that shape.
+        # Those role-selection constraints are stricter than the public op's
+        # symmetric broadcast preconditions, so negating them here would reject
+        # otherwise-correct candidates before the actual equivalence solver has
+        # a chance to validate them.
+        if expr.op == "tensor_scalar":
+            return
         shape_rule, _ = _SEMANTICS.get(expr.op, (None, None))
         if shape_rule is None:
             return
@@ -6957,6 +6967,59 @@ def _test_shapes_not_provably_equivalent_broadcast_compatible_candidate() -> Non
     )
 
 
+def _test_tensor_scalar_data_operand_stays_non_broadcastable_tile() -> None:
+    from unittest.mock import patch
+
+    x = SymTensor("x", shape=(4, 8))
+    reduced = SymTensor("tensor_reduce_1080", shape=(4, 1))
+    target_sym = divide(x, reduced)
+
+    good = tensor_scalar(dst=None, data=x, op0=nl.divide, operand0=reduced)
+    bad = tensor_scalar(dst=None, data=reduced, op0=nl.divide, operand0=x)
+
+    assert _shapes_match_exactly(good, x), (
+        "tensor_scalar must preserve the non-broadcastable tile shape from data"
+    )
+    assert _shapes_match_exactly(bad, reduced), (
+        "tensor_scalar must keep data.shape even when operand0 is larger"
+    )
+    reason = _shape_rejection_reason(target_sym, bad)
+    assert reason is not None, (
+        "reversed tensor_scalar(reduce, x) must be rejected before solver dispatch "
+        f"because data drives the output tile shape, got: {reason!r}"
+    )
+
+    bad_sketch = SketchNode.make_op(
+        "tensor_scalar",
+        [SketchNode.make_input(reduced), SketchNode.make_input(x)],
+        {"op0": nl.divide},
+    )
+    calls = {"count": 0}
+    original_check = _check_equivalent_quiet
+
+    def _counting_check(lhs: SymTensor, rhs: SymTensor, timeout: int = 3000) -> bool:
+        calls["count"] += 1
+        return original_check(lhs, rhs, timeout=timeout)
+
+    with patch("__main__._check_equivalent_quiet", side_effect=_counting_check):
+        found = _synthesize_all_from_pool(
+            target_sym,
+            [bad_sketch],
+            max_hw_size=1,
+            timeout=100,
+            verbose=False,
+            max_workers=1,
+        )
+
+    assert found == [], (
+        "reversed tensor_scalar(reduce, x) must never be accepted as a valid lowering"
+    )
+    assert calls["count"] == 0, (
+        "shape prefilters must reject reversed tensor_scalar orientation before solver dispatch"
+    )
+    print(" synthesis: tensor_scalar keeps data as the output tile and rejects reversed broadcast orientation")
+
+
 def _test_kernel_matmul_red_div_div_node_lowered_via_tensor_scalar() -> None:
     """Regression: the ``div`` node in ``kernel_matmul_red_div`` variant 0 must
     be successfully lowered to a ``tensor_scalar`` hw candidate, not fail with
@@ -7940,6 +8003,7 @@ def run_all_tests() -> None:
     _test_division_broadcast_uses_tensor_scalar_not_tensor_tensor()
     _test_division_symbolic_shape_rejection()
     _test_shapes_not_provably_equivalent_broadcast_compatible_candidate()
+    _test_tensor_scalar_data_operand_stays_non_broadcastable_tile()
     _test_invoke_hw_op_transpose_uses_nc_transpose_semantics()
     _test_invoke_hw_op_tensor_reduce_preserves_reduced_shape()
     _test_lower_nu_graph_parallel_levels()
