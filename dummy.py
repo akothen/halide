@@ -3413,6 +3413,42 @@ def _swap_with_successor_variants(
 
     out: list[tuple[nuGraph, int]] = []
     seen_graphs: set[str] = set()
+    full_input_set = set(op1.inputs)
+
+    def _append_variant(
+        clone_nodes: list[Node],
+        rebuilt_node: Node,
+    ) -> None:
+        new_nodes: list[Node] = []
+        for idx, node in enumerate(G_cur.nodes):
+            if idx == succ_pos:
+                new_nodes.extend(Node(n.id, n.op, list(n.inputs), dict(n.attrs), n.shape) for n in clone_nodes)
+                new_nodes.append(rebuilt_node)
+                continue
+            if idx == pos:
+                continue
+            copied = Node(node.id, node.op, list(node.inputs), dict(node.attrs), node.shape)
+            new_nodes.append(copied)
+
+        G_new = nuGraph(new_nodes)
+        new_pos = _position_by_id(G_new, op2.id)
+        if new_pos is None:
+            return
+        sig = graph_signature(G_new)
+        if sig in seen_graphs:
+            return
+        seen_graphs.add(sig)
+        out.append((G_new, new_pos))
+
+    if (
+        op1.op == "nc_matmul"
+        and op2.op == "nc_transpose"
+        and len(op1.inputs) == 2
+        and clone_inputs == full_input_set
+    ):
+        rebuilt_node = Node(op2.id, op1.op, [op1.inputs[1], op1.inputs[0]], dict(op1.attrs), None)
+        _append_variant([], rebuilt_node)
+
     for rebuilt_inputs in candidate_inputs:
         base_graph = G_cur.clone()
         op1_new = _node_by_id(base_graph, op1.id)
@@ -3433,27 +3469,7 @@ def _swap_with_successor_variants(
 
         rebuilt_node = Node(op2.id, op1.op, list(rebuilt_inputs), dict(op1.attrs), None)
         rebuilt_node.inputs = [clone_output_ids.get(input_id, input_id) for input_id in rebuilt_node.inputs]
-
-        new_nodes: list[Node] = []
-        for idx, node in enumerate(G_cur.nodes):
-            if idx == succ_pos:
-                new_nodes.extend(Node(n.id, n.op, list(n.inputs), dict(n.attrs), n.shape) for n in clone_nodes)
-                new_nodes.append(rebuilt_node)
-                continue
-            if idx == pos:
-                continue
-            copied = Node(node.id, node.op, list(node.inputs), dict(node.attrs), node.shape)
-            new_nodes.append(copied)
-
-        G_new = nuGraph(new_nodes)
-        new_pos = _position_by_id(G_new, op2.id)
-        if new_pos is None:
-            continue
-        sig = graph_signature(G_new)
-        if sig in seen_graphs:
-            continue
-        seen_graphs.add(sig)
-        out.append((G_new, new_pos))
+        _append_variant(clone_nodes, rebuilt_node)
 
     return out
 
@@ -5410,15 +5426,18 @@ def synthesize_hw_graph(
     # ------------------------------------------------------------------
     # Phase 2: post-lowering node-swap variant generation on hw graphs
     # ------------------------------------------------------------------
-    # Iterate over a snapshot of Phase-1 results so that any graphs added
-    # during Phase 2 are not themselves re-processed in this loop.
+    # Continue exploring newly-discovered hw variants until Phase 2 reaches a
+    # fixpoint, since one post-lowering swap can expose a new local adjacency
+    # for a later hw-op swap.
     phase2_variants: list[nuGraph] = []
-    for g_hw in list(results):
+    phase2_worklist: list[nuGraph] = list(results)
+    for g_hw in phase2_worklist:
         for g_hw_variant in nu_graph_generation_z3(g_hw):
             sig = graph_signature(g_hw_variant)
             if sig not in seen:
                 seen.add(sig)
                 phase2_variants.append(g_hw_variant)
+                phase2_worklist.append(g_hw_variant)
     results.extend(phase2_variants)
     if verbose:
         _print_synthesis_phase_variants("post-swap/propagation", results)
@@ -6063,6 +6082,44 @@ def _test_matmul_transpose_graph() -> None:
     variants = nu_graph_generation_z3(G, verbose=False)
     assert len(variants) >= 2, "matmul_transpose should emit a swapped variant"
     print(" matmul_transpose graph builds and runs variant generation")
+
+
+def _test_nc_matmul_transpose_graph() -> None:
+    warmup_x = SymTensor("warmup_x", shape=(4, 8))
+    warmup_w = SymTensor("warmup_w", shape=(8, 16))
+    warmup_xt = nc_transpose(dst=None, data=warmup_x)
+    assert warmup_xt is not None, "Internal test error: nc_transpose warmup failed"
+    warmup_mm = nc_matmul(dst=None, stationary=warmup_xt, moving=warmup_w)
+    assert warmup_mm is not None, "Internal test error: nc_matmul warmup failed"
+    assert nc_transpose(dst=None, data=warmup_mm) is not None, "Internal test error: nc_transpose output warmup failed"
+
+    G = nuGraph([
+        Node("x", "input", [], {"shape": (4, 8)}, (4, 8)),
+        Node("w", "input", [], {"shape": (8, 16)}, (8, 16)),
+        Node("xt", "nc_transpose", ["x"], {}, (8, 4)),
+        Node("mm", "nc_matmul", ["xt", "w"], {}, (4, 16)),
+        Node("out", "nc_transpose", ["mm"], {}, (16, 4)),
+    ])
+
+    mm_pos = _position_by_id(G, "mm")
+    out_pos = _position_by_id(G, "out")
+    assert mm_pos is not None and out_pos is not None, "Internal test error: nc_matmul/nc_transpose nodes missing"
+
+    swapped = _swap_with_successor_variants(G, mm_pos, out_pos, {"xt", "w"})
+    assert swapped, "nc_matmul_transpose should emit a legal swapped variant"
+
+    rewritten = [
+        G_new for G_new, _ in swapped
+        if any(node.id == "out" and node.op == "nc_matmul" and node.inputs == ["w", "xt"] for node in G_new.nodes)
+    ]
+    assert rewritten, "nc_matmul_transpose should rewrite transpose(matmul) to nc_matmul(moving, stationary)"
+
+    variants = nu_graph_generation_z3(G, verbose=False)
+    assert any(
+        any(node.id == "out" and node.op == "nc_matmul" and node.inputs == ["w", "xt"] for node in variant.nodes)
+        for variant in variants
+    ), "nu_graph_generation_z3 should keep the nc_matmul/nc_transpose swapped variant"
+    print(" nc_matmul_transpose graph builds and runs variant generation")
 
 
 def _test_relu_matmul_graph() -> None:
@@ -7815,18 +7872,19 @@ def _test_synthesize_hw_graph_post_lowering_swap_variants() -> None:
         return [hw_graph_a, hw_graph_b]
 
     with (
-        patch("__main__.nu_graph_generation_z3",  side_effect=_mocked_nu_gen),
-        patch("__main__.lower_nu_graph_variants", side_effect=_mocked_lower),
+        patch(f"{__name__}.nu_graph_generation_z3",  side_effect=_mocked_nu_gen),
+        patch(f"{__name__}.lower_nu_graph_variants", side_effect=_mocked_lower),
     ):
         hw_results = synthesize_hw_graph(G, max_hw_size=2, timeout=5000)
 
-    # Phase-2 must have been invoked once for each distinct Phase-1 hw graph.
-    assert len(hw_gen_call_sigs) == 2, (
-        f"Expected Phase-2 nu_graph_generation_z3 calls for 2 hw graphs, "
+    # Phase-2 must visit the original lowered hw graphs and any newly-added
+    # Phase-2 variants until no more distinct graphs are discovered.
+    assert len(hw_gen_call_sigs) == 3, (
+        f"Expected Phase-2 nu_graph_generation_z3 calls for 3 hw graphs, "
         f"got {len(hw_gen_call_sigs)}: {hw_gen_call_sigs}"
     )
-    assert set(hw_gen_call_sigs) == {sig_a, sig_b}, (
-        "Phase-2 must be called on hw_graph_a and hw_graph_b; "
+    assert set(hw_gen_call_sigs) == {sig_a, sig_b, sig_extra}, (
+        "Phase-2 must be called on hw_graph_a, hw_graph_b, and the new hw_extra variant; "
         f"got calls for: {hw_gen_call_sigs}"
     )
 
@@ -7855,6 +7913,60 @@ def _test_synthesize_hw_graph_post_lowering_swap_variants() -> None:
         " synthesize_hw_graph: post-lowering swap variants — "
         "Phase-1 hw graphs: 2, Phase-2 new: 1, total: 3"
     )
+
+
+def _test_synthesize_hw_graph_post_lowering_reaches_fixpoint() -> None:
+    from unittest.mock import patch
+
+    def _make_hw_graph(tag: str) -> nuGraph:
+        return nuGraph([
+            Node("x", "input", [], {"shape": (4, 8)}, (4, 8)),
+            Node("w", "input", [], {"shape": (8, 16)}, (8, 16)),
+            Node(f"hw_{tag}", "nc_matmul", ["x", "w"], {"tag": tag}, (4, 16)),
+        ])
+
+    hw_graph_a = _make_hw_graph("a")
+    hw_graph_b = _make_hw_graph("b")
+    hw_graph_c = _make_hw_graph("c")
+
+    sig_a = graph_signature(hw_graph_a)
+    sig_b = graph_signature(hw_graph_b)
+    sig_c = graph_signature(hw_graph_c)
+
+    G = build_kernel_transpose_matmul_graph(4, 8, 16)
+    sig_original = graph_signature(G)
+    hw_gen_call_sigs: list[str] = []
+
+    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False) -> list[nuGraph]:
+        sig = graph_signature(graph)
+        if sig == sig_original:
+            return [graph]
+        hw_gen_call_sigs.append(sig)
+        if sig == sig_a:
+            return [hw_graph_a, hw_graph_b]
+        if sig == sig_b:
+            return [hw_graph_b, hw_graph_c]
+        if sig == sig_c:
+            return [hw_graph_c]
+        return [graph]
+
+    def _mocked_lower(variants, max_hw_size=2, timeout=3000, verbose=False, max_workers=None):
+        return [hw_graph_a]
+
+    with (
+        patch(f"{__name__}.nu_graph_generation_z3", side_effect=_mocked_nu_gen),
+        patch(f"{__name__}.lower_nu_graph_variants", side_effect=_mocked_lower),
+    ):
+        hw_results = synthesize_hw_graph(G, max_hw_size=2, timeout=5000)
+
+    assert hw_gen_call_sigs == [sig_a, sig_b, sig_c], (
+        "Phase-2 should keep processing newly-discovered hw variants until no new variants remain"
+    )
+    result_sigs = {graph_signature(g) for g in hw_results}
+    assert result_sigs == {sig_a, sig_b, sig_c}, (
+        "Fixpoint Phase-2 propagation should include transitively discovered hw variants"
+    )
+    print(" synthesize_hw_graph: post-lowering propagation reaches fixpoint")
 
 
 def _test_synthesize_hw_graph_verbose_prints_phase_variants() -> None:
@@ -7985,6 +8097,7 @@ def run_all_tests() -> None:
     _test_softmax_matmul_graph()
     _test_transpose_matmul_graph()
     _test_matmul_transpose_graph()
+    _test_nc_matmul_transpose_graph()
     _test_relu_matmul_graph()
     _test_silu_matmul_graph()
     _test_silu_mlp_graph()
@@ -8031,6 +8144,7 @@ def run_all_tests() -> None:
     _test_matmul_with_complex_input_sym_not_rejected()
     _test_matmul_missing_input_guard()
     _test_synthesize_hw_graph_post_lowering_swap_variants()
+    _test_synthesize_hw_graph_post_lowering_reaches_fixpoint()
     _test_synthesize_hw_graph_verbose_prints_phase_variants()
     _test_relu_all_lowerings_found_within_depth_budget()
     print("=============== ALL TESTS PASSED  =====================\n")
