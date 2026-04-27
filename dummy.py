@@ -10,6 +10,7 @@ import time
 from contextlib import redirect_stdout
 from dataclasses import dataclass, field
 from enum import Enum
+from collections import deque
 from itertools import combinations, permutations, product as _iproduct
 from threading import Lock, RLock
 from typing import Any, Callable, Optional, List
@@ -4316,15 +4317,16 @@ def _synthesize_from_pool(
 ) -> Optional[SketchNode]:
     """Phase 2: worklist search for a hw-only sketch equivalent to target_sym.
 
-    Uses DFS (pop from end) so that deeper/more-relevant candidates are
-    explored before exhausting all shallow ones.  Returns the first sketch
-    that passes check_equivalent, or None if the budget is exceeded.
+    Uses BFS (popleft from front) so that shallower candidates are always
+    explored before deeper ones.  This guarantees that the first equivalent
+    sketch returned has the smallest hw_size within the allowed budget,
+    giving a deterministic, minimal canonical lowering.
 
     When *verbose* is True every complete sketch that is evaluated is printed
     together with whether it passed equivalence, allowing manual inspection.
     """
     initial = SketchNode.make_hole()
-    worklist: list[SketchNode] = [initial]
+    worklist: deque[SketchNode] = deque([initial])
     seen: set[SketchNode] = {initial}
     symbolic_shape_reject_count = 0
     solver_dispatch_count = 0
@@ -4334,7 +4336,7 @@ def _synthesize_from_pool(
     )
 
     while worklist:
-        sketch = worklist.pop()           # DFS: pop from end
+        sketch = worklist.popleft()       # BFS: pop from front
 
         if not sketch.has_hole():
             # Complete sketch – evaluate and check
@@ -4375,10 +4377,8 @@ def _synthesize_from_pool(
             continue
 
         # Incomplete sketch – fill the first hole with each pool entry.
-        # Iterate in reverse so the highest-priority templates are appended to
-        # the LIFO worklist last and therefore popped/explored first.
         can_add_hw_op = sketch.hw_size() < max_hw_size
-        for pool_entry in reversed(pool):
+        for pool_entry in pool:
             # Decide whether this pool entry is allowed at this depth
             if pool_entry.op not in ("INPUT", "HOLE"):
                 if not can_add_hw_op:
@@ -7862,6 +7862,56 @@ def _test_synthesize_hw_graph_verbose_prints_phase_variants() -> None:
     print(" synthesize_hw_graph: verbose output prints phased variants")
 
 
+def _test_relu_all_lowerings_found_within_depth_budget() -> None:
+    """Regression test: for a relu node with max_hw_size=2, both the 1-activation
+    lowering (activation(IN:x)) and the 2-activation lowering
+    (activation(activation(IN:x))) must be discovered by _synthesize_all_from_pool,
+    and _synthesize_from_pool must return the shallower 1-activation sketch.
+
+    Previously _synthesize_from_pool used DFS which reached the 2-activation
+    sketch before the 1-activation sketch and returned early, so the shallower
+    valid lowering was never considered.
+    """
+    G = build_kernel_relu_matmul_graph(4, 8, 16)
+    orig_syms = _graph_symbolic_tensors(G)
+    relu_node = _nodes_by_op(G, "relu")[0]
+    input_syms = [orig_syms[inp_id] for inp_id in relu_node.inputs]
+    target_sym = orig_syms[relu_node.id]
+    pool = _build_synthesis_pool(relu_node.op, relu_node.attrs, input_syms)
+
+    # _synthesize_all_from_pool must find BOTH valid lowerings within depth 2.
+    all_sketches = _synthesize_all_from_pool(
+        target_sym, pool, max_hw_size=2, timeout=5000, verbose=False,
+        input_syms=input_syms,
+    )
+    sketch_strs = [_format_sketch(s) for s in all_sketches]
+    one_activation = [s for s in all_sketches if s.op == "activation" and s.hw_size() == 1]
+    two_activation = [s for s in all_sketches if s.op == "activation" and s.hw_size() == 2]
+    assert one_activation, (
+        f"Expected a 1-activation lowering for relu in all-variants search, "
+        f"got sketches: {sketch_strs}"
+    )
+    assert two_activation, (
+        f"Expected a 2-activation lowering for relu in all-variants search, "
+        f"got sketches: {sketch_strs}"
+    )
+    print(f" synthesis: relu all-lowerings found both 1-activation and 2-activation "
+          f"sketches within max_hw_size=2: {sketch_strs}")
+
+    # _synthesize_from_pool must return the shallowest (1-activation) sketch.
+    best = _synthesize_from_pool(
+        target_sym, pool, max_hw_size=2, timeout=5000, verbose=False,
+        input_syms=input_syms,
+    )
+    assert best is not None, "Expected _synthesize_from_pool to find a relu lowering"
+    assert best.hw_size() == 1, (
+        f"Expected _synthesize_from_pool to return the shallower 1-activation sketch "
+        f"(hw_size=1), but got hw_size={best.hw_size()}: {_format_sketch(best)}"
+    )
+    print(f" synthesis: relu canonical lowering is the minimal sketch "
+          f"(hw_size={best.hw_size()}): {_format_sketch(best)}")
+
+
 def run_all_tests() -> None:
     print("\n================ RUNNING NU-GRAPH TESTS ================")
     _test_expected_variant_counts()
@@ -7918,6 +7968,7 @@ def run_all_tests() -> None:
     _test_matmul_missing_input_guard()
     _test_synthesize_hw_graph_post_lowering_swap_variants()
     _test_synthesize_hw_graph_verbose_prints_phase_variants()
+    _test_relu_all_lowerings_found_within_depth_budget()
     print("=============== ALL TESTS PASSED  =====================\n")
 
 
