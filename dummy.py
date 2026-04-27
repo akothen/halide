@@ -3244,6 +3244,17 @@ def graph_signature(G: nuGraph) -> str:
     return " | ".join([f"{n.id}:{n.op}({','.join(n.inputs)})" for n in G.nodes])
 
 
+def graph_structure_signature(G: nuGraph) -> str:
+    canonical_ids: dict[str, str] = {}
+    parts: list[str] = []
+    for idx, node in enumerate(G.nodes):
+        canonical_id = f"n{idx}"
+        canonical_ids[node.id] = canonical_id
+        canonical_inputs = ",".join(canonical_ids.get(input_id, input_id) for input_id in node.inputs)
+        parts.append(f"{canonical_id}:{node.op}({canonical_inputs})")
+    return " | ".join(parts)
+
+
 def _normalize_dim(d: Any) -> Any:
     if isinstance(d, int):
         return d
@@ -3434,7 +3445,7 @@ def _swap_with_successor_variants(
         new_pos = _position_by_id(G_new, op2.id)
         if new_pos is None:
             return
-        sig = graph_signature(G_new)
+        sig = graph_structure_signature(G_new)
         if sig in seen_graphs:
             return
         seen_graphs.add(sig)
@@ -3479,9 +3490,17 @@ def z3_equivalent_order(
 ) -> bool:
     if G_new is None:
         return False
-    lhs = _swap_composition_tensor(G_cur, op2.id)
-    rhs = _swap_composition_tensor(G_new, op2.id)
+    cur_tensors = _graph_symbolic_tensors(G_cur)
+    new_tensors = _graph_symbolic_tensors(G_new)
+    lhs = cur_tensors.get(op2.id)
+    rhs = new_tensors.get(op2.id)
     if lhs is None or rhs is None:
+        return False
+    rhs_node = _node_by_id(G_new, op2.id)
+    if rhs_node is None:
+        return False
+    input_syms = [new_tensors[input_id] for input_id in rhs_node.inputs if input_id in new_tensors]
+    if _shape_rejection_reason(lhs, rhs, input_syms=input_syms) is not None:
         return False
     return check_equivalent(
         lhs,
@@ -3494,15 +3513,15 @@ def z3_equivalent_order(
 
 def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
     G0 = G.clone()
-    M: set[nuGraph] = {G0}
+    M: dict[str, nuGraph] = {graph_structure_signature(G0): G0}
     equivalence_cache: dict[tuple[str, str, str, str], bool] = {}
 
     for op1_orig in [n for n in G0.nodes if n.op != "input"]:
-        M_next: set[nuGraph] = set()
-        for G_seed in sorted(M, key=graph_signature):
+        M_next: dict[str, nuGraph] = {}
+        for G_seed in sorted(M.values(), key=graph_signature):
             pos0 = _position_by_id(G_seed, op1_orig.id)
             if pos0 is None:
-                M_next.add(G_seed)
+                M_next.setdefault(graph_structure_signature(G_seed), G_seed)
                 continue
 
             worklist: list[tuple[nuGraph, int]] = [(G_seed, pos0)]
@@ -3510,7 +3529,8 @@ def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
 
             while worklist:
                 G_cur, pos = worklist.pop()
-                state_key = (graph_signature(G_cur), pos)
+                cur_sig = graph_structure_signature(G_cur)
+                state_key = (cur_sig, pos)
                 if state_key in visited:
                     continue
                 visited.add(state_key)
@@ -3531,14 +3551,14 @@ def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
                     for k in range(1, len(inputs) + 1):
                         for subset in combinations(inputs, k):
                             for G_new, p_new in _swap_with_successor_variants(G_cur, pos, succ_pos, set(subset)):
-                                cache_key = (graph_signature(G_cur), op1.id, op2.id, graph_signature(G_new))
+                                cache_key = (cur_sig, str(pos), str(succ_pos), graph_structure_signature(G_new))
                                 equivalent = equivalence_cache.get(cache_key)
                                 if equivalent is None:
                                     equivalent = z3_equivalent_order(op1, op2, G_cur, G_new, verbose=verbose)
                                     equivalence_cache[cache_key] = equivalent
                                 if not equivalent:
                                     continue
-                                M_next.add(G_new)
+                                M_next.setdefault(graph_structure_signature(G_new), G_new)
                                 worklist.append((G_new, p_new))
                                 found_valid_swap = True
                                 accepted = True
@@ -3548,10 +3568,10 @@ def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
                         if accepted:
                             break
                 if not found_valid_swap:
-                    M_next.add(G_cur)
-        M |= M_next
+                    M_next.setdefault(cur_sig, G_cur)
+        M.update(M_next)
 
-    return sorted(M, key=graph_signature)
+    return sorted(M.values(), key=graph_signature)
 
 
 # ---------------------------------------------------------------------------
@@ -5348,7 +5368,7 @@ def lower_nu_graph_all_variants(
             annotate_shapes_concrete(G_hw)
         except (KeyError, Exception):
             pass
-        sig = graph_signature(G_hw)
+        sig = graph_structure_signature(G_hw)
         if sig in seen_sigs:
             continue
         seen_sigs.add(sig)
@@ -5415,7 +5435,7 @@ def synthesize_hw_graph(
     for g_hw in lowered:
         if g_hw is None:
             continue
-        sig = graph_signature(g_hw)
+        sig = graph_structure_signature(g_hw)
         if sig in seen:
             continue
         seen.add(sig)
@@ -5426,14 +5446,18 @@ def synthesize_hw_graph(
     # ------------------------------------------------------------------
     # Phase 2: post-lowering node-swap variant generation on hw graphs
     # ------------------------------------------------------------------
-    # Continue exploring newly-discovered hw variants until Phase 2 reaches a
-    # fixpoint, since one post-lowering swap can expose a new local adjacency
-    # for a later hw-op swap.
+    # Continue exploring newly-discovered hw variants to a fixpoint, but only
+    # keep post-lowering variants that do not grow the graph.  This preserves
+    # follow-on local rewrites such as the silu-MLP nc_matmul/nc_transpose
+    # chain, while avoiding the broadcast-driven variant explosion caused by
+    # repeatedly cloning larger and larger subgraphs during propagation.
     phase2_variants: list[nuGraph] = []
     phase2_worklist: list[nuGraph] = list(results)
     for g_hw in phase2_worklist:
         for g_hw_variant in nu_graph_generation_z3(g_hw):
-            sig = graph_signature(g_hw_variant)
+            if len(g_hw_variant.nodes) > len(g_hw.nodes):
+                continue
+            sig = graph_structure_signature(g_hw_variant)
             if sig not in seen:
                 seen.add(sig)
                 phase2_variants.append(g_hw_variant)
@@ -7823,9 +7847,20 @@ def _test_synthesize_hw_graph_post_lowering_swap_variants() -> None:
     def _make_hw_graph(tag: str) -> nuGraph:
         x = Node(id="x", op="input", inputs=[], attrs={}, shape=(4, 8))
         w = Node(id="w", op="input", inputs=[], attrs={}, shape=(8, 16))
-        out = Node(id=f"nc_matmul_{tag}", op="nc_matmul",
-                   inputs=["x", "w"], attrs={}, shape=(4, 16))
-        return nuGraph([x, w, out])
+        if tag == "aaa":
+            xt = Node(id="nc_transpose_a", op="nc_transpose", inputs=["x"], attrs={}, shape=(8, 4))
+            act = Node(id="activation_a", op="activation", inputs=["nc_transpose_a"], attrs={"op": nl.silu}, shape=(8, 4))
+            out = Node(id="nc_matmul_a", op="nc_matmul", inputs=["activation_a", "w"], attrs={}, shape=(4, 16))
+            return nuGraph([x, w, xt, act, out])
+        if tag == "bbb":
+            xt = Node(id="nc_transpose_b", op="nc_transpose", inputs=["x"], attrs={}, shape=(8, 4))
+            out = Node(id="nc_matmul_b", op="nc_matmul", inputs=["nc_transpose_b", "w"], attrs={}, shape=(4, 16))
+            act = Node(id="activation_b", op="activation", inputs=["nc_matmul_b"], attrs={"op": nl.silu}, shape=(4, 16))
+            return nuGraph([x, w, xt, out, act])
+        xt = Node(id="nc_transpose_extra", op="nc_transpose", inputs=["x"], attrs={}, shape=(8, 4))
+        act_w = Node(id="activation_extra", op="activation", inputs=["w"], attrs={"op": nl.silu}, shape=(8, 16))
+        out = Node(id="nc_matmul_extra", op="nc_matmul", inputs=["nc_transpose_extra", "activation_extra"], attrs={}, shape=(4, 16))
+        return nuGraph([x, w, xt, act_w, out])
 
     hw_graph_a = _make_hw_graph("aaa")
     hw_graph_b = _make_hw_graph("bbb")
@@ -7915,23 +7950,35 @@ def _test_synthesize_hw_graph_post_lowering_swap_variants() -> None:
     )
 
 
-def _test_synthesize_hw_graph_post_lowering_reaches_fixpoint() -> None:
+def _test_synthesize_hw_graph_post_lowering_reaches_fixpoint_without_growing_variants() -> None:
     from unittest.mock import patch
 
     def _make_hw_graph(tag: str) -> nuGraph:
-        return nuGraph([
-            Node("x", "input", [], {"shape": (4, 8)}, (4, 8)),
-            Node("w", "input", [], {"shape": (8, 16)}, (8, 16)),
-            Node(f"hw_{tag}", "nc_matmul", ["x", "w"], {"tag": tag}, (4, 16)),
-        ])
+        x = Node("x", "input", [], {"shape": (4, 8)}, (4, 8))
+        w = Node("w", "input", [], {"shape": (8, 16)}, (8, 16))
+        if tag == "a":
+            xt = Node("xt_a", "nc_transpose", ["x"], {}, (8, 4))
+            return nuGraph([x, w, xt, Node("hw_a", "nc_matmul", ["xt_a", "w"], {}, (4, 16))])
+        if tag == "b":
+            act = Node("act_b", "activation", ["x"], {"op": nl.silu}, (4, 8))
+            return nuGraph([x, w, act, Node("hw_b", "nc_matmul", ["act_b", "w"], {}, (4, 16))])
+        if tag == "c":
+            xt = Node("xt_c", "nc_transpose", ["x"], {}, (8, 4))
+            return nuGraph([x, w, xt, Node("hw_c", "nc_matmul", ["w", "xt_c"], {}, (16, 4))])
+        xt = Node("xt_d", "nc_transpose", ["x"], {}, (8, 4))
+        act = Node("act_d", "activation", ["xt_d"], {"op": nl.silu}, (8, 4))
+        trans = Node("trans_d", "nc_transpose", ["act_d"], {}, (4, 8))
+        return nuGraph([x, w, xt, act, trans, Node("hw_d", "nc_matmul", ["trans_d", "w"], {}, (8, 16))])
 
     hw_graph_a = _make_hw_graph("a")
     hw_graph_b = _make_hw_graph("b")
     hw_graph_c = _make_hw_graph("c")
+    hw_graph_d = _make_hw_graph("d")
 
     sig_a = graph_signature(hw_graph_a)
     sig_b = graph_signature(hw_graph_b)
     sig_c = graph_signature(hw_graph_c)
+    sig_d = graph_signature(hw_graph_d)
 
     G = build_kernel_transpose_matmul_graph(4, 8, 16)
     sig_original = graph_signature(G)
@@ -7947,7 +7994,7 @@ def _test_synthesize_hw_graph_post_lowering_reaches_fixpoint() -> None:
         if sig == sig_b:
             return [hw_graph_b, hw_graph_c]
         if sig == sig_c:
-            return [hw_graph_c]
+            return [hw_graph_c, hw_graph_d]
         return [graph]
 
     def _mocked_lower(variants, max_hw_size=2, timeout=3000, verbose=False, max_workers=None):
@@ -7960,13 +8007,112 @@ def _test_synthesize_hw_graph_post_lowering_reaches_fixpoint() -> None:
         hw_results = synthesize_hw_graph(G, max_hw_size=2, timeout=5000)
 
     assert hw_gen_call_sigs == [sig_a, sig_b, sig_c], (
-        "Phase-2 should keep processing newly-discovered hw variants until no new variants remain"
+        "Phase-2 should keep processing newly-discovered non-growing variants until no more remain"
     )
     result_sigs = {graph_signature(g) for g in hw_results}
     assert result_sigs == {sig_a, sig_b, sig_c}, (
-        "Fixpoint Phase-2 propagation should include transitively discovered hw variants"
+        "Fixpoint Phase-2 propagation should include transitively discovered non-growing hw variants"
     )
-    print(" synthesize_hw_graph: post-lowering propagation reaches fixpoint")
+    assert sig_d not in result_sigs, (
+        "Growing post-lowering variants should be discarded during propagation"
+    )
+    print(" synthesize_hw_graph: post-lowering propagation reaches fixpoint without growing variants")
+
+
+def _test_synthesize_hw_graph_post_lowering_dedupes_fresh_ids() -> None:
+    from unittest.mock import patch
+
+    def _make_same_structure(tag: str) -> nuGraph:
+        return nuGraph([
+            Node("x", "input", [], {"shape": (4, 8)}, (4, 8)),
+            Node("w", "input", [], {"shape": (8, 16)}, (8, 16)),
+            Node(f"xt_{tag}", "nc_transpose", ["x"], {}, (8, 4)),
+            Node(f"hw_{tag}", "nc_matmul", [f"xt_{tag}", "w"], {}, (4, 16)),
+        ])
+
+    hw_graph_a = _make_same_structure("a")
+    hw_graph_b = _make_same_structure("b")
+    sig_a = graph_signature(hw_graph_a)
+    sig_b = graph_signature(hw_graph_b)
+    assert sig_a != sig_b, "Fresh-id fixtures should differ under the raw signature"
+    assert graph_structure_signature(hw_graph_a) == graph_structure_signature(hw_graph_b), (
+        "Fresh-id fixtures should collapse under the structural signature"
+    )
+
+    G = build_kernel_transpose_matmul_graph(4, 8, 16)
+    sig_original = graph_signature(G)
+    hw_gen_call_sigs: list[str] = []
+
+    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False) -> list[nuGraph]:
+        sig = graph_signature(graph)
+        if sig == sig_original:
+            return [graph]
+        hw_gen_call_sigs.append(sig)
+        if sig == sig_a:
+            return [hw_graph_a, hw_graph_b]
+        return [graph]
+
+    def _mocked_lower(variants, max_hw_size=2, timeout=3000, verbose=False, max_workers=None):
+        return [hw_graph_a]
+
+    with (
+        patch(f"{__name__}.nu_graph_generation_z3", side_effect=_mocked_nu_gen),
+        patch(f"{__name__}.lower_nu_graph_variants", side_effect=_mocked_lower),
+    ):
+        hw_results = synthesize_hw_graph(G, max_hw_size=2, timeout=5000)
+
+    assert hw_gen_call_sigs == [sig_a], (
+        "Phase-2 should not re-process structurally identical variants that only differ by fresh clone ids"
+    )
+    assert len(hw_results) == 1, "Structurally identical fresh-id variants should be deduplicated"
+    assert graph_signature(hw_results[0]) == sig_a, "The original lowered representative should be preserved"
+    print(" synthesize_hw_graph: fresh-id post-lowering variants are deduplicated structurally")
+
+
+def _test_z3_equivalent_order_skips_solver_for_invalid_nc_matmul_broadcast_swap() -> None:
+    from unittest.mock import patch
+
+    warmup_x = SymTensor("warmup_x", shape=(4, 8))
+    warmup_y = SymTensor("warmup_y", shape=(4, 8))
+    warmup_w = SymTensor("warmup_w", shape=(8, 16))
+    warmup_reduce = tensor_reduce(dst=None, data=warmup_y, op=nl.add, axis=1, keepdims=True)
+    assert warmup_reduce is not None, "Internal test error: tensor_reduce warmup failed"
+    warmup_xt = nc_transpose(dst=None, data=warmup_x)
+    assert warmup_xt is not None, "Internal test error: nc_transpose warmup failed"
+    warmup_mm = nc_matmul(dst=None, stationary=warmup_xt, moving=warmup_w)
+    assert warmup_mm is not None, "Internal test error: nc_matmul warmup failed"
+    warmup_bias = tensor_scalar(dst=None, data=warmup_x, op0=nl.add, operand0=warmup_reduce)
+    assert warmup_bias is not None, "Internal test error: tensor_scalar warmup failed"
+    warmup_bias_t = nc_transpose(dst=None, data=warmup_bias)
+    assert warmup_bias_t is not None, "Internal test error: nc_transpose bias warmup failed"
+    warmup_bias_mm = nc_matmul(dst=None, stationary=warmup_bias_t, moving=warmup_w)
+    assert warmup_bias_mm is not None, "Internal test error: second nc_matmul warmup failed"
+
+    G = nuGraph([
+        Node("x", "input", [], {"shape": (4, 8)}, (4, 8)),
+        Node("y", "input", [], {"shape": (4, 8)}, (4, 8)),
+        Node("w", "input", [], {"shape": (8, 16)}, (8, 16)),
+        Node("tensor_reduce_1314", "tensor_reduce", ["y"], {"op": nl.add, "axis": 1, "keepdims": True}, (4, 1)),
+        Node("nc_transpose_1316", "nc_transpose", ["x"], {}, (8, 4)),
+        Node("nc_matmul_1317", "nc_matmul", ["nc_transpose_1316", "w"], {}, (4, 16)),
+        Node("tensor_scalar_1320", "tensor_scalar", ["x", "tensor_reduce_1314"], {"op0": nl.add, "operand0_input_index": 1}, (4, 8)),
+        Node("nc_transpose_1322", "nc_transpose", ["tensor_scalar_1320"], {}, (8, 4)),
+        Node("nc_matmul_1323", "nc_matmul", ["nc_transpose_1322", "w"], {}, (4, 16)),
+        Node("broadcast_1326", "broadcast", ["nc_matmul_1323", "nc_matmul_1317"], {}, (4, 16)),
+    ])
+
+    pos = _position_by_id(G, "nc_matmul_1317")
+    succ_pos = _position_by_id(G, "broadcast_1326")
+    assert pos is not None and succ_pos is not None, "Internal test error: missing nc_matmul/broadcast nodes"
+
+    slow_false_candidates = _swap_with_successor_variants(G, pos, succ_pos, {"w"})
+    assert len(slow_false_candidates) == 1, "Expected exactly one invalid w-clone nc_matmul/broadcast candidate"
+    G_bad, _ = slow_false_candidates[0]
+
+    with patch(f"{__name__}.check_equivalent", side_effect=AssertionError("solver should not be called")):
+        ok = z3_equivalent_order(G.node_at(pos), G.node_at(succ_pos), G, G_bad, verbose=False)
+    assert not ok, "Invalid nc_matmul/broadcast swap must be rejected before solver dispatch"
+    print(" z3_equivalent_order: invalid nc_matmul/broadcast swap rejected before solver dispatch")
 
 
 def _test_synthesize_hw_graph_verbose_prints_phase_variants() -> None:
@@ -8144,7 +8290,9 @@ def run_all_tests() -> None:
     _test_matmul_with_complex_input_sym_not_rejected()
     _test_matmul_missing_input_guard()
     _test_synthesize_hw_graph_post_lowering_swap_variants()
-    _test_synthesize_hw_graph_post_lowering_reaches_fixpoint()
+    _test_synthesize_hw_graph_post_lowering_reaches_fixpoint_without_growing_variants()
+    _test_synthesize_hw_graph_post_lowering_dedupes_fresh_ids()
+    _test_z3_equivalent_order_skips_solver_for_invalid_nc_matmul_broadcast_swap()
     _test_synthesize_hw_graph_verbose_prints_phase_variants()
     _test_relu_all_lowerings_found_within_depth_budget()
     print("=============== ALL TESTS PASSED  =====================\n")
