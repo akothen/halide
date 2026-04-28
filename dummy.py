@@ -5539,11 +5539,10 @@ def _build_general_simplification_pool(
 
 
 def _two_node_simplification_candidates(G: nuGraph) -> list[tuple[Node, Node]]:
-    """Return (producer, consumer) hw-node pairs eligible for simplification.
+    """Return (producer, consumer) node pairs eligible for simplification.
 
     A pair qualifies when:
-    - Both nodes are hardware ops (not ``input`` and not in
-      ``_PUBLIC_PASSTHROUGH_OPS``).
+    - Both nodes are graph ops other than ``input``.
     - The producer's *only* user in the graph is the consumer (sole-user
       condition), which guarantees the producer output can be removed safely.
     """
@@ -5556,13 +5555,11 @@ def _two_node_simplification_candidates(G: nuGraph) -> list[tuple[Node, Node]]:
     candidates: list[tuple[Node, Node]] = []
 
     for consumer in G.nodes:
-        if consumer.op == "input" or consumer.op in _PUBLIC_PASSTHROUGH_OPS:
+        if consumer.op == "input":
             continue
         for inp_id in consumer.inputs:
             producer = node_by_id.get(inp_id)
             if producer is None or producer.op == "input":
-                continue
-            if producer.op in _PUBLIC_PASSTHROUGH_OPS:
                 continue
             # Sole-user condition: producer's only consumer is this node.
             if used_count.get(producer.id, 0) != 1:
@@ -5579,8 +5576,17 @@ def _simplify_hw_graph_once(
 ) -> Optional[nuGraph]:
     """Try a single simplification step on *G*.
 
-    Iterates over all 2-node (producer → consumer) candidates and attempts to
-    replace the composition with either:
+    Iterates over all simplification candidates and attempts to replace them with:
+    - 0 nodes — if a node/subgraph output is semantically equivalent to one of
+      its external inputs (identity/passthrough).
+    - 1 node  — if a single hardware op is semantically equivalent to a
+      2-node composition.
+
+    Candidate kinds:
+    - 1 node  — any non-input node, which may simplify to an external input.
+    - 2 nodes — any producer → consumer pair with the sole-user property.
+
+    For 2-node compositions this can replace the composition with either:
     - 0 nodes — if the consumer output is semantically equivalent to one of
       the external inputs (identity/passthrough).
     - 1 node  — if a single hardware op is semantically equivalent to the
@@ -5597,6 +5603,65 @@ def _simplify_hw_graph_once(
         all_syms = _graph_symbolic_tensors(G)
     except (KeyError, Exception):
         return None
+
+    # ------------------------------------------------------------------
+    # Try 1-node replacement (identity / passthrough)
+    # ------------------------------------------------------------------
+    for node in G.nodes:
+        if node.op == "input":
+            continue
+
+        external_input_ids: list[str] = []
+        seen_ext: set[str] = set()
+        for inp_id in node.inputs:
+            if inp_id not in seen_ext:
+                seen_ext.add(inp_id)
+                external_input_ids.append(inp_id)
+
+        if not external_input_ids:
+            continue
+
+        external_syms: list[Optional[SymTensor]] = [all_syms.get(eid) for eid in external_input_ids]
+        if any(s is None for s in external_syms):
+            continue
+        ext_syms: list[SymTensor] = cast(list[SymTensor], external_syms)
+
+        target_sym = all_syms.get(node.id)
+        if target_sym is None:
+            continue
+
+        replacement_id: Optional[str] = None
+        for ext_id, ext_sym in zip(external_input_ids, ext_syms):
+            if _check_equivalent_quiet(target_sym, ext_sym, timeout=timeout):
+                replacement_id = ext_id
+                if verbose:
+                    print(
+                        f"  [simplify] {node.id}({node.op}): "
+                        f"0-node, rewire to {ext_id}"
+                    )
+                break
+
+        if replacement_id is None:
+            continue
+
+        new_graph_nodes: list[Node] = []
+        for n in G.nodes:
+            if n.id == node.id:
+                continue
+            new_inputs = [
+                replacement_id if inp == node.id else inp
+                for inp in n.inputs
+            ]
+            new_graph_nodes.append(
+                Node(n.id, n.op, new_inputs, dict(n.attrs), n.shape)
+            )
+
+        new_G = nuGraph(new_graph_nodes)
+        try:
+            annotate_shapes_concrete(new_G)
+        except Exception:
+            pass
+        return new_G
 
     for producer, consumer in candidates:
         # ------------------------------------------------------------------
@@ -8648,6 +8713,47 @@ def _test_simplify_hw_graph_1node() -> None:
     print(" simplify_hw_graph: 1-node — double activation(relu) simplified to single activation")
 
 
+def _test_simplify_hw_graph_single_broadcast_identity() -> None:
+    """Unit test: same-shape broadcast simplifies to 0 nodes.
+
+    ``broadcast(x, target)`` is semantically equivalent to ``x`` when ``x`` and
+    ``target`` already have the same shape, so ``_simplify_hw_graph_once`` must
+    rewire uses of the broadcast node directly to ``x``.
+    """
+    # Warmup: ensure lazy semantics are registered.
+    _invoke_hw_op("broadcast", [SymTensor("_w4", shape=(4, 8)), SymTensor("_w5", shape=(4, 8))], {})
+    _invoke_hw_op("activation", [SymTensor("_w6", shape=(4, 8))], {"op": nl.relu})
+
+    _act_relu_attrs = {"op": nl.relu, "scale": 1.0, "bias_const": None, "with_reduce": False}
+
+    G = nuGraph([
+        Node("x", "input", [], {"shape": (4, 8), "sym_shape": ("x_d0", "x_d1")}, (4, 8)),
+        Node("target", "input", [], {"shape": (4, 8), "sym_shape": ("x_d0", "x_d1")}, (4, 8)),
+        Node("bcast", "broadcast", ["x", "target"], {}, (4, 8)),
+        Node("relu", "activation", ["bcast"], _act_relu_attrs, (4, 8)),
+    ])
+
+    candidates = _two_node_simplification_candidates(G)
+    assert any(prod.id == "bcast" and cons.id == "relu" for prod, cons in candidates), (
+        f"Expected broadcast -> relu to be considered for simplification, got {candidates!r}"
+    )
+
+    simplified = _simplify_hw_graph_once(G, timeout=5000, verbose=False)
+    assert simplified is not None, (
+        "Expected _simplify_hw_graph_once to simplify same-shape broadcast to identity"
+    )
+
+    bcast_nodes = [n for n in simplified.nodes if n.id == "bcast"]
+    assert not bcast_nodes, (
+        f"Expected broadcast node to be removed, got {bcast_nodes!r}"
+    )
+    relu = _node_by_id(simplified, "relu")
+    assert relu is not None and relu.inputs == ["x"], (
+        f"Expected relu to be rewired directly to x, got {relu!r}"
+    )
+    print(" simplify_hw_graph: 0-node — same-shape broadcast simplified to identity")
+
+
 def _test_simplify_hw_graph_variants_integration() -> None:
     """Integration test: simplify_hw_graph_variants simplifies all eligible graphs.
 
@@ -8837,6 +8943,7 @@ def run_all_tests() -> None:
     print("\n================ RUNNING SIMPLIFICATION TESTS ==========")
     _test_simplify_hw_graph_0node()
     _test_simplify_hw_graph_1node()
+    _test_simplify_hw_graph_single_broadcast_identity()
     _test_simplify_hw_graph_variants_integration()
     _test_synthesize_hw_graph_verbose_prints_post_simplification()
     print("=============== ALL TESTS PASSED  =====================\n")
