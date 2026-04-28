@@ -5596,8 +5596,6 @@ def _simplify_hw_graph_once(
     ``None`` when no simplification is possible.
     """
     candidates = _two_node_simplification_candidates(G)
-    if not candidates:
-        return None
 
     try:
         all_syms = _graph_symbolic_tensors(G)
@@ -8754,6 +8752,60 @@ def _test_simplify_hw_graph_single_broadcast_identity() -> None:
     print(" simplify_hw_graph: 0-node — same-shape broadcast simplified to identity")
 
 
+def _test_simplify_hw_graph_broadcast_tensor_scalar_redundant() -> None:
+    """Unit test: broadcast feeding tensor_scalar is absorbed by tensor_scalar.
+
+    ``tensor_scalar`` already broadcasts its scalar/tensor operands to the data
+    operand's shape.  A preceding ``broadcast(reduce, x)`` on the scalar operand
+    is therefore redundant and should be rewritten to a direct
+    ``tensor_scalar(x, reduce)`` replacement.
+    """
+    # Warmup: ensure lazy semantics are registered.
+    _invoke_hw_op("tensor_reduce", [SymTensor("_w7", shape=(4, 8))], {"op": nl.add, "axis": 1, "keepdims": True})
+    _invoke_hw_op("broadcast", [SymTensor("_w8", shape=(4, 1)), SymTensor("_w9", shape=(4, 8))], {})
+    _invoke_hw_op("tensor_scalar", [SymTensor("_w10", shape=(4, 8)), SymTensor("_w11", shape=(4, 1))], {"op0": nl.add, "operand0_input_index": 1})
+
+    tensor_scalar_attrs = {"op0": nl.add, "operand0_input_index": 1}
+
+    G = nuGraph([
+        Node("x", "input", [], {"shape": (4, 8), "sym_shape": ("x_d0", "x_d1")}, (4, 8)),
+        Node("y", "input", [], {"shape": (4, 8), "sym_shape": ("x_d0", "x_d1")}, (4, 8)),
+        Node("reduce", "tensor_reduce", ["y"], {"op": nl.add, "axis": 1, "keepdims": True}, (4, 1)),
+        Node("bcast", "broadcast", ["reduce", "x"], {}, (4, 8)),
+        Node("add", "tensor_scalar", ["x", "bcast"], tensor_scalar_attrs, (4, 8)),
+    ])
+
+    candidates = _two_node_simplification_candidates(G)
+    assert any(prod.id == "bcast" and cons.id == "add" for prod, cons in candidates), (
+        f"Expected broadcast -> tensor_scalar to be considered for simplification, got {candidates!r}"
+    )
+
+    simplified = _simplify_hw_graph_once(G, timeout=5000, verbose=False)
+    assert simplified is not None, (
+        "Expected _simplify_hw_graph_once to absorb broadcast into tensor_scalar"
+    )
+
+    assert _node_by_id(simplified, "bcast") is None, (
+        f"Expected broadcast node to be removed, got graph: {graph_signature(simplified)}"
+    )
+    assert _node_by_id(simplified, "add") is None, (
+        f"Expected original tensor_scalar node to be replaced, got graph: {graph_signature(simplified)}"
+    )
+
+    tensor_scalar_nodes = [n for n in simplified.nodes if n.op == "tensor_scalar"]
+    assert len(tensor_scalar_nodes) == 1, (
+        f"Expected exactly one replacement tensor_scalar, got {tensor_scalar_nodes!r}"
+    )
+    replacement = tensor_scalar_nodes[0]
+    assert replacement.inputs == ["x", "reduce"], (
+        f"Expected replacement tensor_scalar to use x and reduce directly, got {replacement.inputs!r}"
+    )
+    assert replacement.attrs.get("operand0_input_index") == 1, (
+        f"Expected replacement tensor_scalar operand to reference reduce, got attrs={replacement.attrs!r}"
+    )
+    print(" simplify_hw_graph: 1-node — broadcast feeding tensor_scalar absorbed")
+
+
 def _test_simplify_hw_graph_variants_integration() -> None:
     """Integration test: simplify_hw_graph_variants simplifies all eligible graphs.
 
@@ -8944,6 +8996,7 @@ def run_all_tests() -> None:
     _test_simplify_hw_graph_0node()
     _test_simplify_hw_graph_1node()
     _test_simplify_hw_graph_single_broadcast_identity()
+    _test_simplify_hw_graph_broadcast_tensor_scalar_redundant()
     _test_simplify_hw_graph_variants_integration()
     _test_synthesize_hw_graph_verbose_prints_post_simplification()
     print("=============== ALL TESTS PASSED  =====================\n")
