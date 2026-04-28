@@ -5417,8 +5417,8 @@ def synthesize_hw_graph(
     Phase 1: generate nuGraph variants from the original public-op graph via
     ``nu_graph_generation_z3``, then lower each to a hardware-only graph.
 
-    Phase 2: immediately simplify the distinct lowered hardware graphs by
-    collapsing semantically-equivalent nodes/subgraphs when rewiring is safe
+    Phase 2: immediately simplify the distinct lowered hardware graphs in place
+    by collapsing semantically-equivalent nodes/subgraphs when rewiring is safe
     (for 2-node rewrites, the producer must have the consumer as its sole user).
 
     Phase 3: run ``nu_graph_generation_z3`` again on the lowered + simplified
@@ -5429,8 +5429,8 @@ def synthesize_hw_graph(
     inputs and thus structurally grows the graph, but the rewrite is still
     valid.
 
-    Phase 4: simplify again after post-lowering swap/propagation so newly
-    exposed 2-node compositions are also collapsed.
+    Phase 4: simplify the current variant set again after post-lowering
+    swap/propagation so newly exposed 2-node compositions are also collapsed.
 
     All returned graphs are deduplicated by structural graph signature to
     guarantee fixpoint termination.  Pass *verbose=True* to print all sketches
@@ -5465,13 +5465,12 @@ def synthesize_hw_graph(
     # ------------------------------------------------------------------
     # Phase 2: simplify immediately after lowering
     # ------------------------------------------------------------------
-    phase2_results = simplify_hw_graph_variants(
+    results = simplify_hw_graph_variants(
         results,
-        seen=seen,
         timeout=timeout,
         verbose=verbose,
     )
-    results.extend(phase2_results)
+    seen.update(graph_structure_signature(g) for g in results)
     if verbose:
         _print_synthesis_phase_variants("post-lowering simplification", results)
 
@@ -5500,13 +5499,11 @@ def synthesize_hw_graph(
     # ------------------------------------------------------------------
     # Phase 4: simplify again after swap/propagation
     # ------------------------------------------------------------------
-    phase4_results = simplify_hw_graph_variants(
+    results = simplify_hw_graph_variants(
         results,
-        seen=seen,
         timeout=timeout,
         verbose=verbose,
     )
-    results.extend(phase4_results)
     if verbose:
         _print_synthesis_phase_variants("post-simplification", results)
 
@@ -5781,40 +5778,38 @@ def _simplify_hw_graph_once(
 
 def simplify_hw_graph_variants(
     graphs: list[nuGraph],
-    seen: Optional[set[str]] = None,
     timeout: int = 3000,
     verbose: bool = False,
 ) -> list[nuGraph]:
     """Apply single-node and 2-node simplification to every graph in *graphs*.
 
-    Repeatedly calls ``_simplify_hw_graph_once`` until no further simplification
-    is possible for each variant, then de-duplicates results by structural
-    signature.  New variants are added to *seen* so callers can avoid
-    processing the same structure twice.
+    Each input graph is simplified to a fixpoint and replaces that input
+    variant.  Simplification must not produce extra variants; it only returns
+    the current simplified variant set, de-duplicated by structural signature.
 
-    Returns only the *newly* discovered simplified graphs (not the originals).
+    Returns the simplified graph for each input graph, or the original graph
+    when no simplification applies.
     """
-    if seen is None:
-        seen = set()
+    simplified_variants: list[nuGraph] = []
+    seen: set[str] = set()
 
-    new_variants: list[nuGraph] = []
-    worklist: list[nuGraph] = list(graphs)
+    for g in graphs:
+        current = g
+        while True:
+            simplified = _simplify_hw_graph_once(current, timeout=timeout, verbose=verbose)
+            if simplified is None:
+                break
+            current = simplified
 
-    for g in worklist:
-        simplified = _simplify_hw_graph_once(g, timeout=timeout, verbose=verbose)
-        if simplified is None:
+        if not _graph_uses_hw_only(current):
             continue
-        sig = graph_structure_signature(simplified)
+        sig = graph_structure_signature(current)
         if sig in seen:
             continue
         seen.add(sig)
-        # Only keep hw-only graphs
-        if not _graph_uses_hw_only(simplified):
-            continue
-        new_variants.append(simplified)
-        worklist.append(simplified)
+        simplified_variants.append(current)
 
-    return new_variants
+    return simplified_variants
 
 
 # ---------------------------------------------------------------------------
@@ -8506,6 +8501,8 @@ def _test_z3_equivalent_order_skips_solver_for_invalid_nc_matmul_broadcast_swap(
 
 
 def _test_synthesize_hw_graph_verbose_prints_phase_variants() -> None:
+    from unittest.mock import patch
+
     G = build_kernel_transpose_matmul_graph(4, 8, 16)
     phase1_variant = G.clone()
     phase1_variant.nodes[-1] = Node(
@@ -8555,8 +8552,8 @@ def _test_synthesize_hw_graph_verbose_prints_phase_variants() -> None:
 
     buf = io.StringIO()
     with (
-        patch("__main__.nu_graph_generation_z3", side_effect=_mocked_nu_gen),
-        patch("__main__.lower_nu_graph_variants", side_effect=_mocked_lower),
+        patch(f"{__name__}.nu_graph_generation_z3", side_effect=_mocked_nu_gen),
+        patch(f"{__name__}.lower_nu_graph_variants", side_effect=_mocked_lower),
         redirect_stdout(buf),
     ):
         hw_results = synthesize_hw_graph(G, max_hw_size=2, timeout=5000, verbose=True)
@@ -8816,12 +8813,12 @@ def _test_simplify_hw_graph_broadcast_tensor_scalar_redundant() -> None:
 
 
 def _test_simplify_hw_graph_variants_integration() -> None:
-    """Integration test: simplify_hw_graph_variants simplifies all eligible graphs.
+    """Integration test: simplify_hw_graph_variants simplifies variants in place.
 
     Builds two graphs — one with a double-transpose (0-node simplifiable) and one
     with a double-relu activation (1-node simplifiable) — passes both through
-    ``simplify_hw_graph_variants`` and asserts that a non-empty list of simplified
-    variants is returned with fewer non-input nodes than their originals.
+    ``simplify_hw_graph_variants`` and asserts that simplification returns the
+    same number of variants with fewer non-input nodes than their originals.
 
     Activation nodes require ``scale: 1.0`` in their attrs so the symbolic
     compiler uses the correct default scale rather than falling back to 0.
@@ -8847,14 +8844,10 @@ def _test_simplify_hw_graph_variants_integration() -> None:
         Node("act2", "activation", ["act1"], _act_relu_attrs, (4, 8)),
     ])
 
-    seen: set[str] = {
-        graph_structure_signature(G_tt),
-        graph_structure_signature(G_ra),
-    }
-    simplified = simplify_hw_graph_variants([G_tt, G_ra], seen=seen, timeout=5000, verbose=False)
+    simplified = simplify_hw_graph_variants([G_tt, G_ra], timeout=5000, verbose=False)
 
-    assert simplified, (
-        "simplify_hw_graph_variants must return at least one simplified variant"
+    assert len(simplified) == 2, (
+        f"simplify_hw_graph_variants must return one simplified graph per input variant, got {len(simplified)}"
     )
     for sv in simplified:
         non_input = [n for n in sv.nodes if n.op != "input"]
@@ -8866,8 +8859,64 @@ def _test_simplify_hw_graph_variants_integration() -> None:
         )
     print(
         f" simplify_hw_graph: integration — "
-        f"{len(simplified)} simplified variant(s) produced from 2 graphs"
+        f"{len(simplified)} variant(s) simplified in place"
     )
+
+
+def _test_synthesize_hw_graph_simplification_replaces_variants() -> None:
+    """Regression test: simplification replaces variants instead of appending.
+
+    ``synthesize_hw_graph`` should continue with the simplified form of a
+    lowered graph.  It must not keep both the original lowered graph and the
+    simplified graph as separate variants.
+    """
+    from unittest.mock import patch
+
+    _invoke_hw_op("nc_transpose", [SymTensor("_w12", shape=(4, 8))], {})
+
+    G = build_kernel_transpose_matmul_graph(4, 8, 16)
+    lowered = nuGraph([
+        Node("x", "input", [], {"shape": (4, 8), "sym_shape": ("x_d0", "x_d1")}, (4, 8)),
+        Node("nc_t1", "nc_transpose", ["x"], {}, (8, 4)),
+        Node("nc_t2", "nc_transpose", ["nc_t1"], {}, (4, 8)),
+    ])
+    expected_simplified = nuGraph([
+        Node("x", "input", [], {"shape": (4, 8), "sym_shape": ("x_d0", "x_d1")}, (4, 8)),
+    ])
+
+    sig_original = graph_signature(G)
+    sig_lowered = graph_structure_signature(lowered)
+    sig_simplified = graph_structure_signature(expected_simplified)
+    hw_generation_inputs: list[str] = []
+
+    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False) -> list[nuGraph]:
+        if graph_signature(graph) == sig_original:
+            return [graph]
+        hw_generation_inputs.append(graph_structure_signature(graph))
+        return [graph]
+
+    def _mocked_lower(variants, max_hw_size=2, timeout=3000, verbose=False, max_workers=None):
+        return [lowered]
+
+    with (
+        patch(f"{__name__}.nu_graph_generation_z3", side_effect=_mocked_nu_gen),
+        patch(f"{__name__}.lower_nu_graph_variants", side_effect=_mocked_lower),
+    ):
+        hw_results = synthesize_hw_graph(G, max_hw_size=2, timeout=5000)
+
+    result_sigs = [graph_structure_signature(g) for g in hw_results]
+    assert result_sigs == [sig_simplified], (
+        "Simplification should replace the lowered variant with its simplified form; "
+        f"got result signatures {result_sigs!r}"
+    )
+    assert sig_lowered not in result_sigs, (
+        "Original unsimplified lowered variant must not remain as an extra result"
+    )
+    assert hw_generation_inputs == [sig_simplified], (
+        "Post-simplification variant generation should proceed from the simplified graph only; "
+        f"got inputs {hw_generation_inputs!r}"
+    )
+    print(" synthesize_hw_graph: simplification replaces variants in place")
 
 
 def _test_synthesize_hw_graph_verbose_prints_post_simplification() -> None:
@@ -8924,8 +8973,8 @@ def _test_synthesize_hw_graph_verbose_prints_post_simplification() -> None:
 
     buf = io.StringIO()
     with (
-        patch("__main__.nu_graph_generation_z3", side_effect=_mocked_nu_gen),
-        patch("__main__.lower_nu_graph_variants", side_effect=_mocked_lower),
+        patch(f"{__name__}.nu_graph_generation_z3", side_effect=_mocked_nu_gen),
+        patch(f"{__name__}.lower_nu_graph_variants", side_effect=_mocked_lower),
         redirect_stdout(buf),
     ):
         hw_results = synthesize_hw_graph(G, max_hw_size=2, timeout=5000, verbose=True)
@@ -9007,6 +9056,7 @@ def run_all_tests() -> None:
     _test_simplify_hw_graph_single_broadcast_identity()
     _test_simplify_hw_graph_broadcast_tensor_scalar_redundant()
     _test_simplify_hw_graph_variants_integration()
+    _test_synthesize_hw_graph_simplification_replaces_variants()
     _test_synthesize_hw_graph_verbose_prints_post_simplification()
     print("=============== ALL TESTS PASSED  =====================\n")
 
