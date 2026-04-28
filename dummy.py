@@ -13,7 +13,7 @@ from enum import Enum
 from collections import deque
 from itertools import combinations, permutations, product as _iproduct
 from threading import Lock, RLock
-from typing import Any, Callable, Optional, List
+from typing import Any, Callable, Optional, List, cast
 
 import z3
 
@@ -5590,7 +5590,7 @@ def _simplify_hw_graph_once(
         external_syms: list[Optional[SymTensor]] = [all_syms.get(eid) for eid in external_input_ids]
         if any(s is None for s in external_syms):
             continue
-        ext_syms: list[SymTensor] = [s for s in external_syms if s is not None]
+        ext_syms: list[SymTensor] = cast(list[SymTensor], external_syms)
 
         target_sym = all_syms.get(consumer.id)
         if target_sym is None:
@@ -5600,7 +5600,7 @@ def _simplify_hw_graph_once(
         # Try 0-node replacement (identity / passthrough)
         # ------------------------------------------------------------------
         replacement_id: Optional[str] = None
-        new_nodes_for_replacement: list[Node] = []  # empty = 0-node
+        new_nodes_for_replacement: list[Node] = []  # empty list = 0-node (identity/passthrough) replacement
 
         for ext_id, ext_sym in zip(external_input_ids, ext_syms):
             if _check_equivalent_quiet(target_sym, ext_sym, timeout=timeout):
@@ -5645,14 +5645,15 @@ def _simplify_hw_graph_once(
         # Build the simplified graph
         # ------------------------------------------------------------------
         new_graph_nodes: list[Node] = []
-        inserted_new_nodes = not new_nodes_for_replacement
+        is_zero_node_replacement = not new_nodes_for_replacement
+        inserted_replacement = is_zero_node_replacement  # 0-node: nothing to insert
 
         for n in G.nodes:
             if n.id == producer.id:
                 # Insert replacement node(s) at the producer's position
                 if new_nodes_for_replacement:
                     new_graph_nodes.extend(new_nodes_for_replacement)
-                    inserted_new_nodes = True
+                    inserted_replacement = True
                 continue  # drop producer
             if n.id == consumer.id:
                 continue  # drop consumer
@@ -5667,7 +5668,7 @@ def _simplify_hw_graph_once(
 
         # Append replacement nodes at the end if they were never inserted
         # (can happen if producer was the last node — edge case safety)
-        if not inserted_new_nodes:
+        if not inserted_replacement and new_nodes_for_replacement:
             new_graph_nodes.extend(new_nodes_for_replacement)
 
         new_G = nuGraph(new_graph_nodes)
