@@ -61,7 +61,7 @@ _NormSketch = Any
 _CACHE_MISS: object = object()          # sentinel: key not yet cached
 
 # Single-result cache (used by _lower_node / lower_nu_graph).
-# Maps (op, frozen_attrs, input_ranks) → None (failure) | _NormSketch (success)
+# Maps (op, frozen_attrs, input_shape_keys) → None (failure) | _NormSketch (success)
 _SYNTHESIS_CACHE: dict[tuple, Optional[_NormSketch]] = {}
 
 # All-results cache (used by _lower_node_all / lower_nu_graph_all_variants).
@@ -3104,10 +3104,16 @@ _register_public_semantics()
 
 
 class DummyArray:
-    def __init__(self, node_id: str, shape: tuple[int, ...], nodes: Optional[list[Any]] = None):
+    def __init__(
+        self,
+        node_id: str,
+        shape: tuple[int, ...],
+        nodes: Optional[list[Any]] = None,
+        sym_shape: Optional[tuple[str, ...]] = None,
+    ):
         self.node_id = node_id
         self.shape = shape
-        self.nodes = list(nodes) if nodes is not None else [_make_input_node(node_id, shape)]
+        self.nodes = list(nodes) if nodes is not None else [_make_input_node(node_id, shape, sym_shape=sym_shape)]
 
     @staticmethod
     def _merge_nodes(inputs: list["DummyArray"]) -> list[Any]:
@@ -3210,8 +3216,15 @@ class Node:
         return NodeSig(self.id, self.op, tuple(self.inputs), tuple(sorted(self.attrs.items())))
 
 
-def _make_input_node(node_id: str, shape: tuple[int, ...]) -> Node:
-    return Node(id=node_id, op="input", inputs=[], attrs={"shape": shape})
+def _make_input_node(
+    node_id: str,
+    shape: tuple[int, ...],
+    sym_shape: Optional[tuple[str, ...]] = None,
+) -> Node:
+    attrs: dict[str, Any] = {"shape": shape}
+    if sym_shape is not None:
+        attrs["sym_shape"] = tuple(sym_shape)
+    return Node(id=node_id, op="input", inputs=[], attrs=attrs)
 
 
 @dataclass
@@ -3357,8 +3370,12 @@ def _sym_expr_from_graph_node(
     symbolic_shape: Optional[tuple[z3.ArithRef, ...]] = None,
 ) -> SymTensor:
     if node.op == "input":
-        rank = len(node.attrs.get("shape", node.shape or tuple()))
-        shape = tuple(z3.Int(f"{node.id}_d{k}") for k in range(rank))
+        sym_shape = node.attrs.get("sym_shape")
+        if sym_shape is not None:
+            shape = tuple(z3.Int(str(dim)) for dim in sym_shape)
+        else:
+            rank = len(node.attrs.get("shape", node.shape or tuple()))
+            shape = tuple(z3.Int(f"{node.id}_d{k}") for k in range(rank))
         return SymTensor(node.id, shape=shape)
 
     if node.op not in _SEMANTICS:
@@ -3450,15 +3467,6 @@ def _swap_with_successor_variants(
             return
         seen_graphs.add(sig)
         out.append((G_new, new_pos))
-
-    if (
-        op1.op == "nc_matmul"
-        and op2.op == "nc_transpose"
-        and len(op1.inputs) == 2
-        and clone_inputs == full_input_set
-    ):
-        rebuilt_node = Node(op2.id, op1.op, [op1.inputs[1], op1.inputs[0]], dict(op1.attrs), None)
-        _append_variant([], rebuilt_node)
 
     for rebuilt_inputs in candidate_inputs:
         base_graph = G_cur.clone()
@@ -4244,14 +4252,6 @@ def _shapes_not_provably_equivalent(
             return
         for inp in expr.inputs:
             _collect_candidate_shape_constraints(inp)
-        # tensor_scalar is intentionally directional: data drives the output
-        # tile shape, while operand0/operand1 broadcast *into* that shape.
-        # Those role-selection constraints are stricter than the public op's
-        # symmetric broadcast preconditions, so negating them here would reject
-        # otherwise-correct candidates before the actual equivalence solver has
-        # a chance to validate them.
-        if expr.op == "tensor_scalar":
-            return
         shape_rule, _ = _SEMANTICS.get(expr.op, (None, None))
         if shape_rule is None:
             return
@@ -4641,15 +4641,22 @@ def _make_lowering_cache_key(
 ) -> tuple:
     """Return a hashable key that uniquely identifies a lowering problem.
 
-    The key is built from the target op name, sorted attribute repr pairs, and
-    the rank of each input tensor.  Concrete node IDs and z3 variable names are
-    deliberately excluded so that structurally identical operations encountered
-    in different graph variants (which may have different generated IDs) map to
-    the same key.
+    The key is built from the target op name, sorted attribute repr pairs, and a
+    per-input shape signature that distinguishes concrete dimensions from
+    symbolic ones while remaining insensitive to concrete node IDs and z3
+    variable names.  This keeps cache reuse across structurally identical graph
+    variants, while avoiding reuse of sketches that are only valid for specific
+    concrete input shapes.
     """
+    def _dim_key(dim: Any) -> tuple[str, Optional[int]]:
+        dim_expr = _to_dim(dim)
+        if z3.is_int_value(dim_expr):
+            return ("const", dim_expr.as_long())
+        return ("sym", None)
+
     frozen_attrs = tuple(sorted((k, repr(v)) for k, v in attrs.items()))
-    input_ranks = tuple(s.rank for s in input_syms)
-    return (op, frozen_attrs, input_ranks)
+    input_shape_keys = tuple(tuple(_dim_key(dim) for dim in s.shape) for s in input_syms)
+    return (op, frozen_attrs, input_shape_keys)
 
 
 def _normalize_sketch(
@@ -5890,67 +5897,132 @@ def _graph_from_axon_array(out: DummyArray) -> nuGraph:
     return G
 
 
-def _build_graph_from_kernel(kernel: Callable[..., DummyArray], *inputs: tuple[str, tuple[int, ...]]) -> nuGraph:
-    args = [DummyArray(name, shape) for name, shape in inputs]
+def _build_graph_from_kernel(
+    kernel: Callable[..., DummyArray],
+    *inputs: tuple[str, tuple[int, ...]] | tuple[str, tuple[int, ...], tuple[str, ...]],
+) -> nuGraph:
+    args: list[DummyArray] = []
+    for spec in inputs:
+        if len(spec) == 2:
+            name, shape = spec
+            args.append(DummyArray(name, shape))
+            continue
+        name, shape, sym_shape = spec
+        args.append(DummyArray(name, shape, sym_shape=sym_shape))
     out = kernel(*args)
     return _graph_from_axon_array(out)
 
 
 def build_kernel_matmul_red_div_graph(M: int, K: int, N: int) -> nuGraph:
-    return _build_graph_from_kernel(kernel_matmul_red_div, ("x", (M, K)), ("y", (M, K)), ("w", (K, N)))
+    return _build_graph_from_kernel(
+        kernel_matmul_red_div,
+        ("x", (M, K), ("x_d0", "x_d1")),
+        ("y", (M, K), ("x_d0", "x_d1")),
+        ("w", (K, N), ("x_d1", "w_d1")),
+    )
 
 
 def build_kernel_matmul_red_mul_graph(M: int, K: int, N: int) -> nuGraph:
-    return _build_graph_from_kernel(kernel_matmul_red_mul, ("x", (M, K)), ("y", (M, K)), ("w", (K, N)))
+    return _build_graph_from_kernel(
+        kernel_matmul_red_mul,
+        ("x", (M, K), ("x_d0", "x_d1")),
+        ("y", (M, K), ("x_d0", "x_d1")),
+        ("w", (K, N), ("x_d1", "w_d1")),
+    )
 
 
 def build_kernel_broadcast_row_bias_add_graph(M: int, K: int, N: int) -> nuGraph:
-    return _build_graph_from_kernel(kernel_broadcast_row_bias_add, ("x", (M, K)), ("y", (M, K)), ("w", (K, N)))
+    return _build_graph_from_kernel(
+        kernel_broadcast_row_bias_add,
+        ("x", (M, K), ("x_d0", "x_d1")),
+        ("y", (M, K), ("x_d0", "x_d1")),
+        ("w", (K, N), ("x_d1", "w_d1")),
+    )
 
 
 def build_kernel_reduce_mul_broadcast_graph(M: int, K: int, N: int) -> nuGraph:
-    return _build_graph_from_kernel(kernel_reduce_mul_broadcast, ("x", (M, K)), ("y", (M, K)), ("w", (K, N)))
+    return _build_graph_from_kernel(
+        kernel_reduce_mul_broadcast,
+        ("x", (M, K), ("x_d0", "x_d1")),
+        ("y", (M, K), ("x_d0", "x_d1")),
+        ("w", (K, N), ("x_d1", "w_d1")),
+    )
 
 
 def build_kernel_reduce_broadcast_mul_graph(M: int, K: int, N: int) -> nuGraph:
-    return _build_graph_from_kernel(kernel_reduce_broadcast_mul, ("x", (M, K)), ("y", (M, K)), ("w", (K, N)))
+    return _build_graph_from_kernel(
+        kernel_reduce_broadcast_mul,
+        ("x", (M, K), ("x_d0", "x_d1")),
+        ("y", (M, K), ("x_d0", "x_d1")),
+        ("w", (K, N), ("x_d1", "w_d1")),
+    )
 
 
 def build_kernel_rmsnorm_matmul_graph(M: int, K: int, N: int) -> nuGraph:
-    return _build_graph_from_kernel(kernel_rmsnorm_matmul, ("x", (M, K)), ("y", (M, K)), ("w", (K, N)))
+    return _build_graph_from_kernel(
+        kernel_rmsnorm_matmul,
+        ("x", (M, K), ("x_d0", "x_d1")),
+        ("y", (M, K), ("x_d0", "x_d1")),
+        ("w", (K, N), ("x_d1", "w_d1")),
+    )
 
 
 def build_kernel_softmax_matmul_graph(M: int, K: int, N: int) -> nuGraph:
-    return _build_graph_from_kernel(kernel_softmax_matmul, ("x", (M, K)), ("w", (K, N)))
+    return _build_graph_from_kernel(
+        kernel_softmax_matmul,
+        ("x", (M, K), ("x_d0", "x_d1")),
+        ("w", (K, N), ("x_d1", "w_d1")),
+    )
 
 
 def build_kernel_transpose_matmul_graph(M: int, K: int, N: int) -> nuGraph:
-    return _build_graph_from_kernel(kernel_transpose_matmul, ("x", (M, K)), ("w", (M, N)))
+    return _build_graph_from_kernel(
+        kernel_transpose_matmul,
+        ("x", (M, K), ("x_d0", "x_d1")),
+        ("w", (M, N), ("x_d0", "w_d1")),
+    )
 
 
 def build_kernel_matmul_transpose_graph(M: int, K: int, N: int) -> nuGraph:
-    return _build_graph_from_kernel(kernel_matmul_transpose, ("x", (M, K)), ("w", (K, N)))
+    return _build_graph_from_kernel(
+        kernel_matmul_transpose,
+        ("x", (M, K), ("x_d0", "x_d1")),
+        ("w", (K, N), ("x_d1", "w_d1")),
+    )
 
 
 def build_kernel_relu_matmul_graph(M: int, K: int, N: int) -> nuGraph:
-    return _build_graph_from_kernel(kernel_relu_matmul, ("x", (M, K)), ("w", (K, N)))
+    return _build_graph_from_kernel(
+        kernel_relu_matmul,
+        ("x", (M, K), ("x_d0", "x_d1")),
+        ("w", (K, N), ("x_d1", "w_d1")),
+    )
 
 
 def build_kernel_silu_matmul_graph(M: int, K: int, N: int) -> nuGraph:
-    return _build_graph_from_kernel(kernel_silu_matmul, ("x", (M, K)), ("w", (K, N)))
+    return _build_graph_from_kernel(
+        kernel_silu_matmul,
+        ("x", (M, K), ("x_d0", "x_d1")),
+        ("w", (K, N), ("x_d1", "w_d1")),
+    )
 
 
 def build_kernel_silu_mlp_graph(M: int, K: int, N: int) -> nuGraph:
-    return _build_graph_from_kernel(kernel_silu_mlp, ("x", (M, K)), ("w1", (K, N)), ("w2", (N, N)))
+    return _build_graph_from_kernel(
+        kernel_silu_mlp,
+        ("x", (M, K), ("x_d0", "x_d1")),
+        ("w1", (K, N), ("x_d1", "w1_d1")),
+        ("w2", (N, N), ("w1_d1", "w1_d1")),
+    )
 
 
 def build_kernel_attention_graph(M: int, K: int, N: int) -> nuGraph:
     return _build_graph_from_kernel(
         kernel_attention,
-        ("x", (M, K)),
-        ("w_q", (K, N)),
-        ("w_k", (K, N)),
-        ("w_v", (K, N)),
+        ("x", (M, K), ("x_d0", "x_d1")),
+        ("w_q", (K, N), ("x_d1", "wq_d1")),
+        ("w_k", (K, N), ("x_d1", "wk_d1")),
+        ("w_v", (K, N), ("x_d1", "wv_d1")),
     )
 
 
@@ -6118,44 +6190,6 @@ def _test_matmul_transpose_graph() -> None:
     variants = nu_graph_generation_z3(G, verbose=False)
     assert len(variants) >= 2, "matmul_transpose should emit a swapped variant"
     print(" matmul_transpose graph builds and runs variant generation")
-
-
-def _test_nc_matmul_transpose_graph() -> None:
-    warmup_x = SymTensor("warmup_x", shape=(4, 8))
-    warmup_w = SymTensor("warmup_w", shape=(8, 16))
-    warmup_xt = nc_transpose(dst=None, data=warmup_x)
-    assert warmup_xt is not None, "Internal test error: nc_transpose warmup failed"
-    warmup_mm = nc_matmul(dst=None, stationary=warmup_xt, moving=warmup_w)
-    assert warmup_mm is not None, "Internal test error: nc_matmul warmup failed"
-    assert nc_transpose(dst=None, data=warmup_mm) is not None, "Internal test error: nc_transpose output warmup failed"
-
-    G = nuGraph([
-        Node("x", "input", [], {"shape": (4, 8)}, (4, 8)),
-        Node("w", "input", [], {"shape": (8, 16)}, (8, 16)),
-        Node("xt", "nc_transpose", ["x"], {}, (8, 4)),
-        Node("mm", "nc_matmul", ["xt", "w"], {}, (4, 16)),
-        Node("out", "nc_transpose", ["mm"], {}, (16, 4)),
-    ])
-
-    mm_pos = _position_by_id(G, "mm")
-    out_pos = _position_by_id(G, "out")
-    assert mm_pos is not None and out_pos is not None, "Internal test error: nc_matmul/nc_transpose nodes missing"
-
-    swapped = _swap_with_successor_variants(G, mm_pos, out_pos, {"xt", "w"})
-    assert swapped, "nc_matmul_transpose should emit a legal swapped variant"
-
-    rewritten = [
-        G_new for G_new, _ in swapped
-        if any(node.id == "out" and node.op == "nc_matmul" and node.inputs == ["w", "xt"] for node in G_new.nodes)
-    ]
-    assert rewritten, "nc_matmul_transpose should rewrite transpose(matmul) to nc_matmul(moving, stationary)"
-
-    variants = nu_graph_generation_z3(G, verbose=False)
-    assert any(
-        any(node.id == "out" and node.op == "nc_matmul" and node.inputs == ["w", "xt"] for node in variant.nodes)
-        for variant in variants
-    ), "nu_graph_generation_z3 should keep the nc_matmul/nc_transpose swapped variant"
-    print(" nc_matmul_transpose graph builds and runs variant generation")
 
 
 def _test_relu_matmul_graph() -> None:
@@ -6974,44 +7008,30 @@ def _test_division_symbolic_shape_rejection() -> None:
 
 def _test_shapes_not_provably_equivalent_broadcast_compatible_candidate() -> None:
     """Regression: ``_shapes_not_provably_equivalent`` must not reject a valid
-    ``tensor_scalar`` candidate for ``div`` when the synthesis assigns *distinct*
-    symbolic dimension variables to operands that are equal at run time.
+    ``tensor_scalar`` candidate for ``div`` when the graph preserves the shared
+    symbolic dimension on the broadcasted axis.
 
     Scenario
     --------
     In ``kernel_matmul_red_div`` the synthesis builds a local target for
     ``div_1002`` from two previously-lowered hw nodes:
 
-    * ``x_sym``              shape ``(x_d0, x_d1)``   (e.g. 4 × 8)
-    * ``tensor_reduce_1080`` shape ``(y_d0, 1)``       (e.g. 4 × 1)
+    * ``x_sym``              shape ``(x_d0, x_d1)``
+    * ``tensor_reduce_1080`` shape ``(x_d0, 1)``
 
-    Here ``x_d0`` and ``y_d0`` are **distinct** z3 variables even though at
-    run time ``x_d0 == y_d0 == 4``.  The target ``div`` (after Fix 1:
-    ``_shape_public_binary`` uses ``_broadcast_shape``) emits the constraint
-    ``Or(x_d0==y_d0, x_d0==1, y_d0==1)`` as its shape pre-condition.
+    With the shared leading symbol, both the public ``div`` target and the
+    broadcast-capable ``tensor_scalar(x, reduce)`` candidate simplify their
+    leading-axis broadcast constraint to ``True``, so the generic shape filter
+    should keep the candidate without any op-specific exception.
 
-    The broadcast-capable candidate ``tensor_scalar(x, reduce, op=divide)``
-    emits the same ``Or(...)`` constraint.  Without Fix 2 (including the
-    target's constraint in the valid-assumption set), the old check
-
-        SAT(x_d0>0, x_d1>0, y_d0>0, ¬Or(x_d0==y_d0, x_d0==1, y_d0==1))
-
-    is SAT (x_d0=4, y_d0=5), so the candidate was wrongly rejected.
-
-    With Fix 2 the valid assumptions include the target's ``Or(...)``
-    constraint, making the negated candidate constraint UNSAT → candidate kept.
-
-    Conversely, the strict ``tensor_tensor(x, reduce)`` candidate emits
-    ``x_d0==y_d0 ∧ x_d1==1``.  Even with the target's Or as an assumption,
-    ``SAT(…, Or(x_d0==y_d0,…), ¬(x_d0==y_d0 ∧ x_d1==1))`` is SAT
-    (x_d0=y_d0=4, x_d1=8), so that candidate is correctly rejected.
+    Conversely, the strict ``tensor_tensor(x, reduce)`` candidate still emits
+    the spurious ``x_d1==1`` restriction and must be rejected generically.
     """
     x_d0 = z3.Int("x_d0")
     x_d1 = z3.Int("x_d1")
-    y_d0 = z3.Int("y_d0")
 
     x_sym = SymTensor("x", shape=(x_d0, x_d1))
-    reduce_sym = SymTensor("tensor_reduce_1080", shape=(y_d0, z3.IntVal(1)))
+    reduce_sym = SymTensor("tensor_reduce_1080", shape=(x_d0, z3.IntVal(1)))
 
     # Build local target the same way lower_nu_graph_all_variants does:
     # _sym_expr_from_graph_node(div_node, [x_sym, reduce_sym])
@@ -7026,17 +7046,16 @@ def _test_shapes_not_provably_equivalent_broadcast_compatible_candidate() -> Non
     good = tensor_scalar(dst=None, data=x_sym, op0=nl.divide, operand0=reduce_sym)
     assert not _shapes_not_provably_equivalent(local_target, good), (
         "tensor_scalar(x, reduce, op=divide) must NOT be rejected by "
-        "_shapes_not_provably_equivalent when operands use distinct symbolic "
-        "vars — the target's broadcast constraint makes the candidate's "
-        "Or constraint trivially implied"
+        "_shapes_not_provably_equivalent when the graph preserves the shared "
+        "symbolic broadcast dimension"
     )
     assert _shape_rejection_reason(local_target, good) is None, (
         "tensor_scalar must pass all shape pre-filters for the div node "
-        "lowering scenario with distinct symbolic dimension variables"
+        "lowering scenario with a shared symbolic broadcast dimension"
     )
     assert _check_equivalent_quiet(local_target, good, timeout=5000), (
         "tensor_scalar(x, reduce, op=divide) must be proven equivalent to "
-        "broadcasted div(x, reduce) when x.shape=(x_d0,x_d1), reduce.shape=(y_d0,1)"
+        "broadcasted div(x, reduce) when x.shape=(x_d0,x_d1), reduce.shape=(x_d0,1)"
     )
 
     # Bad candidate: tensor_tensor injects the spurious k==1 constraint
@@ -7044,19 +7063,19 @@ def _test_shapes_not_provably_equivalent_broadcast_compatible_candidate() -> Non
     assert _shapes_not_provably_equivalent(local_target, bad), (
         "tensor_tensor(x, reduce, op=divide) must be rejected by "
         "_shapes_not_provably_equivalent — it injects x_d1==1 which is not "
-        "implied by the target's Or(x_d0==y_d0, …) assumption"
+        "implied by the shared-symbol div target"
     )
     reason = _shape_rejection_reason(local_target, bad)
     assert reason is not None, (
         "tensor_tensor must be rejected before the equivalence solver for the "
-        "distinct-symbolic-var div lowering scenario"
+        "shared-symbol div lowering scenario"
     )
     assert "provably" in reason.lower(), (
         f"Expected 'output shape not provably equivalent' rejection, got: {reason!r}"
     )
     print(
         " _shapes_not_provably_equivalent: broadcast-compatible tensor_scalar kept, "
-        "strict tensor_tensor rejected for div with distinct symbolic vars"
+        "strict tensor_tensor rejected for div with a shared symbolic broadcast axis"
     )
 
 
@@ -7128,16 +7147,17 @@ def _test_kernel_matmul_red_div_div_node_lowered_via_tensor_scalar() -> None:
     the full, slow ``lower_nu_graph_all_variants``) by replicating the exact
     symbolic-tensor setup used during lowering of ``div_1002``.
     """
-    # Replicate the synthesis context for div_1002 in kernel_matmul_red_div:
+    # Replicate the synthesis context for div_1002 in kernel_matmul_red_div
+    # after the graph builder preserves shared symbolic dims across same-shaped
+    # inputs:
     #   x_sym              : shape = (x_d0, x_d1)
-    #   tensor_reduce_1080 : shape = (y_d0, IntVal(1))
+    #   tensor_reduce_1080 : shape = (x_d0, IntVal(1))
     #                         (result of tensor_reduce[axis=1, keepdims=True](y))
     x_d0 = z3.Int("x_d0")
     x_d1 = z3.Int("x_d1")
-    y_d0 = z3.Int("y_d0")
 
     x_sym = SymTensor("x", shape=(x_d0, x_d1))
-    reduce_sym = SymTensor("tensor_reduce_1080", shape=(y_d0, z3.IntVal(1)))
+    reduce_sym = SymTensor("tensor_reduce_1080", shape=(x_d0, z3.IntVal(1)))
 
     # Build the local target exactly as _lower_node does
     div_node = Node(
@@ -8255,7 +8275,6 @@ def run_all_tests() -> None:
     _test_softmax_matmul_graph()
     _test_transpose_matmul_graph()
     _test_matmul_transpose_graph()
-    _test_nc_matmul_transpose_graph()
     _test_relu_matmul_graph()
     _test_silu_matmul_graph()
     _test_silu_mlp_graph()
