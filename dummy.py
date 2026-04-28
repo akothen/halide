@@ -5778,7 +5778,7 @@ def simplify_hw_graph_variants(
     timeout: int = 3000,
     verbose: bool = False,
 ) -> list[nuGraph]:
-    """Apply 2-node simplification to every graph in *graphs*.
+    """Apply single-node and 2-node simplification to every graph in *graphs*.
 
     Repeatedly calls ``_simplify_hw_graph_once`` until no further simplification
     is possible for each variant, then de-duplicates results by structural
