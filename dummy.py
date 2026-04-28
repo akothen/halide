@@ -5982,6 +5982,7 @@ def _test_expected_variant_counts() -> None:
         ("kernel_matmul_red_div", build_kernel_matmul_red_div_graph, 2),
         ("kernel_matmul_red_mul", build_kernel_matmul_red_mul_graph, 1),
         ("kernel_rmsnorm_matmul", build_kernel_rmsnorm_matmul_graph, 2),
+        ("kernel_softmax_matmul", build_kernel_softmax_matmul_graph, 2),
         ("kernel_broadcast_row_bias_add", build_kernel_broadcast_row_bias_add_graph, 1),
         ("kernel_reduce_mul_broadcast", build_kernel_reduce_mul_broadcast_graph, 1),
         ("kernel_reduce_broadcast_mul", build_kernel_reduce_broadcast_mul_graph, 1),
@@ -6079,7 +6080,17 @@ def _test_softmax_matmul_graph() -> None:
     assert out.shape == (4, 16), f"out shape wrong: {out.shape}"
 
     variants = nu_graph_generation_z3(G, verbose=False)
-    assert len(variants) >= 1, "softmax_matmul should emit at least org variant"
+    probs_pos = _position_by_id(G, probs.id)
+    out_pos = _position_by_id(G, out.id)
+    assert probs_pos is not None, "Internal test error: _test_softmax_matmul_graph missing probs node"
+    assert out_pos is not None, "Internal test error: _test_softmax_matmul_graph missing out node"
+    swapped = _swap_with_successor_variants(G, probs_pos, out_pos, {probs.inputs[0]})
+    assert len(swapped) == 1, "softmax_matmul should have exactly one legal div/matmul swap"
+    assert z3_equivalent_order(G.node_at(probs_pos), G.node_at(out_pos), G, swapped[0][0], verbose=False)
+    expected_sigs = {graph_signature(G), graph_signature(swapped[0][0])}
+    got_sigs = {graph_signature(variant) for variant in variants}
+    assert len(variants) == 2, f"softmax_matmul should emit original + swapped div/matmul variants, got {len(variants)}"
+    assert got_sigs == expected_sigs, "softmax_matmul emitted an unexpected variant"
     print(" softmax_matmul graph builds and runs variant generation")
 
 
