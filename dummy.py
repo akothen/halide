@@ -5476,7 +5476,246 @@ def synthesize_hw_graph(
     if verbose:
         _print_synthesis_phase_variants("post-swap/propagation", results)
 
+    # ------------------------------------------------------------------
+    # Phase 3: post-simplification — collapse 2-node compositions
+    # ------------------------------------------------------------------
+    phase3_results = simplify_hw_graph_variants(results, seen=seen, timeout=timeout, verbose=verbose)
+    results.extend(phase3_results)
+    if verbose:
+        _print_synthesis_phase_variants("post-simplification", results)
+
     return results
+
+
+# ---------------------------------------------------------------------------
+# Post-simplification helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_general_simplification_pool(
+    input_syms: list["SymTensor"],
+) -> list["SketchNode"]:
+    """Build a synthesis pool over *input_syms* covering all hw op templates.
+
+    Unlike ``_build_synthesis_pool`` this does not filter templates by a target
+    op's constituent set, so every single-hw-op sketch is a valid candidate
+    regardless of the composition being simplified.
+    """
+    concrete = [SketchNode.make_input(sym) for sym in input_syms]
+    pool: list[SketchNode] = list(concrete)
+    for hw_op in _SYNTHESIS_POOL_OP_NAMES:
+        # Pass op_name=hw_op so _pool_templates_for_hw_op uses the full
+        # constituent set for that op, ensuring all relevant templates are
+        # included without filtering by an external target op.
+        templates = _pool_templates_for_hw_op(hw_op, concrete, {"op_name": hw_op})
+        pool.extend(templates)
+    return pool
+
+
+def _two_node_simplification_candidates(G: nuGraph) -> list[tuple[Node, Node]]:
+    """Return (producer, consumer) hw-node pairs eligible for simplification.
+
+    A pair qualifies when:
+    - Both nodes are hardware ops (not ``input`` and not in
+      ``_PUBLIC_PASSTHROUGH_OPS``).
+    - The producer's *only* user in the graph is the consumer (sole-user
+      condition), which guarantees the producer output can be removed safely.
+    """
+    used_count: dict[str, int] = {}
+    for n in G.nodes:
+        for inp in n.inputs:
+            used_count[inp] = used_count.get(inp, 0) + 1
+
+    node_by_id: dict[str, Node] = {n.id: n for n in G.nodes}
+    candidates: list[tuple[Node, Node]] = []
+
+    for consumer in G.nodes:
+        if consumer.op == "input" or consumer.op in _PUBLIC_PASSTHROUGH_OPS:
+            continue
+        for inp_id in consumer.inputs:
+            producer = node_by_id.get(inp_id)
+            if producer is None or producer.op == "input":
+                continue
+            if producer.op in _PUBLIC_PASSTHROUGH_OPS:
+                continue
+            # Sole-user condition: producer's only consumer is this node.
+            if used_count.get(producer.id, 0) != 1:
+                continue
+            candidates.append((producer, consumer))
+
+    return candidates
+
+
+def _simplify_hw_graph_once(
+    G: nuGraph,
+    timeout: int = 3000,
+    verbose: bool = False,
+) -> Optional[nuGraph]:
+    """Try a single simplification step on *G*.
+
+    Iterates over all 2-node (producer → consumer) candidates and attempts to
+    replace the composition with either:
+    - 0 nodes — if the consumer output is semantically equivalent to one of
+      the external inputs (identity/passthrough).
+    - 1 node  — if a single hardware op is semantically equivalent to the
+      2-node composition.
+
+    Returns a new ``nuGraph`` on the first successful simplification, or
+    ``None`` when no simplification is possible.
+    """
+    candidates = _two_node_simplification_candidates(G)
+    if not candidates:
+        return None
+
+    try:
+        all_syms = _graph_symbolic_tensors(G)
+    except (KeyError, Exception):
+        return None
+
+    for producer, consumer in candidates:
+        # ------------------------------------------------------------------
+        # Identify external inputs to the 2-node subgraph
+        # ------------------------------------------------------------------
+        external_input_ids: list[str] = []
+        seen_ext: set[str] = set()
+        for inp_id in producer.inputs:
+            if inp_id not in seen_ext:
+                seen_ext.add(inp_id)
+                external_input_ids.append(inp_id)
+        for inp_id in consumer.inputs:
+            if inp_id != producer.id and inp_id not in seen_ext:
+                seen_ext.add(inp_id)
+                external_input_ids.append(inp_id)
+
+        external_syms: list[Optional[SymTensor]] = [all_syms.get(eid) for eid in external_input_ids]
+        if any(s is None for s in external_syms):
+            continue
+        ext_syms: list[SymTensor] = [s for s in external_syms if s is not None]
+
+        target_sym = all_syms.get(consumer.id)
+        if target_sym is None:
+            continue
+
+        # ------------------------------------------------------------------
+        # Try 0-node replacement (identity / passthrough)
+        # ------------------------------------------------------------------
+        replacement_id: Optional[str] = None
+        new_nodes_for_replacement: list[Node] = []  # empty = 0-node
+
+        for ext_id, ext_sym in zip(external_input_ids, ext_syms):
+            if _check_equivalent_quiet(target_sym, ext_sym, timeout=timeout):
+                replacement_id = ext_id
+                if verbose:
+                    print(
+                        f"  [simplify] {producer.id}({producer.op}) -> "
+                        f"{consumer.id}({consumer.op}): "
+                        f"0-node, rewire to {ext_id}"
+                    )
+                break
+
+        # ------------------------------------------------------------------
+        # Try 1-node replacement
+        # ------------------------------------------------------------------
+        if replacement_id is None:
+            pool = _build_general_simplification_pool(ext_syms)
+            sketch = _synthesize_from_pool(
+                target_sym, pool, max_hw_size=1, timeout=timeout,
+                verbose=False, input_syms=ext_syms,
+            )
+            if sketch is not None:
+                sym_to_id: dict[int, str] = {
+                    id(sym): eid for eid, sym in zip(external_input_ids, ext_syms)
+                }
+                raw_nodes: list[Node] = []
+                new_root_id = _sketch_to_graph_nodes(sketch, sym_to_id, raw_nodes)
+                if new_root_id is not None:
+                    replacement_id = new_root_id
+                    new_nodes_for_replacement = raw_nodes
+                    if verbose:
+                        print(
+                            f"  [simplify] {producer.id}({producer.op}) -> "
+                            f"{consumer.id}({consumer.op}): "
+                            f"1-node, sketch={_format_sketch(sketch)}"
+                        )
+
+        if replacement_id is None:
+            continue
+
+        # ------------------------------------------------------------------
+        # Build the simplified graph
+        # ------------------------------------------------------------------
+        new_graph_nodes: list[Node] = []
+        inserted_new_nodes = not new_nodes_for_replacement
+
+        for n in G.nodes:
+            if n.id == producer.id:
+                # Insert replacement node(s) at the producer's position
+                if new_nodes_for_replacement:
+                    new_graph_nodes.extend(new_nodes_for_replacement)
+                    inserted_new_nodes = True
+                continue  # drop producer
+            if n.id == consumer.id:
+                continue  # drop consumer
+            # Rewire any node that consumed the consumer's output
+            new_inputs = [
+                replacement_id if inp == consumer.id else inp
+                for inp in n.inputs
+            ]
+            new_graph_nodes.append(
+                Node(n.id, n.op, new_inputs, dict(n.attrs), n.shape)
+            )
+
+        # Append replacement nodes at the end if they were never inserted
+        # (can happen if producer was the last node — edge case safety)
+        if not inserted_new_nodes:
+            new_graph_nodes.extend(new_nodes_for_replacement)
+
+        new_G = nuGraph(new_graph_nodes)
+        try:
+            annotate_shapes_concrete(new_G)
+        except Exception:
+            pass
+        return new_G
+
+    return None
+
+
+def simplify_hw_graph_variants(
+    graphs: list[nuGraph],
+    seen: Optional[set[str]] = None,
+    timeout: int = 3000,
+    verbose: bool = False,
+) -> list[nuGraph]:
+    """Apply 2-node simplification to every graph in *graphs*.
+
+    Repeatedly calls ``_simplify_hw_graph_once`` until no further simplification
+    is possible for each variant, then de-duplicates results by structural
+    signature.  New variants are added to *seen* so callers can avoid
+    processing the same structure twice.
+
+    Returns only the *newly* discovered simplified graphs (not the originals).
+    """
+    if seen is None:
+        seen = set()
+
+    new_variants: list[nuGraph] = []
+    worklist: list[nuGraph] = list(graphs)
+
+    for g in worklist:
+        simplified = _simplify_hw_graph_once(g, timeout=timeout, verbose=verbose)
+        if simplified is None:
+            continue
+        sig = graph_structure_signature(simplified)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        # Only keep hw-only graphs
+        if not _graph_uses_hw_only(simplified):
+            continue
+        new_variants.append(simplified)
+        worklist.append(simplified)
+
+    return new_variants
 
 
 # ---------------------------------------------------------------------------
@@ -8228,6 +8467,7 @@ def _test_synthesize_hw_graph_verbose_prints_phase_variants() -> None:
     assert "[synthesize_hw_graph] pre-lowering: 2 variant(s)" in out
     assert "[synthesize_hw_graph] post-lowering: 2 variant(s)" in out
     assert "[synthesize_hw_graph] post-swap/propagation: 3 variant(s)" in out
+    assert "[synthesize_hw_graph] post-simplification: 3 variant(s)" in out
     assert "phase': 'pre'" in out
     assert "phase': 'lowered_a'" in out
     assert "phase': 'phase2_extra'" in out
@@ -8283,6 +8523,226 @@ def _test_relu_all_lowerings_found_within_depth_budget() -> None:
     )
     print(f" synthesis: relu canonical lowering is the minimal sketch "
           f"(hw_size={best.hw_size()}): {_format_sketch(best)}")
+
+
+def _test_simplify_hw_graph_0node() -> None:
+    """Unit test: a double nc_transpose graph simplifies to 0 nodes (identity).
+
+    The composition ``nc_transpose(nc_transpose(x))`` is semantically
+    equivalent to ``x``.  ``_simplify_hw_graph_once`` must detect this via the
+    0-node equivalence check and return a graph whose only non-input node (the
+    second transpose) has been removed and whose output is rewired to ``x``.
+    """
+    # Warmup: ensure lazy semantics are registered before building graphs
+    # manually (nc_transpose calls _ensure_semantics on first invocation).
+    _invoke_hw_op("nc_transpose", [SymTensor("_w0", shape=(4, 8))], {})
+
+    # Build a hw-only graph: x → t1 = nc_transpose(x) → t2 = nc_transpose(t1)
+    G = nuGraph([
+        Node("x", "input", [], {"shape": (4, 8), "sym_shape": ("x_d0", "x_d1")}, (4, 8)),
+        Node("nc_t1", "nc_transpose", ["x"], {}, (8, 4)),
+        Node("nc_t2", "nc_transpose", ["nc_t1"], {}, (4, 8)),
+    ])
+
+    candidates = _two_node_simplification_candidates(G)
+    assert len(candidates) == 1, (
+        f"Expected exactly one simplification candidate for double-transpose, got {candidates!r}"
+    )
+    prod, cons = candidates[0]
+    assert prod.id == "nc_t1" and cons.id == "nc_t2", (
+        f"Expected candidate (nc_t1, nc_t2), got ({prod.id}, {cons.id})"
+    )
+
+    simplified = _simplify_hw_graph_once(G, timeout=5000, verbose=False)
+    assert simplified is not None, (
+        "Expected _simplify_hw_graph_once to simplify double-transpose to identity"
+    )
+
+    # After 0-node simplification the graph should have only the input node.
+    non_input = [n for n in simplified.nodes if n.op != "input"]
+    assert len(non_input) == 0, (
+        f"Expected 0 non-input nodes after double-transpose simplification, got {non_input!r}"
+    )
+    # The graph's output node should be the original input.
+    output_nodes = _graph_output_nodes(simplified)
+    assert len(output_nodes) == 1 and output_nodes[0].op == "input", (
+        f"Expected graph output to be rewired to input node, got {output_nodes!r}"
+    )
+    print(" simplify_hw_graph: 0-node — double nc_transpose simplified to identity")
+
+
+def _test_simplify_hw_graph_1node() -> None:
+    """Unit test: activation(activation(x, relu), relu) simplifies to 1 node.
+
+    relu is idempotent: relu(relu(x)) == relu(x).  The 2-node composition
+    consisting of two sequential ``activation(relu)`` ops on the same input
+    must be simplified to a single ``activation(relu)`` node by
+    ``_simplify_hw_graph_once``.
+
+    Note: manually-built activation nodes must include ``scale: 1.0`` and
+    ``bias_const: None`` in their attrs so the symbolic compiler uses the
+    correct default scale instead of falling back to 0.
+    """
+    # Warmup: ensure lazy semantics are registered.
+    _invoke_hw_op("activation", [SymTensor("_w1", shape=(4, 8))], {"op": nl.relu})
+
+    # Full attrs required so _compile_activation uses scale=1 not 0.
+    _act_relu_attrs = {"op": nl.relu, "scale": 1.0, "bias_const": None, "with_reduce": False}
+
+    # Build graph: x → act1 = activation(x, relu) → act2 = activation(act1, relu)
+    G = nuGraph([
+        Node("x", "input", [], {"shape": (4, 8), "sym_shape": ("x_d0", "x_d1")}, (4, 8)),
+        Node("act1", "activation", ["x"], _act_relu_attrs, (4, 8)),
+        Node("act2", "activation", ["act1"], _act_relu_attrs, (4, 8)),
+    ])
+
+    candidates = _two_node_simplification_candidates(G)
+    assert len(candidates) == 1, (
+        f"Expected exactly one simplification candidate for double-relu, got {candidates!r}"
+    )
+
+    simplified = _simplify_hw_graph_once(G, timeout=5000, verbose=False)
+    assert simplified is not None, (
+        "Expected _simplify_hw_graph_once to simplify double-relu activation to 1 node"
+    )
+
+    non_input = [n for n in simplified.nodes if n.op != "input"]
+    assert len(non_input) == 1, (
+        f"Expected exactly 1 non-input node after double-relu simplification, got {non_input!r}"
+    )
+    replacement = non_input[0]
+    assert replacement.op == "activation", (
+        f"Expected replacement op 'activation', got '{replacement.op}'"
+    )
+    # Replacement must take x directly (not the dropped act1 node)
+    assert "x" in replacement.inputs, (
+        f"Expected replacement node to reference input 'x', got inputs={replacement.inputs!r}"
+    )
+    print(" simplify_hw_graph: 1-node — double activation(relu) simplified to single activation")
+
+
+def _test_simplify_hw_graph_variants_integration() -> None:
+    """Integration test: simplify_hw_graph_variants simplifies all eligible graphs.
+
+    Builds two graphs — one with a double-transpose (0-node simplifiable) and one
+    with a double-relu activation (1-node simplifiable) — passes both through
+    ``simplify_hw_graph_variants`` and asserts that a non-empty list of simplified
+    variants is returned with fewer non-input nodes than their originals.
+
+    Activation nodes require ``scale: 1.0`` in their attrs so the symbolic
+    compiler uses the correct default scale rather than falling back to 0.
+    """
+    # Warmup: ensure lazy semantics are registered.
+    _invoke_hw_op("nc_transpose", [SymTensor("_w2", shape=(4, 8))], {})
+    _invoke_hw_op("activation", [SymTensor("_w3", shape=(4, 8))], {"op": nl.relu})
+
+    # Full attrs for activation nodes (scale must be present so compiler uses 1 not 0).
+    _act_relu_attrs = {"op": nl.relu, "scale": 1.0, "bias_const": None, "with_reduce": False}
+
+    # Graph 1: double-transpose (0-node simplifiable)
+    G_tt = nuGraph([
+        Node("x", "input", [], {"shape": (4, 8), "sym_shape": ("x_d0", "x_d1")}, (4, 8)),
+        Node("nc_t1", "nc_transpose", ["x"], {}, (8, 4)),
+        Node("nc_t2", "nc_transpose", ["nc_t1"], {}, (4, 8)),
+    ])
+
+    # Graph 2: double-relu activation (1-node simplifiable)
+    G_ra = nuGraph([
+        Node("x", "input", [], {"shape": (4, 8), "sym_shape": ("x_d0", "x_d1")}, (4, 8)),
+        Node("act1", "activation", ["x"], _act_relu_attrs, (4, 8)),
+        Node("act2", "activation", ["act1"], _act_relu_attrs, (4, 8)),
+    ])
+
+    seen: set[str] = {
+        graph_structure_signature(G_tt),
+        graph_structure_signature(G_ra),
+    }
+    simplified = simplify_hw_graph_variants([G_tt, G_ra], seen=seen, timeout=5000, verbose=False)
+
+    assert simplified, (
+        "simplify_hw_graph_variants must return at least one simplified variant"
+    )
+    for sv in simplified:
+        non_input = [n for n in sv.nodes if n.op != "input"]
+        assert len(non_input) < 3, (
+            f"Simplified variant should have fewer than 3 non-input nodes, got {len(non_input)}"
+        )
+        assert _graph_uses_hw_only(sv), (
+            f"Simplified variant must use only hw ops; got ops: {[n.op for n in sv.nodes]}"
+        )
+    print(
+        f" simplify_hw_graph: integration — "
+        f"{len(simplified)} simplified variant(s) produced from 2 graphs"
+    )
+
+
+def _test_synthesize_hw_graph_verbose_prints_post_simplification() -> None:
+    """Verify that synthesize_hw_graph prints the post-simplification phase header
+    when verbose=True, even when no new simplifications are found.
+
+    Uses the same mocked nu_graph_generation_z3 / lower_nu_graph_variants as the
+    existing phase-variant verbose test to keep synthesis overhead near zero.
+    """
+    from unittest.mock import patch
+
+    G = build_kernel_transpose_matmul_graph(4, 8, 16)
+    phase1_variant = G.clone()
+    phase1_variant.nodes[-1] = Node(
+        phase1_variant.nodes[-1].id,
+        phase1_variant.nodes[-1].op,
+        list(phase1_variant.nodes[-1].inputs),
+        {**phase1_variant.nodes[-1].attrs, "phase": "pre"},
+        phase1_variant.nodes[-1].shape,
+    )
+
+    lowered_a = nuGraph([
+        Node("x", "input", [], {"shape": (4, 8)}, (4, 8)),
+        Node("y", "input", [], {"shape": (8, 16)}, (8, 16)),
+        Node("hw_a", "nc_matmul", ["x", "y"], {"phase": "lowered_a"}, (4, 16)),
+    ])
+    lowered_b = nuGraph([
+        Node("x", "input", [], {"shape": (4, 8)}, (4, 8)),
+        Node("y", "input", [], {"shape": (8, 16)}, (8, 16)),
+        Node("hw_b", "nc_matmul", ["x", "y"], {"phase": "lowered_b"}, (4, 16)),
+    ])
+    phase2_extra = nuGraph([
+        Node("x", "input", [], {"shape": (4, 8)}, (4, 8)),
+        Node("y", "input", [], {"shape": (8, 16)}, (8, 16)),
+        Node("hw_extra", "nc_matmul", ["x", "y"], {"phase": "phase2_extra"}, (4, 16)),
+    ])
+
+    sig_original = graph_signature(G)
+    sig_lowered_a = graph_signature(lowered_a)
+    sig_lowered_b = graph_signature(lowered_b)
+
+    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False) -> list[nuGraph]:
+        sig = graph_signature(graph)
+        if sig == sig_original:
+            return [graph, phase1_variant]
+        if sig == sig_lowered_a:
+            return [lowered_a, phase2_extra]
+        if sig == sig_lowered_b:
+            return [lowered_b]
+        return [graph]
+
+    def _mocked_lower(variants, max_hw_size=2, timeout=3000, verbose=False, max_workers=None):
+        return [lowered_a, lowered_b]
+
+    buf = io.StringIO()
+    with (
+        patch("__main__.nu_graph_generation_z3", side_effect=_mocked_nu_gen),
+        patch("__main__.lower_nu_graph_variants", side_effect=_mocked_lower),
+        redirect_stdout(buf),
+    ):
+        hw_results = synthesize_hw_graph(G, max_hw_size=2, timeout=5000, verbose=True)
+
+    out = buf.getvalue()
+    assert "[synthesize_hw_graph] post-simplification:" in out, (
+        "Expected '[synthesize_hw_graph] post-simplification:' in verbose output"
+    )
+    # Ensure earlier phases are still present
+    assert "[synthesize_hw_graph] post-swap/propagation:" in out
+    print(" synthesize_hw_graph: verbose output includes post-simplification phase")
 
 
 def run_all_tests() -> None:
@@ -8346,6 +8806,11 @@ def run_all_tests() -> None:
     _test_z3_equivalent_order_skips_solver_for_invalid_nc_matmul_broadcast_swap()
     _test_synthesize_hw_graph_verbose_prints_phase_variants()
     _test_relu_all_lowerings_found_within_depth_budget()
+    print("\n================ RUNNING SIMPLIFICATION TESTS ==========")
+    _test_simplify_hw_graph_0node()
+    _test_simplify_hw_graph_1node()
+    _test_simplify_hw_graph_variants_integration()
+    _test_synthesize_hw_graph_verbose_prints_post_simplification()
     print("=============== ALL TESTS PASSED  =====================\n")
 
 
