@@ -5396,7 +5396,8 @@ def _print_synthesis_phase_variants(phase_name: str, graphs: list[nuGraph]) -> N
     """Print synthesized graph variants for one named phase of the pipeline.
 
     Intended for the phase boundaries in ``synthesize_hw_graph`` such as
-    pre-lowering, post-lowering, and post-swap/propagation.
+    pre-lowering, post-lowering, post-lowering simplification, and
+    post-swap/propagation.
     """
     print(f"[synthesize_hw_graph] {phase_name}: {len(graphs)} variant(s)")
     for idx, graph in enumerate(graphs):
@@ -5416,13 +5417,20 @@ def synthesize_hw_graph(
     Phase 1: generate nuGraph variants from the original public-op graph via
     ``nu_graph_generation_z3``, then lower each to a hardware-only graph.
 
-    Phase 2: once all hardware graphs have been collected, run
-    ``nu_graph_generation_z3`` again on every distinct lowered hardware graph to
-    discover additional swap-derived variants among the hardware ops.  Any new
-    variants found are appended to the results.  Variants that increase the
-    node count are included — for example, pushing ``nc_transpose`` before
-    ``tensor_scalar`` may require transposing multiple inputs and thus
-    structurally grows the graph, but the rewrite is still valid.
+    Phase 2: immediately simplify the distinct lowered hardware graphs by
+    collapsing semantically-equivalent 2-node subgraphs to either 0 or 1 node
+    when safe.
+
+    Phase 3: run ``nu_graph_generation_z3`` again on the lowered + simplified
+    hardware graphs to discover additional swap-derived variants among the
+    hardware ops.  Any new variants found are appended to the results.
+    Variants that increase the node count are included — for example, pushing
+    ``nc_transpose`` before ``tensor_scalar`` may require transposing multiple
+    inputs and thus structurally grows the graph, but the rewrite is still
+    valid.
+
+    Phase 4: simplify again after post-lowering swap/propagation so newly
+    exposed 2-node compositions are also collapsed.
 
     All returned graphs are deduplicated by structural graph signature to
     guarantee fixpoint termination.  Pass *verbose=True* to print all sketches
@@ -5455,7 +5463,20 @@ def synthesize_hw_graph(
         _print_synthesis_phase_variants("post-lowering", results)
 
     # ------------------------------------------------------------------
-    # Phase 2: post-lowering node-swap variant generation on hw graphs
+    # Phase 2: simplify immediately after lowering
+    # ------------------------------------------------------------------
+    phase2_results = simplify_hw_graph_variants(
+        results,
+        seen=seen,
+        timeout=timeout,
+        verbose=verbose,
+    )
+    results.extend(phase2_results)
+    if verbose:
+        _print_synthesis_phase_variants("post-lowering simplification", results)
+
+    # ------------------------------------------------------------------
+    # Phase 3: post-lowering node-swap variant generation on hw graphs
     # ------------------------------------------------------------------
     # Continue exploring newly-discovered hw variants to a fixpoint.  The
     # ``seen`` set (keyed by structural signature) guarantees termination: each
@@ -5477,10 +5498,15 @@ def synthesize_hw_graph(
         _print_synthesis_phase_variants("post-swap/propagation", results)
 
     # ------------------------------------------------------------------
-    # Phase 3: post-simplification — collapse 2-node compositions
+    # Phase 4: simplify again after swap/propagation
     # ------------------------------------------------------------------
-    phase3_results = simplify_hw_graph_variants(results, seen=seen, timeout=timeout, verbose=verbose)
-    results.extend(phase3_results)
+    phase4_results = simplify_hw_graph_variants(
+        results,
+        seen=seen,
+        timeout=timeout,
+        verbose=verbose,
+    )
+    results.extend(phase4_results)
     if verbose:
         _print_synthesis_phase_variants("post-simplification", results)
 
@@ -8420,18 +8446,17 @@ def _test_synthesize_hw_graph_verbose_prints_phase_variants() -> None:
 
     lowered_a = nuGraph([
         Node("x", "input", [], {"shape": (4, 8)}, (4, 8)),
-        Node("y", "input", [], {"shape": (8, 16)}, (8, 16)),
-        Node("hw_a", "tensor_matmul", ["x", "y"], {"phase": "lowered_a"}, (4, 16)),
+        Node("w", "input", [], {"shape": (8, 16)}, (8, 16)),
+        Node("hw_a", "nc_matmul", ["x", "w"], {"phase": "lowered_a"}, (4, 16)),
     ])
     lowered_b = nuGraph([
         Node("x", "input", [], {"shape": (4, 8)}, (4, 8)),
-        Node("y", "input", [], {"shape": (8, 16)}, (8, 16)),
-        Node("hw_b", "tensor_matmul", ["x", "y"], {"phase": "lowered_b"}, (4, 16)),
+        Node("y", "input", [], {"shape": (4, 8)}, (4, 8)),
+        Node("hw_b", "tensor_scalar", ["x", "y"], {"phase": "lowered_b", "op0": nl.add, "operand0_input_index": 1}, (4, 8)),
     ])
     phase2_extra = nuGraph([
         Node("x", "input", [], {"shape": (4, 8)}, (4, 8)),
-        Node("y", "input", [], {"shape": (8, 16)}, (8, 16)),
-        Node("hw_extra", "tensor_matmul", ["x", "y"], {"phase": "phase2_extra"}, (4, 16)),
+        Node("hw_extra", "activation", ["x"], {"phase": "phase2_extra", "op": nl.relu, "scale": 1.0, "bias_const": None, "with_reduce": False}, (4, 8)),
     ])
 
     sig_original = graph_signature(G)
@@ -8467,6 +8492,7 @@ def _test_synthesize_hw_graph_verbose_prints_phase_variants() -> None:
     out = buf.getvalue()
     assert "[synthesize_hw_graph] pre-lowering: 2 variant(s)" in out
     assert "[synthesize_hw_graph] post-lowering: 2 variant(s)" in out
+    assert "[synthesize_hw_graph] post-lowering simplification: 2 variant(s)" in out
     assert "[synthesize_hw_graph] post-swap/propagation: 3 variant(s)" in out
     assert "[synthesize_hw_graph] post-simplification: 3 variant(s)" in out
     assert "phase': 'pre'" in out
@@ -8742,6 +8768,7 @@ def _test_synthesize_hw_graph_verbose_prints_post_simplification() -> None:
         "Expected '[synthesize_hw_graph] post-simplification:' in verbose output"
     )
     # Ensure earlier phases are still present
+    assert "[synthesize_hw_graph] post-lowering simplification:" in out
     assert "[synthesize_hw_graph] post-swap/propagation:" in out
     print(" synthesize_hw_graph: verbose output includes post-simplification phase")
 
