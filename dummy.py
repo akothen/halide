@@ -5418,8 +5418,8 @@ def synthesize_hw_graph(
     ``nu_graph_generation_z3``, then lower each to a hardware-only graph.
 
     Phase 2: immediately simplify the distinct lowered hardware graphs by
-    collapsing semantically-equivalent 2-node subgraphs to either 0 or 1 node
-    when safe.
+    collapsing semantically-equivalent nodes/subgraphs when rewiring is safe
+    (for 2-node rewrites, the producer must have the consumer as its sole user).
 
     Phase 3: run ``nu_graph_generation_z3`` again on the lowered + simplified
     hardware graphs to discover additional swap-derived variants among the
@@ -5533,7 +5533,8 @@ def _build_general_simplification_pool(
         # Pass op_name=hw_op so _pool_templates_for_hw_op uses the full
         # constituent set for that op, ensuring all relevant templates are
         # included without filtering by an external target op.
-        templates = _pool_templates_for_hw_op(hw_op, concrete, {"op_name": hw_op})
+        hw_op_attrs = {"op_name": hw_op}
+        templates = _pool_templates_for_hw_op(hw_op, concrete, hw_op_attrs)
         pool.extend(templates)
     return pool
 
@@ -5599,7 +5600,7 @@ def _simplify_hw_graph_once(
 
     try:
         all_syms = _graph_symbolic_tensors(G)
-    except (KeyError, Exception):
+    except KeyError:
         return None
 
     # ------------------------------------------------------------------
@@ -5658,6 +5659,9 @@ def _simplify_hw_graph_once(
         try:
             annotate_shapes_concrete(new_G)
         except Exception:
+            # Shape annotations are best-effort here; the simplification was
+            # proven by symbolic equivalence, so keep the structurally rewired
+            # graph even if concrete annotation cannot be recomputed.
             pass
         return new_G
 
@@ -5766,6 +5770,9 @@ def _simplify_hw_graph_once(
         try:
             annotate_shapes_concrete(new_G)
         except Exception:
+            # Shape annotations are best-effort here; the simplification was
+            # proven by symbolic equivalence, so keep the structurally rewired
+            # graph even if concrete annotation cannot be recomputed.
             pass
         return new_G
 
