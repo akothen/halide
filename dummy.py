@@ -5397,7 +5397,7 @@ def _print_synthesis_phase_variants(phase_name: str, graphs: list[nuGraph]) -> N
 
     Intended for the phase boundaries in ``synthesize_hw_graph`` such as
     pre-lowering, post-lowering, post-lowering simplification, and
-    post-swap/propagation.
+    post-swap/propagation, and post-simplification.
     """
     print(f"[synthesize_hw_graph] {phase_name}: {len(graphs)} variant(s)")
     for idx, graph in enumerate(graphs):
@@ -5689,7 +5689,7 @@ def _simplify_hw_graph_once(
         # Try 0-node replacement (identity / passthrough)
         # ------------------------------------------------------------------
         replacement_id: Optional[str] = None
-        new_nodes_for_replacement: list[Node] = []  # empty list = 0-node (identity/passthrough) replacement
+        new_nodes_for_replacement: list[Node] = []
 
         for ext_id, ext_sym in zip(external_input_ids, ext_syms):
             if _check_equivalent_quiet(target_sym, ext_sym, timeout=timeout):
@@ -5734,6 +5734,8 @@ def _simplify_hw_graph_once(
         # Build the simplified graph
         # ------------------------------------------------------------------
         new_graph_nodes: list[Node] = []
+        # 0-node identity/passthrough replacements have no nodes to insert;
+        # 1-node replacements populate new_nodes_for_replacement above.
         is_zero_node_replacement = not new_nodes_for_replacement
         inserted_replacement = is_zero_node_replacement  # 0-node: nothing to insert
 
