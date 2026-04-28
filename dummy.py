@@ -5419,11 +5419,14 @@ def synthesize_hw_graph(
     Phase 2: once all hardware graphs have been collected, run
     ``nu_graph_generation_z3`` again on every distinct lowered hardware graph to
     discover additional swap-derived variants among the hardware ops.  Any new
-    variants found are appended to the results.
+    variants found are appended to the results.  Variants that increase the
+    node count are included — for example, pushing ``nc_transpose`` before
+    ``tensor_scalar`` may require transposing multiple inputs and thus
+    structurally grows the graph, but the rewrite is still valid.
 
-    All returned graphs are deduplicated by graph signature.  Pass
-    *verbose=True* to print all sketches evaluated during synthesis for manual
-    inspection.
+    All returned graphs are deduplicated by structural graph signature to
+    guarantee fixpoint termination.  Pass *verbose=True* to print all sketches
+    evaluated during synthesis for manual inspection.
     """
     # ------------------------------------------------------------------
     # Phase 1: variant generation + lowering of the original graph
@@ -5454,17 +5457,16 @@ def synthesize_hw_graph(
     # ------------------------------------------------------------------
     # Phase 2: post-lowering node-swap variant generation on hw graphs
     # ------------------------------------------------------------------
-    # Continue exploring newly-discovered hw variants to a fixpoint, but only
-    # keep post-lowering variants that do not grow the graph.  This preserves
-    # follow-on local rewrites such as the silu-MLP nc_matmul/nc_transpose
-    # chain, while avoiding the broadcast-driven variant explosion caused by
-    # repeatedly cloning larger and larger subgraphs during propagation.
+    # Continue exploring newly-discovered hw variants to a fixpoint.  The
+    # ``seen`` set (keyed by structural signature) guarantees termination: each
+    # distinct graph structure is processed at most once regardless of whether
+    # it is larger or smaller than its source graph.  This allows valid rewrites
+    # such as moving ``nc_transpose`` past ``tensor_scalar`` even when doing so
+    # adds nodes by transposing multiple inputs.
     phase2_variants: list[nuGraph] = []
     phase2_worklist: list[nuGraph] = list(results)
     for g_hw in phase2_worklist:
         for g_hw_variant in nu_graph_generation_z3(g_hw):
-            if len(g_hw_variant.nodes) > len(g_hw.nodes):
-                continue
             sig = graph_structure_signature(g_hw_variant)
             if sig not in seen:
                 seen.add(sig)
@@ -7982,7 +7984,17 @@ def _test_synthesize_hw_graph_post_lowering_swap_variants() -> None:
     )
 
 
-def _test_synthesize_hw_graph_post_lowering_reaches_fixpoint_without_growing_variants() -> None:
+def _test_synthesize_hw_graph_post_lowering_reaches_fixpoint_with_growing_variants() -> None:
+    """Regression test: synthesize_hw_graph Phase-2 retains post-lowering
+    variants even when they increase the node count, and still reaches fixpoint.
+
+    The mock simulates a transitive chain where each discovered variant spawns
+    one additional variant (including a "growing" variant hw_graph_d that has
+    more nodes than its source hw_graph_c).  All variants — including growing
+    ones — must appear in the final results.  Fixpoint is guaranteed by the
+    structural-signature ``seen`` set: once every distinct graph structure has
+    been processed, the worklist drains and the loop terminates.
+    """
     from unittest.mock import patch
 
     def _make_hw_graph(tag: str) -> nuGraph:
@@ -7997,6 +8009,7 @@ def _test_synthesize_hw_graph_post_lowering_reaches_fixpoint_without_growing_var
         if tag == "c":
             xt = Node("xt_c", "nc_transpose", ["x"], {}, (8, 4))
             return nuGraph([x, w, xt, Node("hw_c", "nc_matmul", ["w", "xt_c"], {}, (16, 4))])
+        # hw_graph_d has more nodes than hw_graph_c (6 vs 4) — a "growing" variant.
         xt = Node("xt_d", "nc_transpose", ["x"], {}, (8, 4))
         act = Node("act_d", "activation", ["xt_d"], {"op": nl.silu}, (8, 4))
         trans = Node("trans_d", "nc_transpose", ["act_d"], {}, (4, 8))
@@ -8026,6 +8039,7 @@ def _test_synthesize_hw_graph_post_lowering_reaches_fixpoint_without_growing_var
         if sig == sig_b:
             return [hw_graph_b, hw_graph_c]
         if sig == sig_c:
+            # hw_graph_d is larger than hw_graph_c — a growing variant.
             return [hw_graph_c, hw_graph_d]
         return [graph]
 
@@ -8038,17 +8052,23 @@ def _test_synthesize_hw_graph_post_lowering_reaches_fixpoint_without_growing_var
     ):
         hw_results = synthesize_hw_graph(G, max_hw_size=2, timeout=5000)
 
-    assert hw_gen_call_sigs == [sig_a, sig_b, sig_c], (
-        "Phase-2 should keep processing newly-discovered non-growing variants until no more remain"
+    # Phase-2 must visit a, b, c (transitively discovered), and then d
+    # (the growing variant discovered from c).  After d, the mock returns [d]
+    # which is already in ``seen``, so the worklist drains — fixpoint reached.
+    assert hw_gen_call_sigs == [sig_a, sig_b, sig_c, sig_d], (
+        "Phase-2 should process all transitively discovered variants, "
+        f"including growing ones; got calls: {hw_gen_call_sigs}"
     )
     result_sigs = {graph_signature(g) for g in hw_results}
-    assert result_sigs == {sig_a, sig_b, sig_c}, (
-        "Fixpoint Phase-2 propagation should include transitively discovered non-growing hw variants"
+    assert result_sigs == {sig_a, sig_b, sig_c, sig_d}, (
+        "Fixpoint Phase-2 propagation should include all transitively discovered "
+        "hw variants, including growing ones"
     )
-    assert sig_d not in result_sigs, (
-        "Growing post-lowering variants should be discarded during propagation"
+    # Verify the growing variant is specifically present.
+    assert sig_d in result_sigs, (
+        "Growing post-lowering variant (hw_graph_d) must be retained in results"
     )
-    print(" synthesize_hw_graph: post-lowering propagation reaches fixpoint without growing variants")
+    print(" synthesize_hw_graph: post-lowering propagation reaches fixpoint including growing variants")
 
 
 def _test_synthesize_hw_graph_post_lowering_dedupes_fresh_ids() -> None:
@@ -8321,7 +8341,7 @@ def run_all_tests() -> None:
     _test_matmul_with_complex_input_sym_not_rejected()
     _test_matmul_missing_input_guard()
     _test_synthesize_hw_graph_post_lowering_swap_variants()
-    _test_synthesize_hw_graph_post_lowering_reaches_fixpoint_without_growing_variants()
+    _test_synthesize_hw_graph_post_lowering_reaches_fixpoint_with_growing_variants()
     _test_synthesize_hw_graph_post_lowering_dedupes_fresh_ids()
     _test_z3_equivalent_order_skips_solver_for_invalid_nc_matmul_broadcast_swap()
     _test_synthesize_hw_graph_verbose_prints_phase_variants()
