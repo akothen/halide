@@ -6250,6 +6250,37 @@ def kernel_silu_matmul(x: DummyArray, w: DummyArray) -> DummyArray:
     return x.silu() @ w
 
 
+def kernel_matmul(x: DummyArray, w: DummyArray) -> DummyArray:
+    return x @ w
+
+
+def kernel_tensor_mul(x: DummyArray, y: DummyArray) -> DummyArray:
+    return x + y
+
+
+def kernel_rmsnorm(x: DummyArray) -> DummyArray:
+    xx = x * x
+    rec = xx.sum(axis=1, keep_dims=True)
+    rms = rec.sqrt()
+    norm = x / rms
+    return norm
+
+
+def kernel_softmax(x: DummyArray) -> DummyArray:
+    ex = x.exp()
+    den = ex.sum(axis=1, keep_dims=True)
+    probs = ex / den
+    return probs
+
+
+def kernel_relu(x: DummyArray) -> DummyArray:
+    return x.relu()
+
+
+def kernel_silu(x: DummyArray) -> DummyArray:
+    return x.silu()
+
+
 def kernel_silu_mlp(x: DummyArray, w1: DummyArray, w2: DummyArray) -> DummyArray:
     h1 = x @ w1
     h2 = x @ w2
@@ -6410,6 +6441,50 @@ def build_kernel_silu_matmul_graph(M: int, K: int, N: int) -> nuGraph:
     )
 
 
+def build_kernel_matmul_graph(M: int, K: int, N: int) -> nuGraph:
+    return _build_graph_from_kernel(
+        kernel_matmul,
+        ("x", (M, K), ("x_d0", "x_d1")),
+        ("w", (K, N), ("x_d1", "w_d1")),
+    )
+
+
+def build_kernel_tensor_mul_graph(M: int, K: int, N: int) -> nuGraph:
+    return _build_graph_from_kernel(
+        kernel_tensor_mul,
+        ("x", (M, K), ("x_d0", "x_d1")),
+        ("y", (M, K), ("x_d0", "x_d1")),
+    )
+
+
+def build_kernel_rmsnorm_graph(M: int, K: int, N: int) -> nuGraph:
+    return _build_graph_from_kernel(
+        kernel_rmsnorm,
+        ("x", (M, K), ("x_d0", "x_d1")),
+    )
+
+
+def build_kernel_softmax_graph(M: int, K: int, N: int) -> nuGraph:
+    return _build_graph_from_kernel(
+        kernel_softmax,
+        ("x", (M, K), ("x_d0", "x_d1")),
+    )
+
+
+def build_kernel_relu_graph(M: int, K: int, N: int) -> nuGraph:
+    return _build_graph_from_kernel(
+        kernel_relu,
+        ("x", (M, K), ("x_d0", "x_d1")),
+    )
+
+
+def build_kernel_silu_graph(M: int, K: int, N: int) -> nuGraph:
+    return _build_graph_from_kernel(
+        kernel_silu,
+        ("x", (M, K), ("x_d0", "x_d1")),
+    )
+
+
 def build_kernel_silu_mlp_graph(M: int, K: int, N: int) -> nuGraph:
     return _build_graph_from_kernel(
         kernel_silu_mlp,
@@ -6510,6 +6585,12 @@ if __name__ == "__main__":
         ("kernel_matmul_transpose", build_kernel_matmul_transpose_graph),
         ("kernel_relu_matmul", build_kernel_relu_matmul_graph),
         ("kernel_silu_matmul", build_kernel_silu_matmul_graph),
+        ("kernel_matmul", build_kernel_matmul_graph),
+        ("kernel_tensor_mul", build_kernel_tensor_mul_graph),
+        ("kernel_rmsnorm", build_kernel_rmsnorm_graph),
+        ("kernel_softmax", build_kernel_softmax_graph),
+        ("kernel_relu", build_kernel_relu_graph),
+        ("kernel_silu", build_kernel_silu_graph),
         ("kernel_silu_mlp", build_kernel_silu_mlp_graph),
         ("kernel_silu_mlp_full", build_kernel_silu_mlp_full_graph),
         ("kernel_relu_mlp", build_kernel_relu_mlp_graph),
