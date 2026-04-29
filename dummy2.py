@@ -5855,6 +5855,232 @@ def simplify_hw_graph_variants(
 
 
 # ---------------------------------------------------------------------------
+# Symbolic tiling
+# ---------------------------------------------------------------------------
+
+# Sentinel values representing hardware-specific tile-size constants.
+# In production these would resolve to concrete integers determined by the
+# target NKI device; here they are represented as symbolic z3.Int variables
+# so the tiling formulas remain device-independent.
+_TILE_PMAX: Any = tile_size.pmax
+_TILE_PSUM_FMAX: Any = tile_size.psum_fmax
+
+# Maps each hw op to its (t_0, t_1) tile dimensions (partition × free axis).
+# Ops not in this table fall back to (_TILE_PMAX, _TILE_PSUM_FMAX).
+_HW_TILE_DIMS: dict[str, tuple[Any, Any]] = {
+    "activation":              (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "activation_reduce":       (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "dma_copy":                (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "dma_transpose":           (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "exponential":             (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "nc_matmul":               (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "nc_transpose":            (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "reciprocal":              (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "tensor_copy":             (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "tensor_partition_reduce": (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "tensor_reduce":           (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "tensor_scalar":           (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "tensor_tensor":           (_TILE_PMAX, _TILE_PSUM_FMAX),
+}
+
+
+@dataclass
+class TilingParams:
+    """Symbolic tiling parameters for a single hardware operator node.
+
+    Attributes:
+        op_id:      Node id of the operator.
+        tile_dims:  ``(t_0, t_1)`` – hardware-fixed tile sizes (sentinels or
+                    concrete ints).
+        block_dims: ``(b_0, b_1)`` – symbolic block-dimension variables.
+        strip_dims: ``(n_0, n_1)`` – derived strip-dimension variables
+                    (shared across non-reduction axes).
+    """
+
+    op_id: str
+    tile_dims: tuple[Any, Any]
+    block_dims: tuple[z3.ArithRef, z3.ArithRef]
+    strip_dims: tuple[z3.ArithRef, z3.ArithRef]
+
+
+@dataclass
+class GraphTiling:
+    """Symbolic tiling assignment for all hw-op nodes in a lowered nuGraph.
+
+    Attributes:
+        op_tilings:       Mapping from ``node.id`` → :class:`TilingParams`.
+        shared_strip_dims: Shared strip-dim z3 variables, keyed by axis index.
+                           Only non-reduction axes appear here.
+        ctx:              A :class:`Context` collecting all well-formedness
+                          constraints (block ≥ 1, strip formula, SRAM bound).
+    """
+
+    op_tilings: dict[str, TilingParams]
+    shared_strip_dims: dict[int, z3.ArithRef]
+    ctx: Context
+
+
+def _tile_dim_as_z3(t: Any, name: str) -> z3.ArithRef:
+    """Return a z3 integer expression for a tile dimension.
+
+    Concrete ``int`` values become ``z3.IntVal``; sentinel values
+    (e.g. ``tile_size.pmax``) become symbolic ``z3.Int`` variables.
+    """
+    if isinstance(t, int):
+        return z3.IntVal(t)
+    return z3.Int(name)
+
+
+def _reduction_axes(node: Node, G: nuGraph) -> frozenset[int]:
+    """Return the set of output-tensor axes that are reduced over by ``node``.
+
+    For ``tensor_reduce`` the reduced axis is taken from the node's ``axis``
+    attribute.  ``tensor_partition_reduce`` always reduces axis 0 (the
+    partition dimension).  All other hw ops produce outputs with no reduced
+    axes.
+    """
+    op = node.op
+    if op == "tensor_reduce":
+        axis_attr = node.attrs.get("axis", 1)
+        axis = int(axis_attr[0] if isinstance(axis_attr, (list, tuple)) else axis_attr)
+        return frozenset({axis})
+    if op == "tensor_partition_reduce":
+        # Partition reduce collapses axis 0 to size 1.
+        return frozenset({0})
+    return frozenset()
+
+
+def symbolic_tiling(G: nuGraph) -> GraphTiling:
+    """Assign symbolic tiling parameters to every hw-op node in a lowered nuGraph.
+
+    Strip dimensions along non-reduction axes are unified (shared) across all
+    operators to model cross-operator data reuse on SBUF/PSUM.
+
+    Returns a :class:`GraphTiling` containing:
+
+    * per-operator :class:`TilingParams`,
+    * shared strip-dim z3 variables (one per non-reduction axis), and
+    * a :class:`Context` with all tiling well-formedness constraints.
+    """
+    with _Z3_LOCK:
+        hw_nodes = [n for n in G.nodes if n.op in frozenset(_HW_OP_NAMES)]
+
+        try:
+            sym_tensors = _graph_symbolic_tensors(G)
+        except (KeyError, Exception):
+            sym_tensors = {}
+
+        # Shared strip-dim variables, reused across all non-reduction axis ops.
+        shared_strip_dims: dict[int, z3.ArithRef] = {}
+        ctx = Context()
+
+        # Symbolic SRAM capacity bound: tile_size.psum_fmax * tile_size.pmax
+        sram_cap = (
+            _tile_dim_as_z3(_TILE_PSUM_FMAX, "tile_psum_fmax")
+            * _tile_dim_as_z3(_TILE_PMAX, "tile_pmax")
+        )
+
+        op_tilings: dict[str, TilingParams] = {}
+
+        for node in hw_nodes:
+            tile_t0, tile_t1 = _HW_TILE_DIMS.get(
+                node.op, (_TILE_PMAX, _TILE_PSUM_FMAX)
+            )
+            t0_z3 = _tile_dim_as_z3(tile_t0, "tile_pmax")
+            t1_z3 = _tile_dim_as_z3(tile_t1, "tile_psum_fmax")
+
+            red_axes = _reduction_axes(node, G)
+
+            # Per-operator symbolic block dimensions.
+            b0 = z3.Int(f"b0_{node.id}")
+            b1 = z3.Int(f"b1_{node.id}")
+
+            # Strip dimensions: shared for non-reduction axes, per-operator
+            # for reduction axes.
+            if 0 in red_axes:
+                n0: z3.ArithRef = z3.Int(f"n0_{node.id}")
+            else:
+                if 0 not in shared_strip_dims:
+                    shared_strip_dims[0] = z3.Int("strip_0")
+                n0 = shared_strip_dims[0]
+
+            if 1 in red_axes:
+                n1: z3.ArithRef = z3.Int(f"n1_{node.id}")
+            else:
+                if 1 not in shared_strip_dims:
+                    shared_strip_dims[1] = z3.Int("strip_1")
+                n1 = shared_strip_dims[1]
+
+            # Tensor shape for dimension bounds.
+            sym = sym_tensors.get(node.id)
+            if sym is not None and len(sym.shape) >= 2:
+                dim0: z3.ArithRef = sym.shape[0]
+                dim1: z3.ArithRef = sym.shape[1]
+            elif sym is not None and len(sym.shape) == 1:
+                dim0 = sym.shape[0]
+                dim1 = z3.IntVal(1)
+            else:
+                dim0 = z3.Int(f"dim0_{node.id}")
+                dim1 = z3.Int(f"dim1_{node.id}")
+
+            bt0 = b0 * t0_z3
+            bt1 = b1 * t1_z3
+
+            # n_i == ceil(dim_i / (b_i * t_i))  (ceiling integer division)
+            ctx.add(n0 == (dim0 + bt0 - z3.IntVal(1)) / bt0)
+            ctx.add(n1 == (dim1 + bt1 - z3.IntVal(1)) / bt1)
+
+            # Well-formedness: block and strip dimensions must be positive.
+            ctx.add(b0 >= z3.IntVal(1))
+            ctx.add(b1 >= z3.IntVal(1))
+            ctx.add(n0 >= z3.IntVal(1))
+            ctx.add(n1 >= z3.IntVal(1))
+
+            # No over-tiling: b_i * t_i <= dim_i + t_i - 1
+            ctx.add(bt0 <= dim0 + t0_z3 - z3.IntVal(1))
+            ctx.add(bt1 <= dim1 + t1_z3 - z3.IntVal(1))
+
+            # Optional SRAM capacity constraint.
+            ctx.add(bt0 * bt1 <= sram_cap)
+
+            op_tilings[node.id] = TilingParams(
+                op_id=node.id,
+                tile_dims=(tile_t0, tile_t1),
+                block_dims=(b0, b1),
+                strip_dims=(n0, n1),
+            )
+
+        return GraphTiling(
+            op_tilings=op_tilings,
+            shared_strip_dims=shared_strip_dims,
+            ctx=ctx,
+        )
+
+
+def tile_nu_graph_variants(
+    graphs: list[nuGraph],
+) -> list[tuple[nuGraph, GraphTiling]]:
+    """Apply :func:`symbolic_tiling` to each graph in a list of lowered variants."""
+    return [(G, symbolic_tiling(G)) for G in graphs]
+
+
+def print_graph_tiling(G: nuGraph, tiling: GraphTiling) -> None:
+    """Print each node annotated as ``[n0,n1,b0,b1] op [t0,t1]``."""
+    for node in G.nodes:
+        if node.id in tiling.op_tilings:
+            tp = tiling.op_tilings[node.id]
+            n0, n1 = tp.strip_dims
+            b0, b1 = tp.block_dims
+            t0, t1 = tp.tile_dims
+            print(
+                f"  [{n0},{n1},{b0},{b1}] {node.op} [{t0},{t1}]"
+                f"  (id={node.id})"
+            )
+        else:
+            print(f"  {node.op}  (id={node.id}, no tiling)")
+
+
+# ---------------------------------------------------------------------------
 # Synthesizer test helpers
 # ---------------------------------------------------------------------------
 
@@ -6184,6 +6410,150 @@ def _test_matmul_1003_multi_input_synthesis() -> None:
         f"matmul node inputs={matmul_node.inputs!r} (upstream='{upstream_input}'), "
         f"{len(hw_variants)} hw variant(s) produced, first variant equivalent"
     )
+
+
+# ---------------------------------------------------------------------------
+# Symbolic tiling tests
+# ---------------------------------------------------------------------------
+
+def _test_symbolic_tiling_matmul() -> None:
+    """Build matmul graph, lower it, apply symbolic_tiling, assert shared strip dims."""
+    G = build_kernel_matmul_graph(4, 8, 16)
+    G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000)
+    assert G_hw is not None, "lower_nu_graph returned None for matmul"
+
+    tiling = symbolic_tiling(G_hw)
+
+    # All hw-op nodes with no reduction axes should reference the same
+    # Python objects for strip_0 and strip_1.
+    non_red_nodes = [
+        n for n in G_hw.nodes
+        if n.op in frozenset(_HW_OP_NAMES) and not _reduction_axes(n, G_hw)
+    ]
+    assert non_red_nodes, "Lowered matmul graph must contain non-reduction hw nodes"
+
+    if len(non_red_nodes) > 1:
+        tp_ref = tiling.op_tilings[non_red_nodes[0].id]
+        for nd in non_red_nodes[1:]:
+            tp = tiling.op_tilings[nd.id]
+            assert tp.strip_dims[0] is tp_ref.strip_dims[0], (
+                f"Non-reduction axis-0 strip dims must be the same object "
+                f"across {non_red_nodes[0].id!r} and {nd.id!r}"
+            )
+            assert tp.strip_dims[1] is tp_ref.strip_dims[1], (
+                f"Non-reduction axis-1 strip dims must be the same object "
+                f"across {non_red_nodes[0].id!r} and {nd.id!r}"
+            )
+
+    solver = z3.Solver()
+    solver.add(*tiling.ctx.facts)
+    result = solver.check()
+    assert result == z3.sat, f"symbolic_tiling matmul: context should be SAT, got {result}"
+    print(" symbolic_tiling: matmul — shared non-reduction strip dims verified, context SAT")
+
+
+def _test_symbolic_tiling_rmsnorm_matmul() -> None:
+    """Lower rmsnorm+matmul graph and verify reduction-axis strip dims are NOT shared."""
+    G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
+    G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000)
+    assert G_hw is not None, "lower_nu_graph returned None for rmsnorm_matmul"
+
+    tiling = symbolic_tiling(G_hw)
+
+    reduction_node_ids = {
+        n.id for n in G_hw.nodes
+        if n.op in frozenset(_HW_OP_NAMES) and _reduction_axes(n, G_hw)
+    }
+    non_reduction_node_ids = {
+        n.id for n in G_hw.nodes
+        if n.op in frozenset(_HW_OP_NAMES) and not _reduction_axes(n, G_hw)
+    }
+
+    # If both reduction and non-reduction nodes are present, their strip dims
+    # along the reduced axis must be distinct Python objects.
+    for rn in G_hw.nodes:
+        if rn.id not in reduction_node_ids or rn.id not in tiling.op_tilings:
+            continue
+        red_axes = _reduction_axes(rn, G_hw)
+        tp_r = tiling.op_tilings[rn.id]
+        for nn_id in non_reduction_node_ids:
+            if nn_id not in tiling.op_tilings:
+                continue
+            tp_n = tiling.op_tilings[nn_id]
+            for axis in red_axes:
+                assert tp_r.strip_dims[axis] is not tp_n.strip_dims[axis], (
+                    f"Reduction-axis {axis} strip dim of {rn.id!r} must NOT be "
+                    f"shared with non-reduction node {nn_id!r}"
+                )
+
+    solver = z3.Solver()
+    solver.add(*tiling.ctx.facts)
+    result = solver.check()
+    assert result == z3.sat, (
+        f"symbolic_tiling rmsnorm_matmul: context should be SAT, got {result}"
+    )
+    print(
+        " symbolic_tiling: rmsnorm_matmul — reduction-axis strip dims not shared, "
+        "context SAT"
+    )
+
+
+def _test_symbolic_tiling_all_kernels() -> None:
+    """Smoke-test symbolic_tiling on all build_kernel_*_graph helpers."""
+    kernel_builders: list[tuple[str, Any]] = [
+        ("matmul_red_div",        build_kernel_matmul_red_div_graph),
+        ("matmul_red_mul",        build_kernel_matmul_red_mul_graph),
+        ("rmsnorm_matmul",        build_kernel_rmsnorm_matmul_graph),
+        ("transpose_matmul",      build_kernel_transpose_matmul_graph),
+        ("matmul_transpose",      build_kernel_matmul_transpose_graph),
+        ("relu_matmul",           build_kernel_relu_matmul_graph),
+        ("silu_matmul",           build_kernel_silu_matmul_graph),
+        ("matmul",                build_kernel_matmul_graph),
+        ("rmsnorm",               build_kernel_rmsnorm_graph),
+        ("relu",                  build_kernel_relu_graph),
+        ("silu",                  build_kernel_silu_graph),
+    ]
+    for kname, builder in kernel_builders:
+        G = builder(4, 8, 16)
+        G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000)
+        if G_hw is None:
+            print(f" symbolic_tiling: {kname} — skipped (lower_nu_graph returned None)")
+            continue
+        tiling = symbolic_tiling(G_hw)
+        solver = z3.Solver()
+        solver.add(*tiling.ctx.facts)
+        result = solver.check()
+        assert result == z3.sat, (
+            f"symbolic_tiling {kname}: context should be SAT, got {result}"
+        )
+        print(
+            f" symbolic_tiling: {kname} — "
+            f"{len(tiling.op_tilings)} op(s) tiled, context SAT"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test runner
+# ---------------------------------------------------------------------------
+
+def run_all_tests() -> None:
+    """Run all in-file tests for the nuGraph synthesizer and symbolic tiling."""
+    print("\n================ RUNNING SYNTHESIZER TESTS =============")
+    _test_synthesizer_matmul_red_div()
+    _test_synthesizer_rmsnorm_matmul()
+    _test_synthesizer_transpose_matmul()
+    _test_synthesizer_matmul_transpose()
+    _test_synthesizer_relu_matmul()
+    _test_synthesizer_silu_matmul()
+    _test_synthesizer_all_variants_lowered()
+    _test_lower_nu_graph_all_variants()
+    _test_reduce_sum_lowering_no_crash()
+    _test_matmul_1003_multi_input_synthesis()
+    print("\n================ RUNNING SYMBOLIC TILING TESTS =========")
+    _test_symbolic_tiling_matmul()
+    _test_symbolic_tiling_rmsnorm_matmul()
+    _test_symbolic_tiling_all_kernels()
+    print("=============== ALL TESTS PASSED  =====================\n")
 
 
 def kernel_matmul_red_div(x: DummyArray, y: DummyArray, w: DummyArray) -> DummyArray:
@@ -6533,7 +6903,12 @@ def build_kernel_attention_graph(M: int, K: int, N: int) -> nuGraph:
     )
 
 
-def print_graph(G: nuGraph) -> None:
+def print_graph(G: nuGraph, tiling: Optional[GraphTiling] = None) -> None:
+    """Print a human-readable representation of *G*.
+
+    When *tiling* is provided each node is additionally annotated with its
+    symbolic tiling assignment via :func:`print_graph_tiling`.
+    """
     symbolic_shapes: dict[str, tuple[Any, ...]] = {}
     sym_shape_fallback = "None"
     try:
@@ -6549,6 +6924,8 @@ def print_graph(G: nuGraph) -> None:
             f"[{i}] id={n.id:12s} op={n.op:10s} inputs={n.inputs} "
             f"shape={_format_shape(n.shape)} sym_shape={sym_shape_str} attrs={n.attrs}"
         )
+    if tiling is not None:
+        print_graph_tiling(G, tiling)
 
 
 if __name__ == "__main__":
