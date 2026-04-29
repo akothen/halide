@@ -5858,23 +5858,56 @@ def simplify_hw_graph_variants(
 # Symbolic tiling
 # ---------------------------------------------------------------------------
 
-# Sentinel values representing hardware-specific tile-size constants.
-# In production these would resolve to concrete integers determined by the
-# target NKI device; here they are represented as symbolic z3.Int variables
-# so the tiling formulas remain device-independent.
-_TILE_PMAX: Any = tile_size.pmax
+# ---------------------------------------------------------------------------
+# Hardware tile-size constants
+# ---------------------------------------------------------------------------
+# The partition dimension (axis 0) is always 128 for every NKI instruction.
+_TILE_PMAX: int = 128
+
+# Sentinel that marks a free dimension whose size is not fixed by hardware.
+# During symbolic_tiling each operator using this sentinel gets its own
+# per-operator z3.Int variable constrained to _TILE_FREE_DIM_CHOICES.
 _TILE_PSUM_FMAX: Any = tile_size.psum_fmax
 
-# Maps each hw op to its (t_0, t_1) tile dimensions (partition × free axis).
-# Ops not in this table fall back to (_TILE_PMAX, _TILE_PSUM_FMAX).
+# Valid free-dimension tile sizes for instructions without a hardware limit.
+# Hardware supports 512, 1024 and 2048 for these ops.
+_TILE_FREE_DIM_CHOICES: tuple[int, ...] = (512, 1024, 2048)
+
+# nc_matmul-specific free-dimension limits (hardware-fixed).
+# The moving operand's free dim is capped at 512; the stationary operand's
+# free dim is capped at 128 (equal to the partition size).  The output tile
+# maps axis-0 to the stationary free dim (128) and axis-1 to the moving free
+# dim (512), so the overall output tile has t_0=128, t_1=512.
+_TILE_NC_MATMUL_MOVING_FMAX: int = 512
+_TILE_NC_MATMUL_STATIONARY_FMAX: int = 128  # equals _TILE_PMAX
+
+# nc_transpose: both partition and free dims are 128.
+_TILE_NC_TRANSPOSE_FMAX: int = 128  # equals _TILE_PMAX
+
+# SRAM capacity bound used in the block-size constraint:
+#   b_0 * t_0 * b_1 * t_1  ≤  _TILE_SRAM_CAP
+# Set to the maximum possible single-tile footprint (max free dim × partition).
+_TILE_SRAM_CAP: int = builtins.max(_TILE_FREE_DIM_CHOICES) * _TILE_PMAX  # 2048 * 128
+
+# Maps each hw op to its (t_0, t_1) hardware tile dimensions (partition × free axis).
+#
+#   t_0 = 128  for all ops  (partition dim is always fixed at 128).
+#   t_1:
+#     • nc_matmul   → 512  (moving-operand free dim limit)
+#     • nc_transpose → 128  (free dim limit equals partition)
+#     • all others  → _TILE_PSUM_FMAX sentinel; during symbolic_tiling a
+#                     per-operator symbolic variable is created and constrained
+#                     to _TILE_FREE_DIM_CHOICES = {512, 1024, 2048}.
+#
+# Ops not present in this table fall back to (_TILE_PMAX, _TILE_PSUM_FMAX).
 _HW_TILE_DIMS: dict[str, tuple[Any, Any]] = {
     "activation":              (_TILE_PMAX, _TILE_PSUM_FMAX),
     "activation_reduce":       (_TILE_PMAX, _TILE_PSUM_FMAX),
     "dma_copy":                (_TILE_PMAX, _TILE_PSUM_FMAX),
     "dma_transpose":           (_TILE_PMAX, _TILE_PSUM_FMAX),
     "exponential":             (_TILE_PMAX, _TILE_PSUM_FMAX),
-    "nc_matmul":               (_TILE_PMAX, _TILE_PSUM_FMAX),
-    "nc_transpose":            (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "nc_matmul":               (_TILE_PMAX, _TILE_NC_MATMUL_MOVING_FMAX),
+    "nc_transpose":            (_TILE_PMAX, _TILE_NC_TRANSPOSE_FMAX),
     "reciprocal":              (_TILE_PMAX, _TILE_PSUM_FMAX),
     "tensor_copy":             (_TILE_PMAX, _TILE_PSUM_FMAX),
     "tensor_partition_reduce": (_TILE_PMAX, _TILE_PSUM_FMAX),
@@ -5890,8 +5923,12 @@ class TilingParams:
 
     Attributes:
         op_id:      Node id of the operator.
-        tile_dims:  ``(t_0, t_1)`` – hardware-fixed tile sizes (sentinels or
-                    concrete ints).
+        tile_dims:  ``(t_0, t_1)`` – hardware tile sizes.  ``t_0`` is always
+                    the concrete integer :data:`_TILE_PMAX` (128).  ``t_1`` is
+                    either a concrete integer (for ops with a fixed free-dim
+                    limit, e.g. ``nc_matmul``, ``nc_transpose``) or the
+                    :data:`_TILE_PSUM_FMAX` sentinel (for ops whose free dim
+                    is chosen from :data:`_TILE_FREE_DIM_CHOICES`).
         block_dims: ``(b_0, b_1)`` – symbolic block-dimension variables.
         strip_dims: ``(n_0, n_1)`` – derived strip-dimension variables
                     (shared across non-reduction axes).
@@ -5974,11 +6011,8 @@ def symbolic_tiling(G: nuGraph) -> GraphTiling:
         shared_strip_dims: dict[int, z3.ArithRef] = {}
         ctx = Context()
 
-        # Symbolic SRAM capacity bound: tile_size.psum_fmax * tile_size.pmax
-        sram_cap = (
-            _tile_dim_as_z3(_TILE_PSUM_FMAX, "tile_psum_fmax")
-            * _tile_dim_as_z3(_TILE_PMAX, "tile_pmax")
-        )
+        # SRAM capacity bound (concrete): max free dim × partition dim.
+        sram_cap = z3.IntVal(_TILE_SRAM_CAP)
 
         op_tilings: dict[str, TilingParams] = {}
 
@@ -5986,8 +6020,17 @@ def symbolic_tiling(G: nuGraph) -> GraphTiling:
             tile_t0, tile_t1 = _HW_TILE_DIMS.get(
                 node.op, (_TILE_PMAX, _TILE_PSUM_FMAX)
             )
-            t0_z3 = _tile_dim_as_z3(tile_t0, "tile_pmax")
-            t1_z3 = _tile_dim_as_z3(tile_t1, "tile_psum_fmax")
+            # t_0 (partition axis): always the concrete integer 128.
+            t0_z3: z3.ArithRef = z3.IntVal(tile_t0)
+
+            # t_1 (free axis): concrete for nc_matmul/nc_transpose; for all
+            # other ops a per-operator symbolic variable constrained to
+            # _TILE_FREE_DIM_CHOICES = {512, 1024, 2048}.
+            if isinstance(tile_t1, int):
+                t1_z3: z3.ArithRef = z3.IntVal(tile_t1)
+            else:
+                t1_z3 = z3.Int(f"t1_{node.id}")
+                ctx.add(z3.Or(*[t1_z3 == z3.IntVal(c) for c in _TILE_FREE_DIM_CHOICES]))
 
             red_axes = _reduction_axes(node, G)
 
@@ -6535,6 +6578,81 @@ def _test_symbolic_tiling_all_kernels() -> None:
         )
 
 
+def _test_symbolic_tiling_tile_dims() -> None:
+    """Verify that the hardware tile-size constants are correctly reflected in
+    TilingParams for nc_matmul, nc_transpose, and generic ops.
+
+    Concrete checks:
+    - Every op has t_0 == 128 (partition dim).
+    - nc_matmul has t_1 == 512 (moving-operand free dim).
+    - nc_transpose has t_1 == 128 (free dim equals partition).
+    - All other ops have t_1 as the _TILE_PSUM_FMAX sentinel (non-concrete).
+    - The solver can assign t_1 ∈ {512, 1024, 2048} for each generic op.
+    """
+    G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
+    G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000)
+    assert G_hw is not None, "lower_nu_graph returned None for rmsnorm_matmul"
+
+    tiling = symbolic_tiling(G_hw)
+
+    for node in G_hw.nodes:
+        if node.op not in frozenset(_HW_OP_NAMES):
+            continue
+        tp = tiling.op_tilings.get(node.id)
+        assert tp is not None, f"Node {node.id!r} missing from op_tilings"
+
+        t0, t1 = tp.tile_dims
+        assert t0 == _TILE_PMAX, (
+            f"{node.id} ({node.op}): expected t_0 == {_TILE_PMAX}, got {t0}"
+        )
+
+        if node.op == "nc_matmul":
+            assert t1 == _TILE_NC_MATMUL_MOVING_FMAX, (
+                f"nc_matmul {node.id}: expected t_1 == {_TILE_NC_MATMUL_MOVING_FMAX}, got {t1}"
+            )
+        elif node.op == "nc_transpose":
+            assert t1 == _TILE_NC_TRANSPOSE_FMAX, (
+                f"nc_transpose {node.id}: expected t_1 == {_TILE_NC_TRANSPOSE_FMAX}, got {t1}"
+            )
+        else:
+            # Generic op: t_1 must be the sentinel (not a concrete int).
+            assert not isinstance(t1, int), (
+                f"{node.id} ({node.op}): expected sentinel t_1, got concrete {t1!r}"
+            )
+
+    # The constraint system for generic ops must allow each valid free-dim
+    # choice.  Check that the tiling context is satisfiable overall.
+    solver = z3.Solver()
+    solver.add(*tiling.ctx.facts)
+    result = solver.check()
+    assert result == z3.sat, (
+        f"symbolic_tiling tile_dims: context should be SAT, got {result}"
+    )
+
+    # Verify that the solver model assigns t_1 ∈ {512, 1024, 2048} for a
+    # generic op (if any exist in the graph).
+    model = solver.model()
+    generic_nodes = [
+        n for n in G_hw.nodes
+        if n.op in frozenset(_HW_OP_NAMES)
+        and n.op not in {"nc_matmul", "nc_transpose"}
+    ]
+    for n in generic_nodes:
+        t1_var = z3.Int(f"t1_{n.id}")
+        val = model.eval(t1_var, model_completion=True)
+        val_int = val.as_long() if isinstance(val, z3.IntNumRef) else None
+        assert val_int in _TILE_FREE_DIM_CHOICES, (
+            f"Generic op {n.id!r} ({n.op}): solver chose t_1={val_int}, "
+            f"expected one of {_TILE_FREE_DIM_CHOICES}"
+        )
+
+    print(
+        " symbolic_tiling: tile_dims — t_0=128 for all ops, "
+        "nc_matmul t_1=512, nc_transpose t_1=128, "
+        "generic ops t_1∈{512,1024,2048} verified"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test runner
 # ---------------------------------------------------------------------------
@@ -6556,6 +6674,7 @@ def run_all_tests() -> None:
     _test_symbolic_tiling_matmul()
     _test_symbolic_tiling_rmsnorm_matmul()
     _test_symbolic_tiling_all_kernels()
+    _test_symbolic_tiling_tile_dims()
     print("=============== ALL TESTS PASSED  =====================\n")
 
 
