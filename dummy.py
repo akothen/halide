@@ -5508,7 +5508,7 @@ def synthesize_hw_graph(
     # adds nodes by transposing multiple inputs.
     phase2_variants: list[nuGraph] = []
     phase2_worklist: list[nuGraph] = list(results)
-    post_swap_timeout = builtins.min(timeout, _POST_LOWERING_SWAP_TIMEOUT_MS)
+    post_swap_timeout = builtins.min(timeout, _POST_LOWERING_SWAP_TIMEOUT_MILLISECONDS)
     for g_hw in phase2_worklist:
         for g_hw_variant in nu_graph_generation_z3(g_hw, timeout=post_swap_timeout):
             sig = graph_structure_signature(g_hw_variant)
@@ -5538,8 +5538,11 @@ def synthesize_hw_graph(
 # Post-simplification helpers
 # ---------------------------------------------------------------------------
 
-_SIMPLIFICATION_EQ_TIMEOUT_MS = 100
-_POST_LOWERING_SWAP_TIMEOUT_MS = 50
+# Z3 solver timeout values are expressed in milliseconds.  These caps apply
+# only to best-effort optimization phases: missing a simplification or
+# post-lowering hw swap is preferable to making compilation appear stuck.
+_SIMPLIFICATION_EQ_TIMEOUT_MILLISECONDS = 100
+_POST_LOWERING_SWAP_TIMEOUT_MILLISECONDS = 50
 
 
 def _build_general_simplification_pool(
@@ -5621,7 +5624,7 @@ def _simplify_hw_graph_once(
     ``None`` when no simplification is possible.
     """
     candidates = _two_node_simplification_candidates(G)
-    simplification_timeout = builtins.min(timeout, _SIMPLIFICATION_EQ_TIMEOUT_MS)
+    simplification_timeout = builtins.min(timeout, _SIMPLIFICATION_EQ_TIMEOUT_MILLISECONDS)
 
     try:
         all_syms = _graph_symbolic_tensors(G)
@@ -8927,6 +8930,8 @@ def _test_simplify_hw_graph_variants_integration() -> None:
 
 
 def _test_simplify_hw_graph_uses_bounded_solver_timeout() -> None:
+    _invoke_hw_op("nc_transpose", [SymTensor("_w13", shape=(4, 8))], {})
+
     G = nuGraph([
         Node("x", "input", [], {"shape": (4, 8), "sym_shape": ("x_d0", "x_d1")}, (4, 8)),
         Node("nc_t1", "nc_transpose", ["x"], {}, (8, 4)),
@@ -8947,7 +8952,7 @@ def _test_simplify_hw_graph_uses_bounded_solver_timeout() -> None:
         globals()["_check_equivalent_quiet"] = original_check
 
     assert observed_timeouts, "Expected simplification to perform equivalence checks"
-    assert builtins.max(observed_timeouts) <= _SIMPLIFICATION_EQ_TIMEOUT_MS, (
+    assert builtins.max(observed_timeouts) <= _SIMPLIFICATION_EQ_TIMEOUT_MILLISECONDS, (
         f"Simplification checks must use the bounded timeout; got {observed_timeouts}"
     )
     print(" simplify_hw_graph: speculative equivalence checks use bounded timeout")
