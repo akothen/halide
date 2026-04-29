@@ -5967,7 +5967,7 @@ def symbolic_tiling(G: nuGraph) -> GraphTiling:
 
         try:
             sym_tensors = _graph_symbolic_tensors(G)
-        except (KeyError, Exception):
+        except (KeyError, z3.Z3Exception):
             sym_tensors = {}
 
         # Shared strip-dim variables, reused across all non-reduction axis ops.
@@ -6026,7 +6026,8 @@ def symbolic_tiling(G: nuGraph) -> GraphTiling:
             bt0 = b0 * t0_z3
             bt1 = b1 * t1_z3
 
-            # n_i == ceil(dim_i / (b_i * t_i))  (ceiling integer division)
+            # n_i == ceil(dim_i / (b_i * t_i))
+            # Ceiling division: ceil(a/b) == (a + b - 1) // b  for positive a, b
             ctx.add(n0 == (dim0 + bt0 - z3.IntVal(1)) / bt0)
             ctx.add(n1 == (dim1 + bt1 - z3.IntVal(1)) / bt1)
 
@@ -6472,9 +6473,11 @@ def _test_symbolic_tiling_rmsnorm_matmul() -> None:
     # If both reduction and non-reduction nodes are present, their strip dims
     # along the reduced axis must be distinct Python objects.
     for rn in G_hw.nodes:
-        if rn.id not in reduction_node_ids or rn.id not in tiling.op_tilings:
+        if rn.id not in tiling.op_tilings:
             continue
         red_axes = _reduction_axes(rn, G_hw)
+        if not red_axes:
+            continue
         tp_r = tiling.op_tilings[rn.id]
         for nn_id in non_reduction_node_ids:
             if nn_id not in tiling.op_tilings:
