@@ -5865,6 +5865,9 @@ def simplify_hw_graph_variants(
 _TILE_PMAX: int = 128
 
 # Sentinel that marks a free dimension whose size is not fixed by hardware.
+# The value reuses the existing `tile_size.psum_fmax` class attribute (which
+# is `Ellipsis`, a unique non-int object) purely as a distinguishable sentinel;
+# its original NKI meaning (maximum free dim on PSUM) is not used here.
 # During symbolic_tiling each operator using this sentinel gets its own
 # per-operator z3.Int variable constrained to _TILE_FREE_DIM_CHOICES.
 _TILE_PSUM_FMAX: Any = tile_size.psum_fmax
@@ -5955,17 +5958,6 @@ class GraphTiling:
     op_tilings: dict[str, TilingParams]
     shared_strip_dims: dict[int, z3.ArithRef]
     ctx: Context
-
-
-def _tile_dim_as_z3(t: Any, name: str) -> z3.ArithRef:
-    """Return a z3 integer expression for a tile dimension.
-
-    Concrete ``int`` values become ``z3.IntVal``; sentinel values
-    (e.g. ``tile_size.pmax``) become symbolic ``z3.Int`` variables.
-    """
-    if isinstance(t, int):
-        return z3.IntVal(t)
-    return z3.Int(name)
 
 
 def _reduction_axes(node: Node, G: nuGraph) -> frozenset[int]:
@@ -6070,7 +6062,9 @@ def symbolic_tiling(G: nuGraph) -> GraphTiling:
             bt1 = b1 * t1_z3
 
             # n_i == ceil(dim_i / (b_i * t_i))
-            # Ceiling division: ceil(a/b) == (a + b - 1) // b  for positive a, b
+            # Ceiling division: ceil(a/b) == (a + b - 1) / b for positive a, b.
+            # The z3 '/' operator on integer-sorted terms performs integer
+            # (floor) division, so (a + b - 1) / b gives ceiling division.
             ctx.add(n0 == (dim0 + bt0 - z3.IntVal(1)) / bt0)
             ctx.add(n1 == (dim1 + bt1 - z3.IntVal(1)) / bt1)
 
