@@ -6415,7 +6415,7 @@ def build_kernel_silu_mlp_graph(M: int, K: int, N: int) -> nuGraph:
         kernel_silu_mlp,
         ("x", (M, K), ("x_d0", "x_d1")),
         ("w1", (K, N), ("x_d1", "w1_d1")),
-        ("w2", (K, N), ("x_d1", "w2_d1")),
+        ("w2", (K, N), ("x_d1", "w1_d1")),
     )
 
 
@@ -6424,8 +6424,8 @@ def build_kernel_silu_mlp_full_graph(M: int, K: int, N: int) -> nuGraph:
         kernel_silu_mlp_full,
         ("x", (M, K), ("x_d0", "x_d1")),
         ("w1", (K, N), ("x_d1", "w1_d1")),
-        ("w2", (K, N), ("x_d1", "w2_d1")),
-        ("w3", (N, N), ("w1_d1", "w1_d1")),
+        ("w2", (K, N), ("x_d1", "w1_d1")),
+        ("w3", (N, N), ("w1_d1", "w3_d1")),
     )
 
 
@@ -6434,7 +6434,7 @@ def build_kernel_relu_mlp_graph(M: int, K: int, N: int) -> nuGraph:
         kernel_relu_mlp,
         ("x", (M, K), ("x_d0", "x_d1")),
         ("w1", (K, N), ("x_d1", "w1_d1")),
-        ("w2", (K, N), ("x_d1", "w2_d1")),
+        ("w2", (K, N), ("x_d1", "w1_d1")),
     )
 
 
@@ -6443,8 +6443,8 @@ def build_kernel_relu_mlp_full_graph(M: int, K: int, N: int) -> nuGraph:
         kernel_relu_mlp_full,
         ("x", (M, K), ("x_d0", "x_d1")),
         ("w1", (K, N), ("x_d1", "w1_d1")),
-        ("w2", (K, N), ("x_d1", "w2_d1")),
-        ("w3", (N, N), ("w1_d1", "w1_d1")),
+        ("w2", (K, N), ("x_d1", "w1_d1")),
+        ("w3", (N, N), ("w1_d1", "w3_d1")),
     )
 
 
@@ -6664,6 +6664,8 @@ def _test_silu_mlp_graph() -> None:
     assert matmuls[1].shape == (4, 16), f"second matmul shape wrong: {matmuls[1].shape}"
     assert silu_nodes[0].shape == (4, 16), f"silu shape wrong: {silu_nodes[0].shape}"
     assert mul_nodes[0].shape == (4, 16), f"mul shape wrong: {mul_nodes[0].shape}"
+    syms = _graph_symbolic_tensors(G)
+    assert _format_shape(syms[mul_nodes[0].id].shape) == "(x_d0, w1_d1)"
     variants = nu_graph_generation_z3(G, verbose=False)
     assert len(variants) >= 1, "silu_mlp should emit at least one variant"
     print(" silu_mlp graph builds and runs variant generation")
@@ -6682,6 +6684,9 @@ def _test_silu_mlp_full_graph() -> None:
     assert silu_nodes[0].shape == (4, 16), f"silu shape wrong: {silu_nodes[0].shape}"
     assert mul_nodes[0].shape == (4, 16), f"mul shape wrong: {mul_nodes[0].shape}"
     assert matmuls[2].shape == (4, 16), f"third matmul shape wrong: {matmuls[2].shape}"
+    syms = _graph_symbolic_tensors(G)
+    assert _format_shape(syms[mul_nodes[0].id].shape) == "(x_d0, w1_d1)"
+    assert _format_shape(syms[matmuls[2].id].shape) == "(x_d0, w3_d1)"
     variants = nu_graph_generation_z3(G, verbose=False)
     assert len(variants) >= 1, "silu_mlp_full should emit at least one variant"
     print(" silu_mlp_full graph builds and runs variant generation")
@@ -6699,6 +6704,8 @@ def _test_relu_mlp_graph() -> None:
     assert matmuls[1].shape == (4, 16), f"second matmul shape wrong: {matmuls[1].shape}"
     assert relu_nodes[0].shape == (4, 16), f"relu shape wrong: {relu_nodes[0].shape}"
     assert mul_nodes[0].shape == (4, 16), f"mul shape wrong: {mul_nodes[0].shape}"
+    syms = _graph_symbolic_tensors(G)
+    assert _format_shape(syms[mul_nodes[0].id].shape) == "(x_d0, w1_d1)"
     variants = nu_graph_generation_z3(G, verbose=False)
     assert len(variants) >= 1, "relu_mlp should emit at least one variant"
     print(" relu_mlp graph builds and runs variant generation")
@@ -6717,6 +6724,9 @@ def _test_relu_mlp_full_graph() -> None:
     assert relu_nodes[0].shape == (4, 16), f"relu shape wrong: {relu_nodes[0].shape}"
     assert mul_nodes[0].shape == (4, 16), f"mul shape wrong: {mul_nodes[0].shape}"
     assert matmuls[2].shape == (4, 16), f"third matmul shape wrong: {matmuls[2].shape}"
+    syms = _graph_symbolic_tensors(G)
+    assert _format_shape(syms[mul_nodes[0].id].shape) == "(x_d0, w1_d1)"
+    assert _format_shape(syms[matmuls[2].id].shape) == "(x_d0, w3_d1)"
     variants = nu_graph_generation_z3(G, verbose=False)
     assert len(variants) >= 1, "relu_mlp_full should emit at least one variant"
     print(" relu_mlp_full graph builds and runs variant generation")
