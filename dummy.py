@@ -3919,6 +3919,8 @@ def _pool_templates_for_hw_op(
 
     def add_binary(attrs: dict[str, Any]) -> None:
         ordered_pairs = list(_iproduct(concrete, concrete))
+        # Prefer distinct input pairs before same-input pairs so two-input
+        # candidates are explored before degenerate x/x or y/y forms.
         ordered_pairs.sort(key=lambda pair: pair[0] == pair[1])
         for n1, n2 in ordered_pairs:
             templates.append(SketchNode.make_op(
