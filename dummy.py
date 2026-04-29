@@ -3918,17 +3918,8 @@ def _pool_templates_for_hw_op(
             templates.append(SketchNode.make_op(hw_op, [n1], attrs))
 
     def add_binary(attrs: dict[str, Any]) -> None:
-        ordered_pairs = [
-            (n1, n2)
-            for i, n1 in enumerate(concrete)
-            for j, n2 in enumerate(concrete)
-            if i != j
-        ] + [
-            (n1, n2)
-            for i, n1 in enumerate(concrete)
-            for j, n2 in enumerate(concrete)
-            if i == j
-        ]
+        ordered_pairs = list(_iproduct(concrete, concrete))
+        ordered_pairs.sort(key=lambda pair: pair[0] == pair[1])
         for n1, n2 in ordered_pairs:
             templates.append(SketchNode.make_op(
                 hw_op,
@@ -5526,9 +5517,9 @@ def synthesize_hw_graph(
     # adds nodes by transposing multiple inputs.
     phase2_variants: list[nuGraph] = []
     phase2_worklist: list[nuGraph] = list(results)
-    bounded_post_swap_timeout = builtins.min(timeout, _POST_LOWERING_SWAP_TIMEOUT_MILLISECONDS)
+    bounded_post_lowering_swap_timeout = builtins.min(timeout, _POST_LOWERING_SWAP_TIMEOUT_MILLISECONDS)
     for g_hw in phase2_worklist:
-        for g_hw_variant in nu_graph_generation_z3(g_hw, timeout=bounded_post_swap_timeout):
+        for g_hw_variant in nu_graph_generation_z3(g_hw, timeout=bounded_post_lowering_swap_timeout):
             sig = graph_structure_signature(g_hw_variant)
             if sig not in seen:
                 seen.add(sig)
@@ -5642,7 +5633,7 @@ def _simplify_hw_graph_once(
     ``None`` when no simplification is possible.
     """
     candidates = _two_node_simplification_candidates(G)
-    bounded_simplification_timeout = builtins.min(timeout, _SIMPLIFICATION_EQ_TIMEOUT_MILLISECONDS)
+    bounded_equivalence_check_timeout = builtins.min(timeout, _SIMPLIFICATION_EQ_TIMEOUT_MILLISECONDS)
 
     try:
         all_syms = _graph_symbolic_tensors(G)
@@ -5677,7 +5668,7 @@ def _simplify_hw_graph_once(
 
         replacement_id: Optional[str] = None
         for ext_id, ext_sym in zip(external_input_ids, ext_syms):
-            if _check_equivalent_quiet(target_sym, ext_sym, timeout=bounded_simplification_timeout):
+            if _check_equivalent_quiet(target_sym, ext_sym, timeout=bounded_equivalence_check_timeout):
                 replacement_id = ext_id
                 if verbose:
                     print(
@@ -5742,7 +5733,7 @@ def _simplify_hw_graph_once(
         new_nodes_for_replacement: list[Node] = []
 
         for ext_id, ext_sym in zip(external_input_ids, ext_syms):
-            if _check_equivalent_quiet(target_sym, ext_sym, timeout=bounded_simplification_timeout):
+            if _check_equivalent_quiet(target_sym, ext_sym, timeout=bounded_equivalence_check_timeout):
                 replacement_id = ext_id
                 if verbose:
                     print(
@@ -5758,7 +5749,7 @@ def _simplify_hw_graph_once(
         if replacement_id is None:
             pool = _build_general_simplification_pool(ext_syms)
             sketch = _synthesize_from_pool(
-                target_sym, pool, max_hw_size=1, timeout=bounded_simplification_timeout,
+                target_sym, pool, max_hw_size=1, timeout=bounded_equivalence_check_timeout,
                 verbose=False, input_syms=ext_syms,
             )
             if sketch is not None:
