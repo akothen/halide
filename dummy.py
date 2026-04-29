@@ -3918,6 +3918,28 @@ def _pool_templates_for_hw_op(
             templates.append(SketchNode.make_op(hw_op, [n1], attrs))
 
     def add_binary(attrs: dict[str, Any]) -> None:
+        ordered_pairs = [
+            (n1, n2)
+            for i, n1 in enumerate(concrete)
+            for j, n2 in enumerate(concrete)
+            if i != j
+        ] + [
+            (n1, n2)
+            for i, n1 in enumerate(concrete)
+            for j, n2 in enumerate(concrete)
+            if i == j
+        ]
+        for n1, n2 in ordered_pairs:
+            templates.append(SketchNode.make_op(
+                hw_op,
+                [SketchNode.make_op("transpose", [n1], {}), n2],
+                attrs,
+            ))
+            templates.append(SketchNode.make_op(
+                hw_op,
+                [n1, SketchNode.make_op("transpose", [n2], {})],
+                attrs,
+            ))
         templates.append(SketchNode.make_op(hw_op, [H(), H()], attrs))
         for n1 in concrete:
             templates.append(SketchNode.make_op(hw_op, [n1, H()], attrs))
@@ -4005,13 +4027,6 @@ def _build_synthesis_pool(
 
     augmented_attrs = dict(target_attrs)
     augmented_attrs["op_name"] = target_op
-
-    if target_op == "matmul" and len(concrete) >= 2:
-        pool.append(SketchNode.make_op(
-            "nc_matmul",
-            [SketchNode.make_op("transpose", [concrete[0]], {}), concrete[1]],
-            {},
-        ))
 
     for hw_op in _SYNTHESIS_POOL_OP_NAMES:
         is_layout = hw_op in _LAYOUT_TRANSFORM_OPS
@@ -7140,39 +7155,39 @@ def _test_synthesis_pool_filters_templates_by_target_constituents() -> None:
     print(" synthesis: pool filtering keeps only subset-compatible templates")
 
 
-def _test_matmul_pool_prioritizes_canonical_nc_matmul() -> None:
+def _test_binary_pool_prioritizes_layout_composed_templates() -> None:
     G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
     orig_syms = _graph_symbolic_tensors(G)
     matmul_node = _nodes_by_op(G, "matmul")[0]
     pool_inputs = [orig_syms[inp_id] for inp_id in matmul_node.inputs]
     pool = _build_synthesis_pool(matmul_node.op, matmul_node.attrs, pool_inputs)
 
-    assert len(pool) > len(pool_inputs), "matmul pool must contain non-input sketches"
+    assert len(pool) > len(pool_inputs), "binary pool must contain non-input sketches"
     preferred = pool[len(pool_inputs)]
     assert preferred.op == "nc_matmul", (
-        f"Expected first non-input matmul sketch to be nc_matmul, got {_format_sketch(preferred)}"
+        f"Expected first non-input binary sketch to be nc_matmul, got {_format_sketch(preferred)}"
     )
     assert len(preferred.children) == 2, (
         f"Expected preferred nc_matmul to have two operands, got {_format_sketch(preferred)}"
     )
     lhs, rhs = preferred.children
     assert lhs.op == "transpose" and len(lhs.children) == 1 and lhs.children[0].op == "INPUT", (
-        f"Expected preferred matmul lhs to be transpose(IN:left), got {_format_sketch(preferred)}"
+        f"Expected preferred binary lhs to be transpose(IN:left), got {_format_sketch(preferred)}"
     )
     assert rhs.op == "INPUT", (
-        f"Expected preferred matmul rhs to be IN:right, got {_format_sketch(preferred)}"
+        f"Expected preferred binary rhs to be IN:right, got {_format_sketch(preferred)}"
     )
 
     target = _sym_expr_from_graph_node(matmul_node, pool_inputs)
     candidate = _eval_sketch(preferred)
-    assert candidate is not None, "Preferred matmul sketch should evaluate"
+    assert candidate is not None, "Preferred layout-composed binary sketch should evaluate"
     assert _shape_rejection_reason(target, candidate, input_syms=pool_inputs) is None, (
-        f"Preferred matmul sketch should pass shape prefilter, got {_format_sketch(preferred)}"
+        f"Preferred layout-composed binary sketch should pass shape prefilter, got {_format_sketch(preferred)}"
     )
     assert _check_equivalent_quiet(target, candidate, timeout=5000), (
-        f"Preferred matmul sketch should be equivalent to the public matmul target: {_format_sketch(preferred)}"
+        f"Preferred layout-composed binary sketch should be equivalent to the public matmul target: {_format_sketch(preferred)}"
     )
-    print(" synthesis: matmul pool prioritizes canonical nc_matmul(transpose(lhs), rhs)")
+    print(" synthesis: binary pool prioritizes layout-composed templates")
 
 
 def _test_single_operator_sketches_cover_distinct_inputs() -> None:
@@ -9111,7 +9126,7 @@ def run_all_tests() -> None:
     _test_synthesis_symbolic_shape_prefilter_skips_solver()
     _test_sketch_shape_constraints_violated_rejected_early()
     _test_synthesis_pool_filters_templates_by_target_constituents()
-    _test_matmul_pool_prioritizes_canonical_nc_matmul()
+    _test_binary_pool_prioritizes_layout_composed_templates()
     _test_single_operator_sketches_cover_distinct_inputs()
     _test_division_broadcast_uses_tensor_scalar_not_tensor_tensor()
     _test_division_symbolic_shape_rejection()
