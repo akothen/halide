@@ -13,7 +13,7 @@ from enum import Enum
 from collections import deque
 from itertools import combinations, permutations, product as _iproduct
 from threading import Lock, RLock
-from typing import Any, Callable, Optional, List, cast
+from typing import Any, Callable, Optional, List
 
 import z3
 
@@ -5539,7 +5539,7 @@ def synthesize_hw_graph(
 # ---------------------------------------------------------------------------
 
 _SIMPLIFICATION_EQ_TIMEOUT_MS = 100
-_POST_LOWERING_SWAP_TIMEOUT_MS = 25
+_POST_LOWERING_SWAP_TIMEOUT_MS = 50
 
 
 def _build_general_simplification_pool(
@@ -5648,7 +5648,7 @@ def _simplify_hw_graph_once(
         external_syms: list[Optional[SymTensor]] = [all_syms.get(eid) for eid in external_input_ids]
         if any(s is None for s in external_syms):
             continue
-        ext_syms: list[SymTensor] = cast(list[SymTensor], external_syms)
+        ext_syms = [s for s in external_syms if s is not None]
 
         target_sym = all_syms.get(node.id)
         if target_sym is None:
@@ -5708,7 +5708,7 @@ def _simplify_hw_graph_once(
         external_syms: list[Optional[SymTensor]] = [all_syms.get(eid) for eid in external_input_ids]
         if any(s is None for s in external_syms):
             continue
-        ext_syms: list[SymTensor] = cast(list[SymTensor], external_syms)
+        ext_syms = [s for s in external_syms if s is not None]
 
         target_sym = all_syms.get(consumer.id)
         if target_sym is None:
