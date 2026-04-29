@@ -3494,7 +3494,12 @@ def _swap_with_successor_variants(
 
 
 def z3_equivalent_order(
-    op1: Node, op2: Node, G_cur: nuGraph, G_new: Optional[nuGraph] = None, verbose: bool = False
+    op1: Node,
+    op2: Node,
+    G_cur: nuGraph,
+    G_new: Optional[nuGraph] = None,
+    verbose: bool = False,
+    timeout: int = 10000,
 ) -> bool:
     if G_new is None:
         return False
@@ -3514,13 +3519,13 @@ def z3_equivalent_order(
     return check_equivalent(
         lhs,
         rhs,
-        timeout=10000,
+        timeout=timeout,
         rule_name=f"swap_{op1.id}_{op2.id}",
         verbose=verbose,
     )
 
 
-def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
+def nu_graph_generation_z3(G : nuGraph, verbose=False, timeout: int = 10000) -> List[nuGraph]:
     G0 = G.clone()
     M: dict[str, nuGraph] = {graph_structure_signature(G0): G0}
     equivalence_cache: dict[tuple[str, str, str, str], bool] = {}
@@ -3563,7 +3568,11 @@ def nu_graph_generation_z3(G : nuGraph, verbose=False) -> List[nuGraph]:
                                 cache_key = (cur_sig, str(pos), str(succ_pos), graph_structure_signature(G_new))
                                 equivalent = equivalence_cache.get(cache_key)
                                 if equivalent is None:
-                                    equivalent = z3_equivalent_order(op1, op2, G_cur, G_new, verbose=verbose)
+                                    equivalent = z3_equivalent_order(
+                                        op1, op2, G_cur, G_new,
+                                        verbose=verbose,
+                                        timeout=timeout,
+                                    )
                                     equivalence_cache[cache_key] = equivalent
                                 if not equivalent:
                                     continue
@@ -3996,6 +4005,13 @@ def _build_synthesis_pool(
 
     augmented_attrs = dict(target_attrs)
     augmented_attrs["op_name"] = target_op
+
+    if target_op == "matmul" and len(concrete) >= 2:
+        pool.append(SketchNode.make_op(
+            "nc_matmul",
+            [SketchNode.make_op("transpose", [concrete[0]], {}), concrete[1]],
+            {},
+        ))
 
     for hw_op in _SYNTHESIS_POOL_OP_NAMES:
         is_layout = hw_op in _LAYOUT_TRANSFORM_OPS
@@ -4615,6 +4631,13 @@ def _sketch_to_graph_nodes(
         child_ids.append(cid)
 
     clean_attrs = {k: v for k, v in sketch.attrs.items() if k != "name"}
+    if sketch.op == "activation":
+        clean_attrs.setdefault("scale", 1.0)
+        clean_attrs.setdefault("bias_const", None)
+        clean_attrs.setdefault("with_reduce", False)
+    if sketch.op == "activation_reduce":
+        clean_attrs.setdefault("scale", 1.0)
+        clean_attrs.setdefault("bias_const", None)
     if sketch.op == "tensor_scalar":
         if len(child_ids) > 1:
             clean_attrs["operand0_input_index"] = 1
@@ -5485,8 +5508,9 @@ def synthesize_hw_graph(
     # adds nodes by transposing multiple inputs.
     phase2_variants: list[nuGraph] = []
     phase2_worklist: list[nuGraph] = list(results)
+    post_swap_timeout = builtins.min(timeout, _POST_LOWERING_SWAP_TIMEOUT_MS)
     for g_hw in phase2_worklist:
-        for g_hw_variant in nu_graph_generation_z3(g_hw):
+        for g_hw_variant in nu_graph_generation_z3(g_hw, timeout=post_swap_timeout):
             sig = graph_structure_signature(g_hw_variant)
             if sig not in seen:
                 seen.add(sig)
@@ -5513,6 +5537,9 @@ def synthesize_hw_graph(
 # ---------------------------------------------------------------------------
 # Post-simplification helpers
 # ---------------------------------------------------------------------------
+
+_SIMPLIFICATION_EQ_TIMEOUT_MS = 100
+_POST_LOWERING_SWAP_TIMEOUT_MS = 25
 
 
 def _build_general_simplification_pool(
@@ -5594,6 +5621,7 @@ def _simplify_hw_graph_once(
     ``None`` when no simplification is possible.
     """
     candidates = _two_node_simplification_candidates(G)
+    simplification_timeout = builtins.min(timeout, _SIMPLIFICATION_EQ_TIMEOUT_MS)
 
     try:
         all_syms = _graph_symbolic_tensors(G)
@@ -5628,7 +5656,7 @@ def _simplify_hw_graph_once(
 
         replacement_id: Optional[str] = None
         for ext_id, ext_sym in zip(external_input_ids, ext_syms):
-            if _check_equivalent_quiet(target_sym, ext_sym, timeout=timeout):
+            if _check_equivalent_quiet(target_sym, ext_sym, timeout=simplification_timeout):
                 replacement_id = ext_id
                 if verbose:
                     print(
@@ -5693,7 +5721,7 @@ def _simplify_hw_graph_once(
         new_nodes_for_replacement: list[Node] = []
 
         for ext_id, ext_sym in zip(external_input_ids, ext_syms):
-            if _check_equivalent_quiet(target_sym, ext_sym, timeout=timeout):
+            if _check_equivalent_quiet(target_sym, ext_sym, timeout=simplification_timeout):
                 replacement_id = ext_id
                 if verbose:
                     print(
@@ -5709,7 +5737,7 @@ def _simplify_hw_graph_once(
         if replacement_id is None:
             pool = _build_general_simplification_pool(ext_syms)
             sketch = _synthesize_from_pool(
-                target_sym, pool, max_hw_size=1, timeout=timeout,
+                target_sym, pool, max_hw_size=1, timeout=simplification_timeout,
                 verbose=False, input_syms=ext_syms,
             )
             if sketch is not None:
@@ -7106,6 +7134,41 @@ def _test_synthesis_pool_filters_templates_by_target_constituents() -> None:
     print(" synthesis: pool filtering keeps only subset-compatible templates")
 
 
+def _test_matmul_pool_prioritizes_canonical_nc_matmul() -> None:
+    G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
+    orig_syms = _graph_symbolic_tensors(G)
+    matmul_node = _nodes_by_op(G, "matmul")[0]
+    pool_inputs = [orig_syms[inp_id] for inp_id in matmul_node.inputs]
+    pool = _build_synthesis_pool(matmul_node.op, matmul_node.attrs, pool_inputs)
+
+    assert len(pool) > len(pool_inputs), "matmul pool must contain non-input sketches"
+    preferred = pool[len(pool_inputs)]
+    assert preferred.op == "nc_matmul", (
+        f"Expected first non-input matmul sketch to be nc_matmul, got {_format_sketch(preferred)}"
+    )
+    assert len(preferred.children) == 2, (
+        f"Expected preferred nc_matmul to have two operands, got {_format_sketch(preferred)}"
+    )
+    lhs, rhs = preferred.children
+    assert lhs.op == "transpose" and len(lhs.children) == 1 and lhs.children[0].op == "INPUT", (
+        f"Expected preferred matmul lhs to be transpose(IN:left), got {_format_sketch(preferred)}"
+    )
+    assert rhs.op == "INPUT", (
+        f"Expected preferred matmul rhs to be IN:right, got {_format_sketch(preferred)}"
+    )
+
+    target = _sym_expr_from_graph_node(matmul_node, pool_inputs)
+    candidate = _eval_sketch(preferred)
+    assert candidate is not None, "Preferred matmul sketch should evaluate"
+    assert _shape_rejection_reason(target, candidate, input_syms=pool_inputs) is None, (
+        f"Preferred matmul sketch should pass shape prefilter, got {_format_sketch(preferred)}"
+    )
+    assert _check_equivalent_quiet(target, candidate, timeout=5000), (
+        f"Preferred matmul sketch should be equivalent to the public matmul target: {_format_sketch(preferred)}"
+    )
+    print(" synthesis: matmul pool prioritizes canonical nc_matmul(transpose(lhs), rhs)")
+
+
 def _test_single_operator_sketches_cover_distinct_inputs() -> None:
     G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
     orig_syms = _graph_symbolic_tensors(G)
@@ -8256,7 +8319,7 @@ def _test_synthesize_hw_graph_post_lowering_swap_variants() -> None:
     # --------------------------------------------------------------------------
     hw_gen_call_sigs: list[str] = []
 
-    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False) -> list[nuGraph]:
+    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False, timeout: int = 10000) -> list[nuGraph]:
         sig = graph_signature(graph)
         if sig == sig_original:
             return [graph]          # Phase-1: one variant (the original graph)
@@ -8362,7 +8425,7 @@ def _test_synthesize_hw_graph_post_lowering_reaches_fixpoint_with_growing_varian
     sig_original = graph_signature(G)
     hw_gen_call_sigs: list[str] = []
 
-    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False) -> list[nuGraph]:
+    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False, timeout: int = 10000) -> list[nuGraph]:
         sig = graph_signature(graph)
         if sig == sig_original:
             return [graph]
@@ -8428,7 +8491,7 @@ def _test_synthesize_hw_graph_post_lowering_dedupes_fresh_ids() -> None:
     sig_original = graph_signature(G)
     hw_gen_call_sigs: list[str] = []
 
-    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False) -> list[nuGraph]:
+    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False, timeout: int = 10000) -> list[nuGraph]:
         sig = graph_signature(graph)
         if sig == sig_original:
             return [graph]
@@ -8532,7 +8595,7 @@ def _test_synthesize_hw_graph_verbose_prints_phase_variants() -> None:
     sig_lowered_a = graph_signature(lowered_a)
     sig_lowered_b = graph_signature(lowered_b)
 
-    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False) -> list[nuGraph]:
+    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False, timeout: int = 10000) -> list[nuGraph]:
         sig = graph_signature(graph)
         if sig == sig_original:
             return [graph, phase1_variant]
@@ -8863,6 +8926,33 @@ def _test_simplify_hw_graph_variants_integration() -> None:
     )
 
 
+def _test_simplify_hw_graph_uses_bounded_solver_timeout() -> None:
+    G = nuGraph([
+        Node("x", "input", [], {"shape": (4, 8), "sym_shape": ("x_d0", "x_d1")}, (4, 8)),
+        Node("nc_t1", "nc_transpose", ["x"], {}, (8, 4)),
+        Node("nc_t2", "nc_transpose", ["nc_t1"], {}, (4, 8)),
+    ])
+
+    observed_timeouts: list[int] = []
+    original_check = globals()["_check_equivalent_quiet"]
+
+    def _mock_check(lhs: SymTensor, rhs: SymTensor, timeout: int = 3000) -> bool:
+        observed_timeouts.append(timeout)
+        return False
+
+    try:
+        globals()["_check_equivalent_quiet"] = _mock_check
+        _simplify_hw_graph_once(G, timeout=5000, verbose=False)
+    finally:
+        globals()["_check_equivalent_quiet"] = original_check
+
+    assert observed_timeouts, "Expected simplification to perform equivalence checks"
+    assert builtins.max(observed_timeouts) <= _SIMPLIFICATION_EQ_TIMEOUT_MS, (
+        f"Simplification checks must use the bounded timeout; got {observed_timeouts}"
+    )
+    print(" simplify_hw_graph: speculative equivalence checks use bounded timeout")
+
+
 def _test_synthesize_hw_graph_simplification_replaces_variants() -> None:
     """Regression test: simplification replaces variants instead of appending.
 
@@ -8889,7 +8979,7 @@ def _test_synthesize_hw_graph_simplification_replaces_variants() -> None:
     sig_simplified = graph_structure_signature(expected_simplified)
     hw_generation_inputs: list[str] = []
 
-    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False) -> list[nuGraph]:
+    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False, timeout: int = 10000) -> list[nuGraph]:
         if graph_signature(graph) == sig_original:
             return [graph]
         hw_generation_inputs.append(graph_structure_signature(graph))
@@ -8958,7 +9048,7 @@ def _test_synthesize_hw_graph_verbose_prints_post_simplification() -> None:
     sig_lowered_a = graph_signature(lowered_a)
     sig_lowered_b = graph_signature(lowered_b)
 
-    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False) -> list[nuGraph]:
+    def _mocked_nu_gen(graph: nuGraph, verbose: bool = False, timeout: int = 10000) -> list[nuGraph]:
         sig = graph_signature(graph)
         if sig == sig_original:
             return [graph, phase1_variant]
@@ -9013,6 +9103,7 @@ def run_all_tests() -> None:
     _test_synthesis_symbolic_shape_prefilter_skips_solver()
     _test_sketch_shape_constraints_violated_rejected_early()
     _test_synthesis_pool_filters_templates_by_target_constituents()
+    _test_matmul_pool_prioritizes_canonical_nc_matmul()
     _test_single_operator_sketches_cover_distinct_inputs()
     _test_division_broadcast_uses_tensor_scalar_not_tensor_tensor()
     _test_division_symbolic_shape_rejection()
@@ -9056,6 +9147,7 @@ def run_all_tests() -> None:
     _test_simplify_hw_graph_single_broadcast_identity()
     _test_simplify_hw_graph_broadcast_tensor_scalar_redundant()
     _test_simplify_hw_graph_variants_integration()
+    _test_simplify_hw_graph_uses_bounded_solver_timeout()
     _test_synthesize_hw_graph_simplification_replaces_variants()
     _test_synthesize_hw_graph_verbose_prints_post_simplification()
     print("=============== ALL TESTS PASSED  =====================\n")
