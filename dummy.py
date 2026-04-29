@@ -5420,9 +5420,10 @@ def _print_synthesis_phase_variants(phase_name: str, graphs: list[nuGraph]) -> N
 
     Intended for the phase boundaries in ``synthesize_hw_graph`` such as
     pre-lowering, post-lowering, post-lowering simplification,
-    post-swap/propagation, and post-simplification.  The two simplification
-    phases are distinct: post-lowering simplification runs immediately after
-    lowering, while post-simplification runs after swap/propagation.
+    post-swap/propagation, and post-simplification.  Two distinct
+    simplification phases exist within the pipeline: post-lowering
+    simplification runs immediately after lowering, while post-simplification
+    runs after swap/propagation.
     """
     print(f"[synthesize_hw_graph] {phase_name}: {len(graphs)} variant(s)")
     for idx, graph in enumerate(graphs):
