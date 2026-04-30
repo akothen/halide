@@ -7333,6 +7333,56 @@ def render_nki_kernel_schedule_isa(
     return "\n".join(lines)
 
 
+def render_nki_kernel_versions_isa(
+    G: nuGraph,
+    loop_nests: list[NKILoopNest],
+    schedules: list[NKIKernelSchedule],
+    kernel_name: str = "nki_kernel",
+) -> list[tuple[NKIKernelSchedule, str]]:
+    """Render one ISA-syntax kernel string per fusion schedule version."""
+    rendered: list[tuple[NKIKernelSchedule, str]] = []
+    for schedule in schedules:
+        suffix = schedule.name.replace("-", "_")
+        rendered.append(
+            (
+                schedule,
+                render_nki_kernel_schedule_isa(
+                    G,
+                    loop_nests,
+                    schedule,
+                    kernel_name=f"{kernel_name}_{suffix}",
+                ),
+            )
+        )
+    return rendered
+
+
+def render_all_graph_variant_nki_versions(
+    hw_variants: list[nuGraph],
+    kernel_name: str,
+    *,
+    verbose: bool = False,
+) -> list[tuple[int, nuGraph, GraphTiling, list[FusionOpportunity], dict[str, int], list[tuple[NKIKernelSchedule, str]]]]:
+    """Render ISA-syntax NKI kernels for every synthesized hw graph variant."""
+    rendered_variants: list[
+        tuple[int, nuGraph, GraphTiling, list[FusionOpportunity], dict[str, int], list[tuple[NKIKernelSchedule, str]]]
+    ] = []
+    tiled_variants = tile_nu_graph_variants(hw_variants)
+    for hi, (g_hw, tiling) in enumerate(tiled_variants):
+        loop_nests = lower_tiled_graph_to_nki(g_hw, tiling)
+        opportunities = enumerate_fusion_opportunities(g_hw, tiling, verbose=verbose)
+        counts = count_fusion_candidates(opportunities)
+        schedules = build_nki_fusion_schedule_versions(g_hw, tiling, loop_nests)
+        rendered = render_nki_kernel_versions_isa(
+            g_hw,
+            loop_nests,
+            schedules,
+            kernel_name=f"{kernel_name}_v{hi}",
+        )
+        rendered_variants.append((hi, g_hw, tiling, opportunities, counts, rendered))
+    return rendered_variants
+
+
 def render_all_fusion_versions(
     G: "nuGraph",
     kernel_name: str,
@@ -8315,6 +8365,36 @@ def _test_nki_multi_version_emission_all_kernels() -> None:
         )
 
 
+def _test_graph_variant_isa_emission_covers_all_variants() -> None:
+    """Verify ISA emission produces output for every synthesized hw graph variant."""
+    G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
+    hw_variants = synthesize_hw_graph(
+        G,
+        max_hw_size=2,
+        timeout=2000,
+        verbose=False,
+        max_workers=1,
+    )
+    assert hw_variants, "Expected at least one synthesized hw variant"
+    rendered_variants = render_all_graph_variant_nki_versions(
+        hw_variants,
+        kernel_name="nki_rmsnorm_matmul",
+    )
+    assert len(rendered_variants) == len(hw_variants), (
+        f"Expected emission for {len(hw_variants)} hw variant(s), got {len(rendered_variants)}"
+    )
+    for hi, _g_hw, _tiling, _opps, counts, rendered in rendered_variants:
+        assert counts["total"] >= 0, f"variant {hi}: total fusion count must be non-negative"
+        assert rendered, f"variant {hi}: expected at least one rendered ISA kernel"
+        assert all("@nki.jit" in src and "nisa." in src for _, src in rendered), (
+            f"variant {hi}: every rendered kernel must use ISA syntax"
+        )
+    print(
+        f" graph_variant_isa_emission: rmsnorm_matmul — "
+        f"{len(rendered_variants)} variant(s) rendered"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test runner
 # ---------------------------------------------------------------------------
@@ -8349,6 +8429,7 @@ def run_all_tests() -> None:
     _test_nki_multi_version_emission_rmsnorm_matmul()
     _test_nki_multi_version_emission_softmax_matmul()
     _test_nki_multi_version_emission_all_kernels()
+    _test_graph_variant_isa_emission_covers_all_variants()
     print("=============== ALL TESTS PASSED  =====================\n")
 
 
@@ -8794,19 +8875,17 @@ if __name__ == "__main__":
             print(f"  [synthesis failed for {kname}]")
         else:
             print(f"--- {kname} :: {len(hw_variants)} synthesized hw graph(s) ---")
-            tiled_variants = tile_nu_graph_variants(hw_variants)
-            for hi, (g_hw, tiling) in enumerate(tiled_variants):
+            for hi, g_hw, tiling, _opps, counts, rendered in render_all_graph_variant_nki_versions(
+                hw_variants,
+                kernel_name=f"nki_{kname}",
+                verbose=False,
+            ):
                 print(f"  +-- hw variant {hi} ---")
                 print_graph(g_hw, tiling)
-                loop_nests = lower_tiled_graph_to_nki(g_hw, tiling)
-                schedules = build_nki_fusion_schedule_versions(g_hw, tiling, loop_nests)
-                print(f"  +-- hw variant {hi} :: {len(schedules)} NKI kernel version(s) ---")
-                for schedule, src in render_nki_kernel_versions(
-                    g_hw,
-                    loop_nests,
-                    schedules,
-                    kernel_name=f"nki_{kname}_v{hi}",
-                ):
+                print(f"  +-- hw variant {hi} :: fusion candidates ---")
+                _print_fusion_candidate_summary(counts)
+                print(f"  +-- hw variant {hi} :: {len(rendered)} ISA NKI kernel version(s) ---")
+                for schedule, src in rendered:
                     print(f"    [schedule={schedule.name}]")
                     print(src)
         print()
