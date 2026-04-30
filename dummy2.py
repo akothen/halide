@@ -6186,10 +6186,10 @@ class FusionOpportunity:
     consumer_id: str
     producer_op: str
     consumer_op: str
-    shared_axes: frozenset
+    shared_axes: frozenset[int]
     fusion_kind: str
     graph_variant_hash: str
-    symbolic_dims: tuple
+    symbolic_dims: tuple[str, ...]
 
 
 _LAYOUT_ONLY_HW_OPS: frozenset[str] = frozenset({
@@ -7046,6 +7046,12 @@ def _nisa_call_str(
     def _inp(i: int) -> str:
         return input_tile_vars[i] if i < len(input_tile_vars) else "None"
 
+    def _nl_op(op_val: Any) -> str:
+        """Prefix *op_val* with ``nl.`` if it is a bare op name string."""
+        if isinstance(op_val, str) and not op_val.startswith("nl."):
+            return f"nl.{op_val}"
+        return str(op_val)
+
     if op == "nc_matmul":
         stat = _inp(0)
         mov = _inp(1)
@@ -7130,23 +7136,17 @@ def _nisa_call_str(
         operand1 = attrs.get("operand1")
         tail = ""
         if op1 is not None:
-            tail = f", op1=nl.{op1}, operand1={operand1!r}"
-        op0_arg = (
-            f"nl.{op0}" if isinstance(op0, str) and not op0.startswith("nl.") else str(op0)
-        )
+            tail = f", op1={_nl_op(op1)}, operand1={operand1!r}"
         return (
             f"{ind}nisa.tensor_scalar(dst={dst_var}, data={_inp(0)},"
-            f" op0={op0_arg}, operand0={operand0!r}{tail})"
+            f" op0={_nl_op(op0)}, operand0={operand0!r}{tail})"
         )
 
     if op == "tensor_tensor":
         tt_op = attrs.get("op", "add")
-        tt_op_arg = (
-            f"nl.{tt_op}" if isinstance(tt_op, str) and not tt_op.startswith("nl.") else str(tt_op)
-        )
         return (
             f"{ind}nisa.tensor_tensor(dst={dst_var},"
-            f" data1={_inp(0)}, data2={_inp(1)}, op={tt_op_arg})"
+            f" data1={_inp(0)}, data2={_inp(1)}, op={_nl_op(tt_op)})"
         )
 
     # Generic fallback.
@@ -7187,6 +7187,7 @@ def _render_fused_node_body_isa(
         input_tile_vars: list[str] = []
         for idx, inp_id in enumerate(loop_nest.input_ids):
             inline_var = inline_tiles.get(inp_id)
+            # (0, 1) = both partition and free axes are shared (fully-fused 2D nest).
             if inline_var is not None and not local_axes and tuple(group.shared_axes) == (0, 1):
                 input_tile_vars.append(inline_var)
                 continue
@@ -8205,6 +8206,8 @@ def _test_fusion_candidate_counts() -> None:
     # All by_kind / by_axes / by_variant counts must be positive (>0) and sum
     # to at most total (axis-subset duplicates mean >1 opp per edge, so the
     # by_variant sum can exceed total if there are multi-subset ops).
+    # builtins.sum is used here because dummy2.py defines a module-level sum()
+    # function with a different signature that shadows the Python builtin.
     by_kind_sum = builtins.sum(v for k, v in counts.items() if k.startswith("by_kind:"))
     assert by_kind_sum == counts["total"], (
         f"sum of by_kind counts ({by_kind_sum}) must equal total ({counts['total']})"
