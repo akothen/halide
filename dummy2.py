@@ -6308,6 +6308,8 @@ def _make_fusion_group(
     """Build a fusion group and mark any fully-elidable intermediate outputs."""
     elided: set[str] = set()
     if tuple(shared_axes) == (0, 1):
+        # Only consecutive producer/consumer pairs inside a fully shared 2D nest
+        # can keep an intermediate tile live without writing it back to a buffer.
         for prod_id, cons_id in zip(node_ids, node_ids[1:]):
             prod = loop_nests_by_id[prod_id]
             cons = loop_nests_by_id[cons_id]
@@ -6712,6 +6714,9 @@ def _render_fused_node_body(
         for idx, inp_id in enumerate(loop_nest.input_ids):
             inline_var = inline_tiles.get(inp_id)
             if inline_var is not None and not local_axes and tuple(group.shared_axes) == (0, 1):
+                # Reuse a producer tile only when the entire 2D iteration space is
+                # shared by the group; otherwise local per-node loops would break
+                # the producer/consumer tile alignment.
                 input_tile_vars.append(inline_var)
                 continue
             tile_var = f"_tile_in{idx}_{loop_nest.node_id}"
