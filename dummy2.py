@@ -6117,6 +6117,352 @@ def print_graph_tiling(G: nuGraph, tiling: GraphTiling) -> None:
         else:
             print(f"  {node.op}  (id={node.id}, no tiling)")
 
+# ---------------------------------------------------------------------------
+# NKI loop-nest lowering
+# ---------------------------------------------------------------------------
+
+@dataclass
+class NKILoopNest:
+    """Loop nest lowering of a single hw-op node in the tiled graph.
+
+    Attributes:
+        node_id:         Node id of the hw op.
+        op:              NKI op name (e.g. ``"nc_matmul"``).
+        strip_dims:      ``(n0, n1)`` – symbolic loop-bound z3 expressions.
+        block_dims:      ``(b0, b1)`` – symbolic block-dimension z3 expressions.
+        tile_dims:       ``(t0, t1)`` – hardware tile sizes (int or sentinel).
+        input_ids:       Ordered list of input node ids.
+        attrs:           Op attributes dict from the graph node.
+        reduction_axes:  Set of axes that are reduced over by this op.
+    """
+
+    node_id: str
+    op: str
+    strip_dims: tuple[z3.ArithRef, z3.ArithRef]
+    block_dims: tuple[z3.ArithRef, z3.ArithRef]
+    tile_dims: tuple[Any, Any]
+    input_ids: list[str]
+    attrs: dict[str, Any]
+    reduction_axes: frozenset[int]
+
+
+def _z3_str(expr: Any) -> str:
+    """Render a z3 ArithRef (or plain int/sentinel) as a Python source token.
+
+    * ``z3.IntNumRef``  → decimal literal string (e.g. ``"128"``).
+    * ``z3.ArithRef``   → the z3 variable name (e.g. ``"strip_0"``).
+    * plain ``int``     → decimal literal string.
+    * anything else     → ``repr(expr)``.
+    """
+    if isinstance(expr, z3.IntNumRef):
+        return str(expr.as_long())
+    if isinstance(expr, z3.ArithRef):
+        return str(expr)
+    if isinstance(expr, int):
+        return str(expr)
+    return repr(expr)
+
+
+def _tile_extent_str(block: z3.ArithRef, tile: Any) -> str:
+    """Return a Python expression string for ``block * tile`` (tile extent)."""
+    b = _z3_str(block)
+    t = _z3_str(tile)
+    if b == "1" and t == "1":
+        return "1"
+    if b == "1":
+        return t
+    if t == "1":
+        return b
+    return f"{b} * {t}"
+
+
+def _slice_str(loop_var: str, block: z3.ArithRef, tile: Any) -> str:
+    """Return a Python slice string for one axis inside a tiled loop.
+
+    The slice is ``loop_var * extent : (loop_var + 1) * extent`` where
+    ``extent = block * tile``.
+    """
+    ext = _tile_extent_str(block, tile)
+    return f"{loop_var} * {ext} : ({loop_var} + 1) * {ext}"
+
+
+def _nki_call_str(
+    op: str,
+    dst_var: str,
+    input_tile_vars: list[str],
+    attrs: dict[str, Any],
+    ind: str,
+) -> str:
+    """Return the NKI API call source line(s) for a given hw op.
+
+    Parameters
+    ----------
+    op:
+        NKI op name.
+    dst_var:
+        Python identifier for the destination tile (already allocated).
+    input_tile_vars:
+        Ordered list of Python identifiers for the input tiles.
+    attrs:
+        Node attribute dict.
+    ind:
+        Indentation prefix string.
+    """
+    def _inp(i: int) -> str:
+        return input_tile_vars[i] if i < len(input_tile_vars) else "None"
+
+    if op == "nc_matmul":
+        stat = _inp(0)
+        mov = _inp(1)
+        acc = attrs.get("accumulate", None)
+        acc_str = f", accumulate={acc!r}" if acc is not None else ""
+        return f"{ind}nki.nc_matmul({dst_var}, stationary={stat}, moving={mov}{acc_str})"
+
+    if op == "nc_transpose":
+        return f"{ind}nki.nc_transpose({dst_var}, {_inp(0)})"
+
+    if op in ("dma_copy", "tensor_copy"):
+        return f"{ind}nki.{op}({dst_var}, {_inp(0)})"
+
+    if op == "dma_transpose":
+        axes = attrs.get("axes")
+        axes_str = f", axes={axes!r}" if axes is not None else ""
+        return f"{ind}nki.dma_transpose({dst_var}, {_inp(0)}{axes_str})"
+
+    if op == "activation":
+        act_op = attrs.get("op", "relu")
+        scale = attrs.get("scale", 1.0)
+        bias_idx = attrs.get("bias_input_index")
+        bias_var = f", bias={_inp(bias_idx)}" if bias_idx is not None else ""
+        return (
+            f"{ind}nki.activation({dst_var}, op={act_op!r}, "
+            f"data={_inp(0)}{bias_var}, scale={scale!r})"
+        )
+
+    if op == "activation_reduce":
+        act_op = attrs.get("op", "relu")
+        reduce_op = attrs.get("reduce_op")
+        scale = attrs.get("scale", 1.0)
+        bias_idx = attrs.get("bias_input_index")
+        bias_var = f", bias={_inp(bias_idx)}" if bias_idx is not None else ""
+        return (
+            f"{ind}nki.activation_reduce({dst_var}, op={act_op!r}, "
+            f"data={_inp(0)}, reduce_op={reduce_op!r}{bias_var}, scale={scale!r})"
+        )
+
+    if op == "exponential":
+        max_val = attrs.get("max_value", 0.0)
+        max_idx = attrs.get("max_input_index")
+        max_var = f", max_value={_inp(max_idx)}" if max_idx is not None else f", max_value={max_val!r}"
+        return f"{ind}nki.exponential({dst_var}, {_inp(0)}{max_var})"
+
+    if op == "reciprocal":
+        return f"{ind}nki.reciprocal({dst_var}, {_inp(0)})"
+
+    if op == "tensor_reduce":
+        axis = attrs.get("axis", 1)
+        red_op = attrs.get("op", "add")
+        negate = attrs.get("negate", False)
+        keepdims = attrs.get("keepdims", False)
+        return (
+            f"{ind}nki.tensor_reduce({dst_var}, op={red_op!r}, "
+            f"data={_inp(0)}, axis={axis!r}, negate={negate!r}, keepdims={keepdims!r})"
+        )
+
+    if op == "tensor_partition_reduce":
+        red_op = attrs.get("op", "add")
+        return f"{ind}nki.tensor_partition_reduce({dst_var}, op={red_op!r}, data={_inp(0)})"
+
+    if op == "tensor_scalar":
+        op0 = attrs.get("op0", "add")
+        operand0 = attrs.get("operand0", 0.0)
+        op1 = attrs.get("op1")
+        operand1 = attrs.get("operand1")
+        tail = ""
+        if op1 is not None:
+            tail = f", op1={op1!r}, operand1={operand1!r}"
+        return (
+            f"{ind}nki.tensor_scalar({dst_var}, data={_inp(0)}, "
+            f"op0={op0!r}, operand0={operand0!r}{tail})"
+        )
+
+    if op == "tensor_tensor":
+        tt_op = attrs.get("op", "add")
+        return (
+            f"{ind}nki.tensor_tensor({dst_var}, data1={_inp(0)}, "
+            f"data2={_inp(1)}, op={tt_op!r})"
+        )
+
+    # Fallback: emit a generic call with all input tiles as positional args.
+    args = ", ".join([dst_var] + input_tile_vars)
+    return f"{ind}nki.{op}({args})"
+
+
+def render_nki_loop_nest(loop_nest: NKILoopNest, indent: int = 4) -> str:
+    """Render a single :class:`NKILoopNest` as a Python source block.
+
+    The output is a series of nested ``for`` loops with a slice expression for
+    each input tile, an ``nl.ndarray`` allocation for the output tile, and the
+    NKI API call followed by a write-back to the output buffer.
+
+    Parameters
+    ----------
+    loop_nest:
+        The loop nest to render.
+    indent:
+        Base indentation (number of spaces).
+    """
+    ind0 = " " * indent
+    n0, n1 = loop_nest.strip_dims
+    b0, b1 = loop_nest.block_dims
+    t0, t1 = loop_nest.tile_dims
+    nid = loop_nest.node_id
+    op = loop_nest.op
+
+    n0s = _z3_str(n0)
+    n1s = _z3_str(n1)
+    ext0 = _tile_extent_str(b0, t0)
+    ext1 = _tile_extent_str(b1, t1)
+
+    loop_var0 = f"_i0_{nid}"
+    loop_var1 = f"_i1_{nid}"
+    slice0 = _slice_str(loop_var0, b0, t0)
+    slice1 = _slice_str(loop_var1, b1, t1)
+
+    ind1 = ind0 + "    "
+    ind2 = ind1 + "    "
+
+    lines: list[str] = []
+    lines.append(f"{ind0}# --- node {nid!r} ({op}) ---")
+
+    # Outer loop: strip dim 0
+    lines.append(f"{ind0}for {loop_var0} in range({n0s}):")
+    # Inner loop: strip dim 1
+    lines.append(f"{ind1}for {loop_var1} in range({n1s}):")
+
+    # Slice each input tile.
+    input_tile_vars: list[str] = []
+    for k, inp_id in enumerate(loop_nest.input_ids):
+        tile_var = f"_tile_in{k}_{nid}"
+        buf_name = f"buf_{inp_id}"
+        lines.append(
+            f"{ind2}{tile_var} = {buf_name}[{slice0}, {slice1}]"
+        )
+        input_tile_vars.append(tile_var)
+
+    # Allocate output tile.
+    dst_var = f"_tile_dst_{nid}"
+    lines.append(f"{ind2}{dst_var} = nl.ndarray(({ext0}, {ext1}), dtype=nl.bfloat16)")
+
+    # NKI call.
+    lines.append(_nki_call_str(op, dst_var, input_tile_vars, loop_nest.attrs, ind2))
+
+    # Write output tile back to output buffer.
+    buf_dst = f"buf_{nid}"
+    lines.append(f"{ind2}{buf_dst}[{slice0}, {slice1}] = {dst_var}")
+
+    return "\n".join(lines)
+
+
+def lower_tiled_graph_to_nki(
+    G: nuGraph,
+    tiling: GraphTiling,
+) -> list[NKILoopNest]:
+    """Lower each hw-op node of the tiled graph into a :class:`NKILoopNest`.
+
+    Nodes are visited in topological order.  ``input`` nodes and any
+    non-hw-op nodes are skipped.
+
+    Parameters
+    ----------
+    G:
+        A lowered (hw-only) nuGraph.
+    tiling:
+        The symbolic tiling for *G*, as returned by :func:`symbolic_tiling`.
+
+    Returns
+    -------
+    list[NKILoopNest]
+        One loop nest per hw-op node, in topological order.
+    """
+    ordered = [node for level in _build_dag_levels(G) for node in level]
+    loop_nests: list[NKILoopNest] = []
+    hw_op_set = frozenset(_HW_OP_NAMES)
+    for node in ordered:
+        if node.op not in hw_op_set:
+            continue
+        if node.id not in tiling.op_tilings:
+            continue
+        tp = tiling.op_tilings[node.id]
+        red_axes = _reduction_axes(node, G)
+        loop_nests.append(
+            NKILoopNest(
+                node_id=node.id,
+                op=node.op,
+                strip_dims=tp.strip_dims,
+                block_dims=tp.block_dims,
+                tile_dims=tp.tile_dims,
+                input_ids=list(node.inputs),
+                attrs=dict(node.attrs),
+                reduction_axes=red_axes,
+            )
+        )
+    return loop_nests
+
+
+def render_nki_kernel(
+    G: nuGraph,
+    loop_nests: list[NKILoopNest],
+    kernel_name: str = "nki_kernel",
+) -> str:
+    """Render a list of NKI loop nests as a Python NKI kernel function string.
+
+    The generated function signature is derived from the graph's ``input``
+    nodes and is a rough sketch intended for human readability; it is not
+    guaranteed to be directly executable without adaptation.
+
+    Parameters
+    ----------
+    G:
+        The nuGraph whose input nodes define the function parameters.
+    loop_nests:
+        Ordered list of loop nests, as returned by
+        :func:`lower_tiled_graph_to_nki`.
+    kernel_name:
+        Name of the generated Python function.
+    """
+    input_nodes = [n for n in G.nodes if n.op == "input"]
+    params = ", ".join(n.id for n in input_nodes) or "..."
+
+    # Collect all node ids that appear as inputs; these need buffer declarations.
+    all_node_ids = {n.id for n in G.nodes}
+    output_node_ids = {
+        n.id for n in G.nodes
+        if not G.successors(n) and n.op != "input"
+    }
+
+    lines: list[str] = []
+    lines.append(f"def {kernel_name}({params}):")
+    lines.append(f"    # Input buffers")
+    for n in input_nodes:
+        shape_str = str(n.attrs.get("shape", "..."))
+        lines.append(f"    buf_{n.id} = {n.id}  # shape={shape_str}")
+    lines.append(f"    # Output buffers")
+    for nid in output_node_ids:
+        node = next(n for n in G.nodes if n.id == nid)
+        shape_str = str(node.shape)
+        lines.append(f"    buf_{nid} = nl.ndarray({shape_str}, dtype=nl.bfloat16)  # output")
+    lines.append(f"    # Intermediate buffers (allocated per tile in each loop nest)")
+    lines.append("")
+    lines.append(f"    # Loop nests (one per hw op, in topological order)")
+    for ln in loop_nests:
+        lines.append(render_nki_loop_nest(ln, indent=4))
+        lines.append("")
+    if output_node_ids:
+        outs = ", ".join(f"buf_{nid}" for nid in sorted(output_node_ids))
+        lines.append(f"    return {outs}")
+    return "\n".join(lines)
+
 
 # ---------------------------------------------------------------------------
 # Synthesizer test helpers
@@ -6647,6 +6993,73 @@ def _test_symbolic_tiling_tile_dims() -> None:
     )
 
 
+def _test_nki_lowering_matmul() -> None:
+    """Smoke-test :func:`lower_tiled_graph_to_nki` and :func:`render_nki_kernel`
+    on a matmul graph.
+
+    Checks:
+    * :func:`lower_tiled_graph_to_nki` returns one loop nest per hw-op node.
+    * Every loop nest exposes the expected strip/block/tile fields.
+    * :func:`render_nki_kernel` returns a non-empty string containing
+      ``def nki_kernel`` and a ``for`` loop body.
+    """
+    G = build_kernel_matmul_graph(4, 8, 16)
+    G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000)
+    assert G_hw is not None, "lower_nu_graph returned None for matmul"
+
+    tiling = symbolic_tiling(G_hw)
+    loop_nests = lower_tiled_graph_to_nki(G_hw, tiling)
+
+    hw_nodes = [n for n in G_hw.nodes if n.op in frozenset(_HW_OP_NAMES)]
+    assert len(loop_nests) == len(hw_nodes), (
+        f"Expected {len(hw_nodes)} loop nests, got {len(loop_nests)}"
+    )
+
+    for ln in loop_nests:
+        assert ln.op in frozenset(_HW_OP_NAMES), f"Unexpected op {ln.op!r}"
+        assert ln.strip_dims is not None
+        assert ln.block_dims is not None
+        assert ln.tile_dims is not None
+
+    src = render_nki_kernel(G_hw, loop_nests, kernel_name="nki_kernel")
+    assert "def nki_kernel" in src, "render_nki_kernel: missing function definition"
+    assert "for " in src, "render_nki_kernel: missing for loop"
+    assert "nki." in src, "render_nki_kernel: missing NKI call"
+
+    print(
+        f" nki_lowering: matmul — {len(loop_nests)} loop nest(s) generated, "
+        "kernel rendered OK"
+    )
+
+
+def _test_nki_lowering_all_kernels() -> None:
+    """Smoke-test :func:`lower_tiled_graph_to_nki` on all build_kernel_* helpers."""
+    kernel_builders: list[tuple[str, Callable[[int, int, int], nuGraph]]] = [
+        ("matmul_red_div",   build_kernel_matmul_red_div_graph),
+        ("rmsnorm_matmul",   build_kernel_rmsnorm_matmul_graph),
+        ("transpose_matmul", build_kernel_transpose_matmul_graph),
+        ("relu_matmul",      build_kernel_relu_matmul_graph),
+        ("matmul",           build_kernel_matmul_graph),
+        ("rmsnorm",          build_kernel_rmsnorm_graph),
+        ("relu",             build_kernel_relu_graph),
+        ("softmax",          build_kernel_softmax_graph),
+    ]
+    for kname, builder in kernel_builders:
+        G = builder(4, 8, 16)
+        G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000)
+        if G_hw is None:
+            print(f" nki_lowering: {kname} — skipped (lower_nu_graph returned None)")
+            continue
+        tiling = symbolic_tiling(G_hw)
+        loop_nests = lower_tiled_graph_to_nki(G_hw, tiling)
+        src = render_nki_kernel(G_hw, loop_nests, kernel_name=f"nki_{kname}")
+        assert "def nki_" in src, f"nki_lowering {kname}: missing function definition"
+        print(
+            f" nki_lowering: {kname} — {len(loop_nests)} loop nest(s), "
+            "kernel rendered OK"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Test runner
 # ---------------------------------------------------------------------------
@@ -6669,6 +7082,9 @@ def run_all_tests() -> None:
     _test_symbolic_tiling_rmsnorm_matmul()
     _test_symbolic_tiling_all_kernels()
     _test_symbolic_tiling_tile_dims()
+    print("\n================ RUNNING NKI LOWERING TESTS ============")
+    _test_nki_lowering_matmul()
+    _test_nki_lowering_all_kernels()
     print("=============== ALL TESTS PASSED  =====================\n")
 
 
@@ -7117,4 +7533,7 @@ if __name__ == "__main__":
             for hi, (g_hw, tiling) in enumerate(tiled_variants):
                 print(f"  +-- hw variant {hi} ---")
                 print_graph(g_hw, tiling)
+                loop_nests = lower_tiled_graph_to_nki(g_hw, tiling)
+                print(f"  +-- hw variant {hi} :: NKI kernel ---")
+                print(render_nki_kernel(g_hw, loop_nests, kernel_name=f"nki_{kname}_v{hi}"))
         print()
