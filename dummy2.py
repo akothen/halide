@@ -7423,8 +7423,10 @@ def render_all_fusion_versions(
                     rep_axes = tuple(sorted(grp.shared_axes))
                     break
             if not rep_axes:
-                rep_axes = tuple(sorted(schedule.kind.replace("shared_axes_", "").replace("shared_axis_", "").split("_")))
-            axes_str = "_".join(str(a) for a in rep_axes) if rep_axes else schedule.name
+                # Fall back to using the schedule name as the key suffix.
+                axes_str = schedule.name
+            else:
+                axes_str = "_".join(str(a) for a in rep_axes)
             partial_key = f"partial_{axes_str}"
             result[partial_key] = sched_src
 
@@ -8203,9 +8205,9 @@ def _test_fusion_candidate_counts() -> None:
     # All by_kind / by_axes / by_variant counts must be positive (>0) and sum
     # to at most total (axis-subset duplicates mean >1 opp per edge, so the
     # by_variant sum can exceed total if there are multi-subset ops).
-    kind_total = builtins.sum(v for k, v in counts.items() if k.startswith("by_kind:"))
-    assert kind_total == counts["total"], (
-        f"sum of by_kind counts ({kind_total}) must equal total ({counts['total']})"
+    by_kind_sum = builtins.sum(v for k, v in counts.items() if k.startswith("by_kind:"))
+    assert by_kind_sum == counts["total"], (
+        f"sum of by_kind counts ({by_kind_sum}) must equal total ({counts['total']})"
     )
     print(
         f" fusion_candidates: rmsnorm_matmul — {counts['total']} candidate(s)"
@@ -8296,13 +8298,13 @@ def _test_nki_multi_version_emission_all_kernels() -> None:
             assert "activation" in all_src or "tensor_reduce" in all_src, (
                 f"{kname}: kernel must contain activation or tensor_reduce"
             )
-        tiling_G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
-        tiling_hw = lower_nu_graph(tiling_G, max_hw_size=2, timeout=3000)
-        if tiling_hw is not None:
-            tiling = symbolic_tiling(tiling_hw)
-            opps = enumerate_fusion_opportunities(tiling_hw, tiling)
-            counts = count_fusion_candidates(opps)
-            assert counts["total"] >= 0
+        # Also verify fusion opportunity enumeration on the hw graph for this kernel.
+        G_hw_check = lower_nu_graph(builder(4, 8, 16), max_hw_size=2, timeout=3000)
+        if G_hw_check is not None:
+            tiling_check = symbolic_tiling(G_hw_check)
+            opps_check = enumerate_fusion_opportunities(G_hw_check, tiling_check)
+            counts_check = count_fusion_candidates(opps_check)
+            assert counts_check["total"] >= 0
         print(
             f" multi_version_emission: {kname} — {len(versions)} version(s)"
         )
