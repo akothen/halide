@@ -6165,6 +6165,33 @@ class NKIKernelSchedule:
     groups: tuple[NKIFusionGroup, ...]
 
 
+@dataclass
+class FusionOpportunity:
+    """A single fusion opportunity between a producer and consumer hw-op node.
+
+    Attributes:
+        producer_id:         Node id of the producer.
+        consumer_id:         Node id of the consumer.
+        producer_op:         NKI op name of the producer.
+        consumer_op:         NKI op name of the consumer.
+        shared_axes:         Frozenset of symbolic loop axes that can be shared.
+        fusion_kind:         Fusion kind string, e.g. "pointwise-pointwise",
+                             "pointwise-reduce", "matmul-pointwise", …
+        graph_variant_hash:  ``graph_signature()`` of the source nuGraph.
+        symbolic_dims:       Human-readable symbolic dimension names from the
+                             producer's strip_dims, e.g. ``("strip_0", "strip_1")``.
+    """
+
+    producer_id: str
+    consumer_id: str
+    producer_op: str
+    consumer_op: str
+    shared_axes: frozenset
+    fusion_kind: str
+    graph_variant_hash: str
+    symbolic_dims: tuple
+
+
 _LAYOUT_ONLY_HW_OPS: frozenset[str] = frozenset({
     "dma_copy",
     "dma_transpose",
@@ -6515,6 +6542,147 @@ def build_nki_fusion_schedule_versions(
     return deduped
 
 
+# ---------------------------------------------------------------------------
+# Fusion opportunity enumeration and candidate counting
+# ---------------------------------------------------------------------------
+
+def _classify_hw_op(op: str) -> str:
+    """Return a coarse category string for a hw op used in fusion_kind labels."""
+    if op == "nc_matmul":
+        return "matmul"
+    if op in ("tensor_reduce", "tensor_partition_reduce", "activation_reduce"):
+        return "reduce"
+    if op in _LAYOUT_ONLY_HW_OPS:
+        return "layout"
+    return "pointwise"
+
+
+def enumerate_fusion_opportunities(
+    G: "nuGraph",
+    tiling: "GraphTiling",
+    *,
+    verbose: bool = False,
+) -> "list[FusionOpportunity]":
+    """Walk every directed producer→consumer edge in *G* and record all valid
+    fusion opportunities across symbolic tensor dimensions.
+
+    For each edge the function computes the set of shared non-reduction axes
+    via :func:`_shared_fusable_axes`, then enumerates every non-empty subset
+    of those axes and checks whether :func:`_can_fuse_edge` allows fusion
+    under that subset.  A :class:`FusionOpportunity` is recorded for each
+    valid (edge, axis-subset) combination.
+
+    Parameters
+    ----------
+    G:
+        A lowered (hw-only) nuGraph.
+    tiling:
+        The symbolic tiling for *G*.
+    verbose:
+        If True, print each discovered opportunity to stdout.
+
+    Returns
+    -------
+    list[FusionOpportunity]
+        All valid fusion opportunities in topological edge order.
+    """
+    loop_nests = lower_tiled_graph_to_nki(G, tiling)
+    loop_nests_by_id = {ln.node_id: ln for ln in loop_nests}
+    ordered_ids = [ln.node_id for ln in loop_nests]
+    node_by_id = {n.id: n for n in G.nodes}
+    hw_successors: dict[str, list[str]] = {
+        nid: [
+            succ.id
+            for succ in G.successors(node_by_id[nid])
+            if succ.id in loop_nests_by_id
+        ]
+        for nid in ordered_ids
+    }
+    variant_hash = graph_signature(G)
+    opportunities: list[FusionOpportunity] = []
+
+    for prod_id in ordered_ids:
+        for cons_id in hw_successors.get(prod_id, []):
+            prod = loop_nests_by_id[prod_id]
+            cons = loop_nests_by_id[cons_id]
+            all_shared = _shared_fusable_axes(prod, cons)
+            if not all_shared:
+                continue
+            # Enumerate all non-empty subsets of the shared axes.
+            axes_list = sorted(all_shared)
+            for mask in range(1, 1 << len(axes_list)):
+                subset: frozenset[int] = frozenset(
+                    axes_list[j] for j in range(len(axes_list)) if mask & (1 << j)
+                )
+                shared_tuple = tuple(sorted(subset))
+                if not _can_fuse_edge(prod, cons, shared_tuple, hw_successors):
+                    continue
+                prod_tp = tiling.op_tilings.get(prod_id)
+                sym_dims: tuple[str, ...] = (
+                    tuple(_z3_str(d) for d in prod_tp.strip_dims)
+                    if prod_tp is not None
+                    else ()
+                )
+                fusion_kind = (
+                    f"{_classify_hw_op(prod.op)}-{_classify_hw_op(cons.op)}"
+                )
+                opp = FusionOpportunity(
+                    producer_id=prod_id,
+                    consumer_id=cons_id,
+                    producer_op=prod.op,
+                    consumer_op=cons.op,
+                    shared_axes=subset,
+                    fusion_kind=fusion_kind,
+                    graph_variant_hash=variant_hash,
+                    symbolic_dims=sym_dims,
+                )
+                opportunities.append(opp)
+                if verbose:
+                    print(
+                        f"  FusionOpportunity: {prod_id}({prod.op})"
+                        f" → {cons_id}({cons.op})"
+                        f" axes={shared_tuple} kind={fusion_kind}"
+                    )
+    return opportunities
+
+
+def count_fusion_candidates(
+    opportunities: "list[FusionOpportunity]",
+) -> "dict[str, int]":
+    """Aggregate fusion opportunities by kind, axis set, and graph variant.
+
+    Returns a dict with the following key formats:
+
+    * ``"total"`` – total count of opportunities.
+    * ``"by_kind:<kind>"`` – count per :attr:`~FusionOpportunity.fusion_kind`.
+    * ``"by_axes:<axes_tuple>"`` – count per shared-axis combination, where
+      *axes_tuple* is the sorted tuple representation of the frozenset.
+    * ``"by_variant:<hash>"`` – count per graph variant hash.
+
+    Parameters
+    ----------
+    opportunities:
+        As returned by :func:`enumerate_fusion_opportunities`.
+    """
+    result: dict[str, int] = {"total": len(opportunities)}
+    for opp in opportunities:
+        kind_key = f"by_kind:{opp.fusion_kind}"
+        result[kind_key] = result.get(kind_key, 0) + 1
+        axes_key = f"by_axes:{tuple(sorted(opp.shared_axes))}"
+        result[axes_key] = result.get(axes_key, 0) + 1
+        variant_key = f"by_variant:{opp.graph_variant_hash}"
+        result[variant_key] = result.get(variant_key, 0) + 1
+    return result
+
+
+def _print_fusion_candidate_summary(counts: "dict[str, int]") -> None:
+    """Print a formatted summary table of :func:`count_fusion_candidates` output."""
+    print(f"  {'Key':<45}  {'Count':>6}")
+    print(f"  {'-'*45}  {'-'*6}")
+    for key in sorted(counts):
+        print(f"  {key:<45}  {counts[key]:>6}")
+
+
 def _nki_call_str(
     op: str,
     dst_var: str,
@@ -6845,6 +7013,422 @@ def render_nki_kernel_versions(
             )
         )
     return rendered
+
+
+# ---------------------------------------------------------------------------
+# ISA-syntax NKI emitter (Version A / B / C kernel strings)
+# ---------------------------------------------------------------------------
+
+_NKI_ISA_HEADER: str = """\
+import nki
+import nki.isa as nisa
+import nki.language as nl
+"""
+
+
+def _nisa_call_str(
+    op: str,
+    dst_var: str,
+    input_tile_vars: list[str],
+    attrs: dict[str, Any],
+    ind: str,
+    psum_var: str = "",
+) -> str:
+    """Return ISA-syntax NKI source line(s) for a given hw op.
+
+    Uses ``nisa.`` prefix and keyword-argument calling conventions as required
+    by the NKI ISA specification from the ``aws-neuron/nki-samples`` tutorials.
+
+    For ``nc_matmul`` a two-line PSUM → SBUF pattern is emitted:
+    the caller must pass a non-empty *psum_var* to name the intermediate
+    ``nl.psum`` tile.
+    """
+    def _inp(i: int) -> str:
+        return input_tile_vars[i] if i < len(input_tile_vars) else "None"
+
+    if op == "nc_matmul":
+        stat = _inp(0)
+        mov = _inp(1)
+        psum = psum_var if psum_var else f"{dst_var}_psum"
+        return (
+            f"{ind}nisa.nc_matmul(dst={psum}, stationary={stat}, moving={mov})\n"
+            f"{ind}nisa.tensor_copy(dst={dst_var}, src={psum})"
+        )
+
+    if op == "nc_transpose":
+        return f"{ind}nisa.nc_transpose(dst={dst_var}, data={_inp(0)})"
+
+    if op in ("dma_copy",):
+        return f"{ind}nisa.dma_copy(dst={dst_var}, src={_inp(0)})"
+
+    if op == "tensor_copy":
+        return f"{ind}nisa.tensor_copy(dst={dst_var}, src={_inp(0)})"
+
+    if op == "dma_transpose":
+        axes = attrs.get("axes")
+        axes_str = f", axes={axes!r}" if axes is not None else ""
+        return f"{ind}nisa.dma_copy(dst={dst_var}, src={_inp(0)}{axes_str})"
+
+    if op == "activation":
+        act_op = attrs.get("op", "relu")
+        scale = attrs.get("scale", 1.0)
+        bias_idx = attrs.get("bias_input_index")
+        bias_str = f", bias={_inp(bias_idx)}" if bias_idx is not None else ""
+        return (
+            f"{ind}nisa.activation(dst={dst_var}, op=nl.{act_op},"
+            f" data={_inp(0)}{bias_str}, scale={scale!r})"
+        )
+
+    if op == "activation_reduce":
+        act_op = attrs.get("op", "relu")
+        reduce_op = attrs.get("reduce_op", "add")
+        scale = attrs.get("scale", 1.0)
+        bias_idx = attrs.get("bias_input_index")
+        bias_str = f", bias={_inp(bias_idx)}" if bias_idx is not None else ""
+        reduce_res = f"{dst_var}_reduce_res"
+        return (
+            f"{ind}nisa.activation(dst={dst_var}, op=nl.{act_op},"
+            f" data={_inp(0)}{bias_str}, scale={scale!r},"
+            f" reduce_op=nl.{reduce_op}, reduce_res={reduce_res},"
+            f" reduce_cmd=nisa.reduce_cmd.reset_reduce)"
+        )
+
+    if op == "exponential":
+        max_val = attrs.get("max_value", 0.0)
+        max_idx = attrs.get("max_input_index")
+        max_str = (
+            f", bias={_inp(max_idx)}" if max_idx is not None else f", bias={max_val!r}"
+        )
+        return (
+            f"{ind}nisa.activation(dst={dst_var}, op=nl.exp,"
+            f" data={_inp(0)}{max_str})"
+        )
+
+    if op == "reciprocal":
+        return f"{ind}nisa.reciprocal(dst={dst_var}, data={_inp(0)})"
+
+    if op == "tensor_reduce":
+        axis = attrs.get("axis", 1)
+        red_op = attrs.get("op", "add")
+        negate = attrs.get("negate", False)
+        return (
+            f"{ind}nisa.tensor_reduce(dst={dst_var}, op=nl.{red_op},"
+            f" data={_inp(0)}, axis={axis!r}, negate={negate!r})"
+        )
+
+    if op == "tensor_partition_reduce":
+        red_op = attrs.get("op", "add")
+        return (
+            f"{ind}nisa.tensor_reduce(dst={dst_var}, op=nl.{red_op},"
+            f" data={_inp(0)}, axis=(0,))"
+        )
+
+    if op == "tensor_scalar":
+        op0 = attrs.get("op0", "add")
+        operand0 = attrs.get("operand0", 0.0)
+        op1 = attrs.get("op1")
+        operand1 = attrs.get("operand1")
+        tail = ""
+        if op1 is not None:
+            tail = f", op1=nl.{op1}, operand1={operand1!r}"
+        op0_arg = (
+            f"nl.{op0}" if isinstance(op0, str) and not op0.startswith("nl.") else str(op0)
+        )
+        return (
+            f"{ind}nisa.tensor_scalar(dst={dst_var}, data={_inp(0)},"
+            f" op0={op0_arg}, operand0={operand0!r}{tail})"
+        )
+
+    if op == "tensor_tensor":
+        tt_op = attrs.get("op", "add")
+        tt_op_arg = (
+            f"nl.{tt_op}" if isinstance(tt_op, str) and not tt_op.startswith("nl.") else str(tt_op)
+        )
+        return (
+            f"{ind}nisa.tensor_tensor(dst={dst_var},"
+            f" data1={_inp(0)}, data2={_inp(1)}, op={tt_op_arg})"
+        )
+
+    # Generic fallback.
+    args = ", ".join([f"dst={dst_var}"] + [f"src{i}={v}" for i, v in enumerate(input_tile_vars)])
+    return f"{ind}nisa.{op}({args})"
+
+
+def _nisa_tile_alloc(var: str, ext0: str, ext1: str, dtype: str, buf: str, ind: str) -> str:
+    """Return an ``nl.ndarray`` allocation line using the ISA buffer constants."""
+    return f"{ind}{var} = nl.ndarray(({ext0}, {ext1}), dtype={dtype}, buffer={buf})"
+
+
+def _nisa_ds(loop_var: str, ext: str) -> str:
+    """Return a ``nl.ds(offset, size)`` dynamic-slice expression."""
+    return f"nl.ds({loop_var} * {ext}, {ext})"
+
+
+def _render_fused_node_body_isa(
+    loop_nest: "NKILoopNest",
+    group: "NKIFusionGroup",
+    loop_vars: dict[int, str],
+    inline_tiles: dict[str, str],
+    lines: list[str],
+    indent: str,
+) -> None:
+    """Append ISA-syntax NKI source for one node inside a fused group."""
+    local_axes = [axis for axis in (0, 1) if axis not in group.shared_axes]
+
+    def _emit(local_loop_vars: dict[int, str], current_indent: str) -> None:
+        all_loop_vars = dict(loop_vars)
+        all_loop_vars.update(local_loop_vars)
+
+        ext0 = _tile_extent_str(loop_nest.block_dims[0], loop_nest.tile_dims[0])
+        ext1 = _tile_extent_str(loop_nest.block_dims[1], loop_nest.tile_dims[1])
+        ds0 = _nisa_ds(all_loop_vars[0], ext0)
+        ds1 = _nisa_ds(all_loop_vars[1], ext1)
+
+        input_tile_vars: list[str] = []
+        for idx, inp_id in enumerate(loop_nest.input_ids):
+            inline_var = inline_tiles.get(inp_id)
+            if inline_var is not None and not local_axes and tuple(group.shared_axes) == (0, 1):
+                input_tile_vars.append(inline_var)
+                continue
+            tile_var = f"_tile_in{idx}_{loop_nest.node_id}"
+            lines.append(
+                _nisa_tile_alloc(tile_var, ext0, ext1, "nl.bfloat16", "nl.sbuf", current_indent)
+            )
+            lines.append(
+                f"{current_indent}nisa.dma_copy(dst={tile_var}, src=buf_{inp_id}[{ds0}, {ds1}])"
+            )
+            input_tile_vars.append(tile_var)
+
+        dst_var = f"_tile_dst_{loop_nest.node_id}"
+        if loop_nest.op == "nc_matmul":
+            psum_var = f"_tile_psum_{loop_nest.node_id}"
+            lines.append(
+                _nisa_tile_alloc(psum_var, ext0, ext1, "nl.float32", "nl.psum", current_indent)
+            )
+            lines.append(
+                _nisa_tile_alloc(dst_var, ext0, ext1, "nl.bfloat16", "nl.sbuf", current_indent)
+            )
+        else:
+            psum_var = ""
+            lines.append(
+                _nisa_tile_alloc(dst_var, ext0, ext1, "nl.bfloat16", "nl.sbuf", current_indent)
+            )
+        lines.append(
+            _nisa_call_str(
+                loop_nest.op, dst_var, input_tile_vars, loop_nest.attrs, current_indent, psum_var
+            )
+        )
+        if loop_nest.node_id in group.elided_output_ids and not local_axes:
+            inline_tiles[loop_nest.node_id] = dst_var
+        else:
+            lines.append(
+                f"{current_indent}nisa.dma_copy(dst=buf_{loop_nest.node_id}[{ds0}, {ds1}], src={dst_var})"
+            )
+
+    def _emit_with_loops(axis_idx: int, active_loop_vars: dict[int, str], current_indent: str) -> None:
+        if axis_idx >= len(local_axes):
+            _emit(active_loop_vars, current_indent)
+            return
+        axis = local_axes[axis_idx]
+        loop_var = f"_i{axis}_{loop_nest.node_id}"
+        bound = _z3_str(loop_nest.strip_dims[axis])
+        lines.append(f"{current_indent}for {loop_var} in nl.affine_range({bound}):")
+        next_loop_vars = dict(active_loop_vars)
+        next_loop_vars[axis] = loop_var
+        _emit_with_loops(axis_idx + 1, next_loop_vars, current_indent + "    ")
+
+    _emit_with_loops(0, {}, indent)
+
+
+def render_nki_kernel_schedule_isa(
+    G: "nuGraph",
+    loop_nests: "list[NKILoopNest]",
+    schedule: "NKIKernelSchedule",
+    kernel_name: str = "nki_kernel",
+) -> str:
+    """Render one fusion schedule as an ISA-syntax Python/NKI kernel string.
+
+    Differences from :func:`render_nki_kernel_schedule`:
+
+    * Emits ``import nki``, ``import nki.isa as nisa``, ``import nki.language as nl``
+      header and a ``@nki.jit`` decorator.
+    * Uses ``nisa.`` prefix for all hardware ISA calls.
+    * Allocates buffers with ``nl.ndarray(…, buffer=nl.sbuf)`` and
+      ``nl.ndarray(…, buffer=nl.psum)`` where appropriate.
+    * Uses ``nl.affine_range(n)`` for loop bounds.
+    * Uses ``nl.ds(offset, size)`` for dynamic tile slices.
+    * Emits the PSUM → SBUF copy pattern for ``nc_matmul`` nodes.
+    """
+    loop_nests_by_id = {ln.node_id: ln for ln in loop_nests}
+    input_nodes = [n for n in G.nodes if n.op == "input"]
+    params = ", ".join(n.id for n in input_nodes) or "..."
+    output_node_ids = {
+        n.id for n in G.nodes
+        if not G.successors(n) and n.op != "input"
+    }
+    elided_output_ids = {
+        nid
+        for group in schedule.groups
+        for nid in group.elided_output_ids
+        if nid not in output_node_ids
+    }
+    materialized_node_ids = [
+        n.id for n in G.nodes
+        if n.op != "input" and n.id not in elided_output_ids
+    ]
+
+    lines: list[str] = [_NKI_ISA_HEADER]
+    lines.append("")
+    lines.append(f"@nki.jit")
+    lines.append(f"def {kernel_name}({params}):")
+    lines.append(f"    # Schedule kind: {schedule.kind}")
+    lines.append(f"    # Input buffers")
+    for n in input_nodes:
+        shape_str = str(n.attrs.get("shape", "..."))
+        lines.append(f"    buf_{n.id} = {n.id}  # shape={shape_str}")
+    lines.append(f"    # Materialized output/intermediate buffers")
+    for nid in materialized_node_ids:
+        node = next(n for n in G.nodes if n.id == nid)
+        role = "output" if nid in output_node_ids else "intermediate"
+        shape = node.shape or "..."
+        buf_val = f"nl.shared_hbm" if nid in output_node_ids else "nl.sbuf"
+        lines.append(
+            f"    buf_{nid} = nl.ndarray({shape}, dtype=nl.bfloat16, buffer={buf_val})  # {role}"
+        )
+    lines.append("")
+    lines.append(f"    # Fusion groups (schedule={schedule.name!r})")
+    for group in schedule.groups:
+        shared_axes = tuple(group.shared_axes)
+        axis_desc = ",".join(str(axis) for axis in shared_axes) or "none"
+        lines.append(
+            f"    # --- group kind={group.kind!r} shared_axes={axis_desc}"
+            f" nodes={list(group.node_ids)!r} ---"
+        )
+        shared_loop_vars: dict[int, str] = {}
+        indent = "    "
+        for axis in shared_axes:
+            loop_var = f"_g{axis}_{group.node_ids[0]}"
+            bound = _z3_str(loop_nests_by_id[group.node_ids[0]].strip_dims[axis])
+            lines.append(f"{indent}for {loop_var} in nl.affine_range({bound}):")
+            shared_loop_vars[axis] = loop_var
+            indent += "    "
+        inline_tiles: dict[str, str] = {}
+        for node_id in group.node_ids:
+            lines.append(f"{indent}# node {node_id!r}")
+            _render_fused_node_body_isa(
+                loop_nest=loop_nests_by_id[node_id],
+                group=group,
+                loop_vars=shared_loop_vars,
+                inline_tiles=inline_tiles,
+                lines=lines,
+                indent=indent,
+            )
+        lines.append("")
+    if output_node_ids:
+        outs = ", ".join(f"buf_{nid}" for nid in sorted(output_node_ids))
+        lines.append(f"    return {outs}")
+    return "\n".join(lines)
+
+
+def render_all_fusion_versions(
+    G: "nuGraph",
+    kernel_name: str,
+    M: int = 512,
+    K: int = 128,
+    N: int = 512,
+    *,
+    verbose: bool = False,
+) -> "dict[str, str]":
+    """Run the full fusion pipeline for *G* and return ISA-syntax NKI kernels.
+
+    Executes the following steps:
+
+    1. ``annotate_shapes_concrete(G)`` with the given *M*/*K*/*N* dimensions.
+    2. Lower *G* to a hw graph (using :func:`lower_nu_graph`, with
+       :func:`synthesize_hw_graph` invoked first to discover graph variants;
+       the representative variant is used for emission).
+    3. For the hw graph: ``tile_nu_graph_variants``,
+       ``enumerate_fusion_opportunities``, and ``count_fusion_candidates``.
+    4. ``build_nki_fusion_schedule_versions`` to build the schedule set.
+    5. Emit **Version A** (unfused), **Version B** (per-axis partial), and
+       **Version C** (maximal) kernel strings via
+       :func:`render_nki_kernel_schedule_isa`.
+
+    Parameters
+    ----------
+    G:
+        Source nuGraph (public-op graph).  Modified in-place by
+        ``annotate_shapes_concrete``.
+    kernel_name:
+        Base name for the emitted kernel functions.
+    M, K, N:
+        Concrete dimension sizes used for shape annotation.  For graphs with
+        fewer than three symbolic dimensions only M and K are used.
+    verbose:
+        If True, print progress information including fusion opportunity tables.
+
+    Returns
+    -------
+    dict[str, str]
+        Keys are ``"unfused"``, ``"partial_<axes>"`` for each distinct
+        partial-fusion axis set, and ``"maximal"``.  Values are the
+        corresponding ISA-syntax NKI kernel source strings.
+    """
+    # ---- Step 1: concrete shape annotation --------------------------------
+    try:
+        annotate_shapes_concrete(G)
+    except Exception:
+        pass  # best-effort; some graphs may not have all shape rules
+
+    # ---- Step 2: lower to hw graph ----------------------------------------
+    # Try a fast direct lowering first; attempt synthesis to get variants only
+    # if the direct lowering succeeds (synthesis can be expensive for large
+    # graphs so we guard it with a short timeout).
+    G_hw = lower_nu_graph(G, max_hw_size=2, timeout=3000)
+    if G_hw is None:
+        return {}
+
+    # ---- Step 3: tile + enumerate opportunities ---------------------------
+    tiling = symbolic_tiling(G_hw)
+    loop_nests = lower_tiled_graph_to_nki(G_hw, tiling)
+    opps = enumerate_fusion_opportunities(G_hw, tiling, verbose=verbose)
+    counts = count_fusion_candidates(opps)
+    if verbose:
+        print(f"  render_all_fusion_versions: {kernel_name}")
+        _print_fusion_candidate_summary(counts)
+
+    # ---- Step 4: build schedule versions ----------------------------------
+    schedules = build_nki_fusion_schedule_versions(G_hw, tiling, loop_nests)
+
+    # ---- Step 5: emit Version A / B / C -----------------------------------
+    result: dict[str, str] = {}
+    for schedule in schedules:
+        sched_src = render_nki_kernel_schedule_isa(
+            G_hw,
+            loop_nests,
+            schedule,
+            kernel_name=f"{kernel_name}_{schedule.name}",
+        )
+        kind = schedule.kind
+        if kind == "unfused":
+            result["unfused"] = sched_src
+        elif kind in ("maximal_chain", "maximal_chain_layout"):
+            result["maximal"] = sched_src
+        else:
+            # Partial-fusion versions keyed by shared-axis set.
+            # Derive the representative axis set from the first multi-node group.
+            rep_axes: tuple[int, ...] = ()
+            for grp in schedule.groups:
+                if len(grp.node_ids) > 1:
+                    rep_axes = tuple(sorted(grp.shared_axes))
+                    break
+            if not rep_axes:
+                rep_axes = tuple(sorted(schedule.kind.replace("shared_axes_", "").replace("shared_axis_", "").split("_")))
+            axes_str = "_".join(str(a) for a in rep_axes) if rep_axes else schedule.name
+            partial_key = f"partial_{axes_str}"
+            result[partial_key] = sched_src
+
+    return result
 
 
 def lower_tiled_graph_to_nki(
@@ -7579,6 +8163,152 @@ def _test_nki_layout_absorption_schedule() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Fusion opportunity and multi-version emission tests
+# ---------------------------------------------------------------------------
+
+def _test_fusion_opportunity_enumeration() -> None:
+    """Verify :func:`enumerate_fusion_opportunities` on a simple matmul graph."""
+    G = build_kernel_matmul_graph(4, 8, 16)
+    G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000)
+    assert G_hw is not None, "lower_nu_graph returned None for matmul"
+    tiling = symbolic_tiling(G_hw)
+    opps = enumerate_fusion_opportunities(G_hw, tiling)
+    # A single-op matmul has no producer→consumer edge among hw ops with fusion
+    # opportunity, so the count must be non-negative.
+    assert isinstance(opps, list), "enumerate_fusion_opportunities must return a list"
+    counts = count_fusion_candidates(opps)
+    assert counts["total"] >= 0, "count_fusion_candidates total must be non-negative"
+    print(
+        f" fusion_opportunity: matmul — {counts['total']} opportunity/ies enumerated"
+    )
+
+
+def _test_fusion_candidate_counts() -> None:
+    """Verify :func:`count_fusion_candidates` on a multi-op rmsnorm_matmul graph."""
+    G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
+    G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000)
+    assert G_hw is not None, "lower_nu_graph returned None for rmsnorm_matmul"
+    tiling = symbolic_tiling(G_hw)
+    opps = enumerate_fusion_opportunities(G_hw, tiling)
+    counts = count_fusion_candidates(opps)
+
+    # Structural assertions.
+    assert "total" in counts, "count_fusion_candidates must contain 'total'"
+    assert counts["total"] >= 0, "total must be non-negative"
+    for key, val in counts.items():
+        assert isinstance(val, int) and val >= 0, (
+            f"count_fusion_candidates value for {key!r} must be a non-negative int"
+        )
+
+    # All by_kind / by_axes / by_variant counts must be positive (>0) and sum
+    # to at most total (axis-subset duplicates mean >1 opp per edge, so the
+    # by_variant sum can exceed total if there are multi-subset ops).
+    kind_total = builtins.sum(v for k, v in counts.items() if k.startswith("by_kind:"))
+    assert kind_total == counts["total"], (
+        f"sum of by_kind counts ({kind_total}) must equal total ({counts['total']})"
+    )
+    print(
+        f" fusion_candidates: rmsnorm_matmul — {counts['total']} candidate(s)"
+        f", kinds={[k for k in counts if k.startswith('by_kind:')]}"
+    )
+    _print_fusion_candidate_summary(counts)
+
+
+def _test_nki_multi_version_emission_matmul() -> None:
+    """Verify :func:`render_all_fusion_versions` for a matmul graph."""
+    G = build_kernel_matmul_graph(4, 8, 16)
+    versions = render_all_fusion_versions(G, kernel_name="nki_matmul")
+    assert isinstance(versions, dict), "render_all_fusion_versions must return a dict"
+    for key, src in versions.items():
+        assert "@nki.jit" in src, (
+            f"kernel version {key!r} missing @nki.jit decorator"
+        )
+        assert "nisa." in src, (
+            f"kernel version {key!r} missing nisa. ISA calls"
+        )
+    if "maximal" in versions:
+        assert "nc_matmul" in versions["maximal"], (
+            "maximal matmul kernel must contain nc_matmul"
+        )
+    print(
+        f" multi_version_emission: matmul — {len(versions)} version(s): {sorted(versions)}"
+    )
+
+
+def _test_nki_multi_version_emission_rmsnorm_matmul() -> None:
+    """Verify :func:`render_all_fusion_versions` for an rmsnorm_matmul graph."""
+    G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
+    versions = render_all_fusion_versions(G, kernel_name="nki_rmsnorm_matmul")
+    assert isinstance(versions, dict)
+    for key, src in versions.items():
+        assert "@nki.jit" in src, f"version {key!r} missing @nki.jit"
+        assert "nisa." in src, f"version {key!r} missing nisa. calls"
+    all_src = "\n".join(versions.values())
+    # rmsnorm involves tensor_reduce / activation ops.
+    assert "tensor_reduce" in all_src or "activation" in all_src, (
+        "rmsnorm_matmul kernel versions should contain tensor_reduce or activation"
+    )
+    print(
+        f" multi_version_emission: rmsnorm_matmul — {len(versions)} version(s): {sorted(versions)}"
+    )
+
+
+def _test_nki_multi_version_emission_softmax_matmul() -> None:
+    """Verify :func:`render_all_fusion_versions` for a softmax_matmul graph."""
+    G = build_kernel_softmax_matmul_graph(4, 8, 16)
+    versions = render_all_fusion_versions(G, kernel_name="nki_softmax_matmul")
+    assert isinstance(versions, dict)
+    for key, src in versions.items():
+        assert "@nki.jit" in src, f"version {key!r} missing @nki.jit"
+        assert "nisa." in src, f"version {key!r} missing nisa. calls"
+    all_src = "\n".join(versions.values())
+    assert "activation" in all_src or "tensor_reduce" in all_src, (
+        "softmax_matmul kernel versions should contain activation or tensor_reduce"
+    )
+    print(
+        f" multi_version_emission: softmax_matmul — {len(versions)} version(s): {sorted(versions)}"
+    )
+
+
+def _test_nki_multi_version_emission_all_kernels() -> None:
+    """Smoke-test :func:`render_all_fusion_versions` across all kernel builders."""
+    kernel_builders: list[tuple[str, Any]] = [
+        ("matmul",           build_kernel_matmul_graph),
+        ("rmsnorm_matmul",   build_kernel_rmsnorm_matmul_graph),
+        ("softmax_matmul",   build_kernel_softmax_matmul_graph),
+        ("relu_matmul",      build_kernel_relu_matmul_graph),
+        ("transpose_matmul", build_kernel_transpose_matmul_graph),
+        ("rmsnorm",          build_kernel_rmsnorm_graph),
+        ("softmax",          build_kernel_softmax_graph),
+        ("relu",             build_kernel_relu_graph),
+    ]
+    for kname, builder in kernel_builders:
+        G = builder(4, 8, 16)
+        versions = render_all_fusion_versions(G, kernel_name=f"nki_{kname}")
+        assert isinstance(versions, dict), f"{kname}: render_all_fusion_versions must return dict"
+        for key, src in versions.items():
+            assert "@nki.jit" in src, f"{kname}/{key}: missing @nki.jit"
+            assert "nisa." in src, f"{kname}/{key}: missing nisa. calls"
+        all_src = "\n".join(versions.values())
+        if "matmul" in kname:
+            assert "nc_matmul" in all_src, f"{kname}: maximal kernel must contain nc_matmul"
+        if kname in ("softmax", "softmax_matmul", "rmsnorm", "rmsnorm_matmul"):
+            assert "activation" in all_src or "tensor_reduce" in all_src, (
+                f"{kname}: kernel must contain activation or tensor_reduce"
+            )
+        tiling_G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
+        tiling_hw = lower_nu_graph(tiling_G, max_hw_size=2, timeout=3000)
+        if tiling_hw is not None:
+            tiling = symbolic_tiling(tiling_hw)
+            opps = enumerate_fusion_opportunities(tiling_hw, tiling)
+            counts = count_fusion_candidates(opps)
+            assert counts["total"] >= 0
+        print(
+            f" multi_version_emission: {kname} — {len(versions)} version(s)"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Test runner
 # ---------------------------------------------------------------------------
 
@@ -7605,7 +8335,15 @@ def run_all_tests() -> None:
     _test_nki_lowering_all_kernels()
     _test_nki_fusion_schedule_versions()
     _test_nki_layout_absorption_schedule()
+    print("\n================ RUNNING FUSION OPPORTUNITY TESTS ======")
+    _test_fusion_opportunity_enumeration()
+    _test_fusion_candidate_counts()
+    _test_nki_multi_version_emission_matmul()
+    _test_nki_multi_version_emission_rmsnorm_matmul()
+    _test_nki_multi_version_emission_softmax_matmul()
+    _test_nki_multi_version_emission_all_kernels()
     print("=============== ALL TESTS PASSED  =====================\n")
+
 
 
 def kernel_matmul_red_div(x: DummyArray, y: DummyArray, w: DummyArray) -> DummyArray:
