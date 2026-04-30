@@ -6146,6 +6146,33 @@ class NKILoopNest:
     reduction_axes: frozenset[int]
 
 
+@dataclass(frozen=True)
+class NKIFusionGroup:
+    """A producer/consumer chain rendered under a shared symbolic loop nest."""
+
+    node_ids: tuple[str, ...]
+    shared_axes: tuple[int, ...]
+    kind: str
+    elided_output_ids: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class NKIKernelSchedule:
+    """One candidate NKI kernel schedule built from fused node groups."""
+
+    name: str
+    kind: str
+    groups: tuple[NKIFusionGroup, ...]
+
+
+_LAYOUT_ONLY_HW_OPS: frozenset[str] = frozenset({
+    "dma_copy",
+    "dma_transpose",
+    "nc_transpose",
+    "tensor_copy",
+})
+
+
 def _z3_str(expr: Any) -> str:
     """Render a z3 ArithRef (or plain int/sentinel) as a Python source token.
 
@@ -6184,6 +6211,306 @@ def _slice_str(loop_var: str, block: z3.ArithRef, tile: Any) -> str:
     """
     ext = _tile_extent_str(block, tile)
     return f"{loop_var} * {ext} : ({loop_var} + 1) * {ext}"
+
+
+def _tile_dim_expr(node_id: str, axis: int, tile: Any) -> z3.ArithRef:
+    """Return a z3 expression for a loop nest's hardware tile dimension."""
+    if isinstance(tile, z3.ArithRef):
+        return tile
+    if isinstance(tile, int):
+        return z3.IntVal(tile)
+    if axis == 1:
+        return z3.Int(f"t1_{node_id}")
+    return z3.IntVal(_TILE_PMAX)
+
+
+def _tile_footprint_expr(loop_nest: NKILoopNest) -> z3.ArithRef:
+    """Return the symbolic SRAM footprint of one output tile."""
+    b0, b1 = loop_nest.block_dims
+    t0, t1 = loop_nest.tile_dims
+    return (
+        b0
+        * _tile_dim_expr(loop_nest.node_id, 0, t0)
+        * b1
+        * _tile_dim_expr(loop_nest.node_id, 1, t1)
+    )
+
+
+def _shared_fusable_axes(prod: NKILoopNest, cons: NKILoopNest) -> frozenset[int]:
+    """Return shared non-reduction strip axes that can anchor a fused schedule."""
+    shared: set[int] = set()
+    for axis in (0, 1):
+        if axis in prod.reduction_axes or axis in cons.reduction_axes:
+            continue
+        if _z3_str(prod.strip_dims[axis]) == _z3_str(cons.strip_dims[axis]):
+            shared.add(axis)
+    return frozenset(shared)
+
+
+def _can_fuse_edge(
+    prod: NKILoopNest,
+    cons: NKILoopNest,
+    shared_axes: tuple[int, ...],
+    hw_successors: dict[str, list[str]],
+    allow_layout_absorption: bool = False,
+) -> bool:
+    """Return True if a producer/consumer edge can be grouped under ``shared_axes``."""
+    if not shared_axes:
+        return False
+    if cons.node_id not in hw_successors.get(prod.node_id, []):
+        return False
+    if len(hw_successors.get(prod.node_id, [])) != 1:
+        return False
+    if (prod.op in _LAYOUT_ONLY_HW_OPS or cons.op in _LAYOUT_ONLY_HW_OPS) and not allow_layout_absorption:
+        return False
+    return set(shared_axes).issubset(_shared_fusable_axes(prod, cons))
+
+
+def _edge_can_elide_intermediate(
+    prod: NKILoopNest,
+    cons: NKILoopNest,
+    tiling: GraphTiling,
+    hw_successors: dict[str, list[str]],
+) -> bool:
+    """Return True if a fused 2D schedule can keep ``prod``'s result on-tile."""
+    if cons.node_id not in hw_successors.get(prod.node_id, []):
+        return False
+    if len(hw_successors.get(prod.node_id, [])) != 1:
+        return False
+    if prod.op in _LAYOUT_ONLY_HW_OPS or cons.op in _LAYOUT_ONLY_HW_OPS:
+        return False
+    prod_ext = (
+        _tile_extent_str(prod.block_dims[0], prod.tile_dims[0]),
+        _tile_extent_str(prod.block_dims[1], prod.tile_dims[1]),
+    )
+    cons_ext = (
+        _tile_extent_str(cons.block_dims[0], cons.tile_dims[0]),
+        _tile_extent_str(cons.block_dims[1], cons.tile_dims[1]),
+    )
+    if prod_ext != cons_ext:
+        return False
+    with _Z3_LOCK:
+        solver = z3.Solver()
+        solver.add(*tiling.ctx.facts)
+        pair_live = _tile_footprint_expr(prod) + _tile_footprint_expr(cons)
+        solver.add(pair_live <= z3.IntVal(_TILE_SRAM_CAP))
+        return solver.check() == z3.sat
+
+
+def _make_fusion_group(
+    node_ids: list[str],
+    shared_axes: tuple[int, ...],
+    kind: str,
+    loop_nests_by_id: dict[str, NKILoopNest],
+    tiling: GraphTiling,
+    hw_successors: dict[str, list[str]],
+) -> NKIFusionGroup:
+    """Build a fusion group and mark any fully-elidable intermediate outputs."""
+    elided: set[str] = set()
+    if tuple(shared_axes) == (0, 1):
+        for prod_id, cons_id in zip(node_ids, node_ids[1:]):
+            prod = loop_nests_by_id[prod_id]
+            cons = loop_nests_by_id[cons_id]
+            if _edge_can_elide_intermediate(prod, cons, tiling, hw_successors):
+                elided.add(prod_id)
+    return NKIFusionGroup(
+        node_ids=tuple(node_ids),
+        shared_axes=tuple(shared_axes),
+        kind=kind,
+        elided_output_ids=frozenset(elided),
+    )
+
+
+def _build_fixed_axis_schedule(
+    name: str,
+    kind: str,
+    shared_axes: tuple[int, ...],
+    ordered_ids: list[str],
+    loop_nests_by_id: dict[str, NKILoopNest],
+    tiling: GraphTiling,
+    hw_successors: dict[str, list[str]],
+    allow_layout_absorption: bool = False,
+) -> NKIKernelSchedule:
+    """Greedily fuse maximal linear chains under a fixed shared-axis policy."""
+    assigned: set[str] = set()
+    groups: list[NKIFusionGroup] = []
+    for node_id in ordered_ids:
+        if node_id in assigned:
+            continue
+        chain = [node_id]
+        current = node_id
+        while True:
+            succs = hw_successors.get(current, [])
+            if len(succs) != 1:
+                break
+            succ_id = succs[0]
+            if succ_id in assigned:
+                break
+            if not _can_fuse_edge(
+                loop_nests_by_id[current],
+                loop_nests_by_id[succ_id],
+                shared_axes,
+                hw_successors,
+                allow_layout_absorption=allow_layout_absorption,
+            ):
+                break
+            chain.append(succ_id)
+            current = succ_id
+        assigned.update(chain)
+        group_axes = shared_axes if len(chain) > 1 else ()
+        groups.append(
+            _make_fusion_group(
+                chain,
+                group_axes,
+                kind=kind,
+                loop_nests_by_id=loop_nests_by_id,
+                tiling=tiling,
+                hw_successors=hw_successors,
+            )
+        )
+    return NKIKernelSchedule(name=name, kind=kind, groups=tuple(groups))
+
+
+def _build_maximal_chain_schedule(
+    ordered_ids: list[str],
+    loop_nests_by_id: dict[str, NKILoopNest],
+    tiling: GraphTiling,
+    hw_successors: dict[str, list[str]],
+) -> NKIKernelSchedule:
+    """Greedily fuse each linear chain using the widest shared-axis set available."""
+    assigned: set[str] = set()
+    groups: list[NKIFusionGroup] = []
+    for node_id in ordered_ids:
+        if node_id in assigned:
+            continue
+        chain = [node_id]
+        current = node_id
+        common_axes: set[int] = {0, 1}
+        saw_layout = loop_nests_by_id[node_id].op in _LAYOUT_ONLY_HW_OPS
+        while True:
+            succs = hw_successors.get(current, [])
+            if len(succs) != 1:
+                break
+            succ_id = succs[0]
+            if succ_id in assigned:
+                break
+            prod = loop_nests_by_id[current]
+            cons = loop_nests_by_id[succ_id]
+            edge_axes = set(_shared_fusable_axes(prod, cons))
+            if prod.op in _LAYOUT_ONLY_HW_OPS or cons.op in _LAYOUT_ONLY_HW_OPS:
+                saw_layout = True
+            if not edge_axes:
+                break
+            new_axes = common_axes & edge_axes
+            if not new_axes:
+                break
+            common_axes = new_axes
+            chain.append(succ_id)
+            current = succ_id
+        assigned.update(chain)
+        group_axes = tuple(sorted(common_axes)) if len(chain) > 1 else ()
+        groups.append(
+            _make_fusion_group(
+                chain,
+                group_axes,
+                kind="maximal_chain_layout" if saw_layout else "maximal_chain",
+                loop_nests_by_id=loop_nests_by_id,
+                tiling=tiling,
+                hw_successors=hw_successors,
+            )
+        )
+    return NKIKernelSchedule(name="maximal_chain", kind="maximal_chain", groups=tuple(groups))
+
+
+def build_nki_fusion_schedule_versions(
+    G: nuGraph,
+    tiling: GraphTiling,
+    loop_nests: Optional[list[NKILoopNest]] = None,
+) -> list[NKIKernelSchedule]:
+    """Return bounded multi-version fusion schedules for a tiled hw graph."""
+    if loop_nests is None:
+        loop_nests = lower_tiled_graph_to_nki(G, tiling)
+    loop_nests_by_id = {ln.node_id: ln for ln in loop_nests}
+    ordered_ids = [ln.node_id for ln in loop_nests]
+    node_by_id = {n.id: n for n in G.nodes}
+    hw_successors = {
+        nid: [succ.id for succ in G.successors(node_by_id[nid]) if succ.id in loop_nests_by_id]
+        for nid in ordered_ids
+    }
+
+    schedules: list[NKIKernelSchedule] = [
+        NKIKernelSchedule(
+            name="unfused",
+            kind="unfused",
+            groups=tuple(
+                _make_fusion_group(
+                    [nid],
+                    (),
+                    kind="unfused",
+                    loop_nests_by_id=loop_nests_by_id,
+                    tiling=tiling,
+                    hw_successors=hw_successors,
+                )
+                for nid in ordered_ids
+            ),
+        ),
+        _build_fixed_axis_schedule(
+            name="fuse_strip_0",
+            kind="shared_axis_0",
+            shared_axes=(0,),
+            ordered_ids=ordered_ids,
+            loop_nests_by_id=loop_nests_by_id,
+            tiling=tiling,
+            hw_successors=hw_successors,
+        ),
+        _build_fixed_axis_schedule(
+            name="fuse_strip_1",
+            kind="shared_axis_1",
+            shared_axes=(1,),
+            ordered_ids=ordered_ids,
+            loop_nests_by_id=loop_nests_by_id,
+            tiling=tiling,
+            hw_successors=hw_successors,
+        ),
+        _build_fixed_axis_schedule(
+            name="fuse_strip_0_1",
+            kind="shared_axes_0_1",
+            shared_axes=(0, 1),
+            ordered_ids=ordered_ids,
+            loop_nests_by_id=loop_nests_by_id,
+            tiling=tiling,
+            hw_successors=hw_successors,
+        ),
+        _build_fixed_axis_schedule(
+            name="layout_absorb",
+            kind="layout_absorb",
+            shared_axes=(0, 1),
+            ordered_ids=ordered_ids,
+            loop_nests_by_id=loop_nests_by_id,
+            tiling=tiling,
+            hw_successors=hw_successors,
+            allow_layout_absorption=True,
+        ),
+        _build_maximal_chain_schedule(
+            ordered_ids=ordered_ids,
+            loop_nests_by_id=loop_nests_by_id,
+            tiling=tiling,
+            hw_successors=hw_successors,
+        ),
+    ]
+
+    deduped: list[NKIKernelSchedule] = []
+    seen: set[tuple[Any, ...]] = set()
+    for sched in schedules:
+        signature = tuple(
+            (group.node_ids, group.shared_axes, tuple(sorted(group.elided_output_ids)))
+            for group in sched.groups
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(sched)
+    return deduped
 
 
 def _nki_call_str(
@@ -6364,6 +6691,157 @@ def render_nki_loop_nest(loop_nest: NKILoopNest, indent: int = 4) -> str:
     return "\n".join(lines)
 
 
+def _render_fused_node_body(
+    loop_nest: NKILoopNest,
+    group: NKIFusionGroup,
+    loop_vars: dict[int, str],
+    inline_tiles: dict[str, str],
+    lines: list[str],
+    indent: str,
+) -> None:
+    """Append the NKI source for one node inside a fused group."""
+    local_axes = [axis for axis in (0, 1) if axis not in group.shared_axes]
+
+    def _emit(local_loop_vars: dict[int, str], current_indent: str) -> None:
+        all_loop_vars = dict(loop_vars)
+        all_loop_vars.update(local_loop_vars)
+        slice0 = _slice_str(all_loop_vars[0], loop_nest.block_dims[0], loop_nest.tile_dims[0])
+        slice1 = _slice_str(all_loop_vars[1], loop_nest.block_dims[1], loop_nest.tile_dims[1])
+
+        input_tile_vars: list[str] = []
+        for idx, inp_id in enumerate(loop_nest.input_ids):
+            inline_var = inline_tiles.get(inp_id)
+            if inline_var is not None and not local_axes and tuple(group.shared_axes) == (0, 1):
+                input_tile_vars.append(inline_var)
+                continue
+            tile_var = f"_tile_in{idx}_{loop_nest.node_id}"
+            lines.append(f"{current_indent}{tile_var} = buf_{inp_id}[{slice0}, {slice1}]")
+            input_tile_vars.append(tile_var)
+
+        ext0 = _tile_extent_str(loop_nest.block_dims[0], loop_nest.tile_dims[0])
+        ext1 = _tile_extent_str(loop_nest.block_dims[1], loop_nest.tile_dims[1])
+        dst_var = f"_tile_dst_{loop_nest.node_id}"
+        lines.append(
+            f"{current_indent}{dst_var} = nl.ndarray(({ext0}, {ext1}), dtype=nl.bfloat16)"
+        )
+        lines.append(_nki_call_str(loop_nest.op, dst_var, input_tile_vars, loop_nest.attrs, current_indent))
+        if loop_nest.node_id in group.elided_output_ids and not local_axes:
+            inline_tiles[loop_nest.node_id] = dst_var
+        else:
+            lines.append(f"{current_indent}buf_{loop_nest.node_id}[{slice0}, {slice1}] = {dst_var}")
+
+    def _emit_with_loops(axis_idx: int, active_loop_vars: dict[int, str], current_indent: str) -> None:
+        if axis_idx >= len(local_axes):
+            _emit(active_loop_vars, current_indent)
+            return
+        axis = local_axes[axis_idx]
+        loop_var = f"_i{axis}_{loop_nest.node_id}"
+        bound = _z3_str(loop_nest.strip_dims[axis])
+        lines.append(f"{current_indent}for {loop_var} in range({bound}):")
+        next_loop_vars = dict(active_loop_vars)
+        next_loop_vars[axis] = loop_var
+        _emit_with_loops(axis_idx + 1, next_loop_vars, current_indent + "    ")
+
+    _emit_with_loops(0, {}, indent)
+
+
+def render_nki_kernel_schedule(
+    G: nuGraph,
+    loop_nests: list[NKILoopNest],
+    schedule: NKIKernelSchedule,
+    kernel_name: str = "nki_kernel",
+) -> str:
+    """Render one fusion schedule as a Python/NKI kernel string."""
+    loop_nests_by_id = {ln.node_id: ln for ln in loop_nests}
+    input_nodes = [n for n in G.nodes if n.op == "input"]
+    params = ", ".join(n.id for n in input_nodes) or "..."
+    output_node_ids = {
+        n.id for n in G.nodes
+        if not G.successors(n) and n.op != "input"
+    }
+    elided_output_ids = {
+        nid
+        for group in schedule.groups
+        for nid in group.elided_output_ids
+        if nid not in output_node_ids
+    }
+    materialized_node_ids = [
+        n.id for n in G.nodes
+        if n.op != "input" and n.id not in elided_output_ids
+    ]
+
+    lines: list[str] = []
+    lines.append(f"def {kernel_name}({params}):")
+    lines.append(f"    # Schedule kind: {schedule.kind}")
+    lines.append(f"    # Input buffers")
+    for n in input_nodes:
+        shape_str = str(n.attrs.get("shape", "..."))
+        lines.append(f"    buf_{n.id} = {n.id}  # shape={shape_str}")
+    lines.append(f"    # Materialized buffers")
+    for nid in materialized_node_ids:
+        node = next(n for n in G.nodes if n.id == nid)
+        role = "output" if nid in output_node_ids else "intermediate"
+        lines.append(
+            f"    buf_{nid} = nl.ndarray({node.shape}, dtype=nl.bfloat16)  # {role}"
+        )
+    lines.append("")
+    lines.append(f"    # Fusion groups")
+    for group in schedule.groups:
+        shared_axes = tuple(group.shared_axes)
+        axis_desc = ",".join(str(axis) for axis in shared_axes) or "none"
+        lines.append(
+            f"    # --- group kind={group.kind!r} shared_axes={axis_desc} nodes={list(group.node_ids)!r} ---"
+        )
+        shared_loop_vars: dict[int, str] = {}
+        indent = "    "
+        for axis in shared_axes:
+            loop_var = f"_g{axis}_{group.node_ids[0]}"
+            bound = _z3_str(loop_nests_by_id[group.node_ids[0]].strip_dims[axis])
+            lines.append(f"{indent}for {loop_var} in range({bound}):")
+            shared_loop_vars[axis] = loop_var
+            indent += "    "
+        inline_tiles: dict[str, str] = {}
+        for node_id in group.node_ids:
+            lines.append(f"{indent}# node {node_id!r}")
+            _render_fused_node_body(
+                loop_nest=loop_nests_by_id[node_id],
+                group=group,
+                loop_vars=shared_loop_vars,
+                inline_tiles=inline_tiles,
+                lines=lines,
+                indent=indent,
+            )
+        lines.append("")
+    if output_node_ids:
+        outs = ", ".join(f"buf_{nid}" for nid in sorted(output_node_ids))
+        lines.append(f"    return {outs}")
+    return "\n".join(lines)
+
+
+def render_nki_kernel_versions(
+    G: nuGraph,
+    loop_nests: list[NKILoopNest],
+    schedules: list[NKIKernelSchedule],
+    kernel_name: str = "nki_kernel",
+) -> list[tuple[NKIKernelSchedule, str]]:
+    """Render one kernel string per fusion schedule version."""
+    rendered: list[tuple[NKIKernelSchedule, str]] = []
+    for schedule in schedules:
+        suffix = schedule.name.replace("-", "_")
+        rendered.append(
+            (
+                schedule,
+                render_nki_kernel_schedule(
+                    G,
+                    loop_nests,
+                    schedule,
+                    kernel_name=f"{kernel_name}_{suffix}",
+                ),
+            )
+        )
+    return rendered
+
+
 def lower_tiled_graph_to_nki(
     G: nuGraph,
     tiling: GraphTiling,
@@ -6415,53 +6893,16 @@ def render_nki_kernel(
     loop_nests: list[NKILoopNest],
     kernel_name: str = "nki_kernel",
 ) -> str:
-    """Render a list of NKI loop nests as a Python NKI kernel function string.
-
-    The generated function signature is derived from the graph's ``input``
-    nodes and is a rough sketch intended for human readability; it is not
-    guaranteed to be directly executable without adaptation.
-
-    Parameters
-    ----------
-    G:
-        The nuGraph whose input nodes define the function parameters.
-    loop_nests:
-        Ordered list of loop nests, as returned by
-        :func:`lower_tiled_graph_to_nki`.
-    kernel_name:
-        Name of the generated Python function.
-    """
-    input_nodes = [n for n in G.nodes if n.op == "input"]
-    params = ", ".join(n.id for n in input_nodes) or "..."
-
-    # Collect all node ids that appear as inputs; these need buffer declarations.
-    all_node_ids = {n.id for n in G.nodes}
-    output_node_ids = {
-        n.id for n in G.nodes
-        if not G.successors(n) and n.op != "input"
-    }
-
-    lines: list[str] = []
-    lines.append(f"def {kernel_name}({params}):")
-    lines.append(f"    # Input buffers")
-    for n in input_nodes:
-        shape_str = str(n.attrs.get("shape", "..."))
-        lines.append(f"    buf_{n.id} = {n.id}  # shape={shape_str}")
-    lines.append(f"    # Output buffers")
-    for nid in output_node_ids:
-        node = next(n for n in G.nodes if n.id == nid)
-        shape_str = str(node.shape)
-        lines.append(f"    buf_{nid} = nl.ndarray({shape_str}, dtype=nl.bfloat16)  # output")
-    lines.append(f"    # Intermediate buffers (allocated per tile in each loop nest)")
-    lines.append("")
-    lines.append(f"    # Loop nests (one per hw op, in topological order)")
-    for ln in loop_nests:
-        lines.append(render_nki_loop_nest(ln, indent=4))
-        lines.append("")
-    if output_node_ids:
-        outs = ", ".join(f"buf_{nid}" for nid in sorted(output_node_ids))
-        lines.append(f"    return {outs}")
-    return "\n".join(lines)
+    """Render the unfused baseline NKI kernel."""
+    schedule = NKIKernelSchedule(
+        name="unfused",
+        kind="unfused",
+        groups=tuple(
+            NKIFusionGroup(node_ids=(ln.node_id,), shared_axes=(), kind="unfused")
+            for ln in loop_nests
+        ),
+    )
+    return render_nki_kernel_schedule(G, loop_nests, schedule, kernel_name=kernel_name)
 
 
 # ---------------------------------------------------------------------------
@@ -7060,6 +7501,78 @@ def _test_nki_lowering_all_kernels() -> None:
         )
 
 
+def _test_nki_fusion_schedule_versions() -> None:
+    """Verify that bounded fusion schedule versions are emitted and renderable."""
+    G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
+    G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000)
+    assert G_hw is not None, "lower_nu_graph returned None for rmsnorm_matmul"
+
+    tiling = symbolic_tiling(G_hw)
+    loop_nests = lower_tiled_graph_to_nki(G_hw, tiling)
+    schedules = build_nki_fusion_schedule_versions(G_hw, tiling, loop_nests)
+    schedule_names = {sched.name for sched in schedules}
+
+    expected = {
+        "unfused",
+        "fuse_strip_0",
+        "fuse_strip_1",
+        "fuse_strip_0_1",
+        "maximal_chain",
+    }
+    assert expected.issubset(schedule_names), (
+        f"Expected fusion schedules {sorted(expected)!r}, got {sorted(schedule_names)!r}"
+    )
+
+    rendered = render_nki_kernel_versions(
+        G_hw,
+        loop_nests,
+        schedules,
+        kernel_name="nki_rmsnorm_matmul",
+    )
+    assert len(rendered) == len(schedules), "Expected one rendered kernel per schedule"
+    assert len(rendered) >= 6, f"Expected at least 6 kernel versions, got {len(rendered)}"
+    assert any("shared_axes=0,1" in src for _, src in rendered), (
+        "Expected at least one fully shared 2D fused kernel version"
+    )
+
+    print(
+        f" nki_fusion: rmsnorm_matmul — {len(schedules)} schedule version(s) "
+        "generated and rendered"
+    )
+
+
+def _test_nki_layout_absorption_schedule() -> None:
+    """Verify that layout-aware schedule generation fuses layout-transform chains."""
+    G = build_kernel_transpose_matmul_graph(4, 8, 16)
+    G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000)
+    assert G_hw is not None, "lower_nu_graph returned None for transpose_matmul"
+
+    tiling = symbolic_tiling(G_hw)
+    loop_nests = lower_tiled_graph_to_nki(G_hw, tiling)
+    loop_nests_by_id = {ln.node_id: ln for ln in loop_nests}
+    schedules = build_nki_fusion_schedule_versions(G_hw, tiling, loop_nests)
+
+    layout_schedule = next((sched for sched in schedules if sched.name == "layout_absorb"), None)
+    assert layout_schedule is not None, "Expected a layout_absorb schedule version"
+    assert any(
+        len(group.node_ids) > 1
+        and any(loop_nests_by_id[nid].op in _LAYOUT_ONLY_HW_OPS for nid in group.node_ids)
+        for group in layout_schedule.groups
+    ), "layout_absorb schedule should contain a fused group with a layout op"
+
+    rendered = render_nki_kernel_versions(
+        G_hw,
+        loop_nests,
+        [layout_schedule],
+        kernel_name="nki_transpose_matmul",
+    )
+    assert rendered and "layout_absorb" in rendered[0][1], (
+        "Expected layout_absorb kernel source to include the schedule marker"
+    )
+
+    print(" nki_fusion: transpose_matmul — layout-aware fused schedule rendered")
+
+
 # ---------------------------------------------------------------------------
 # Test runner
 # ---------------------------------------------------------------------------
@@ -7085,6 +7598,8 @@ def run_all_tests() -> None:
     print("\n================ RUNNING NKI LOWERING TESTS ============")
     _test_nki_lowering_matmul()
     _test_nki_lowering_all_kernels()
+    _test_nki_fusion_schedule_versions()
+    _test_nki_layout_absorption_schedule()
     print("=============== ALL TESTS PASSED  =====================\n")
 
 
@@ -7534,6 +8049,14 @@ if __name__ == "__main__":
                 print(f"  +-- hw variant {hi} ---")
                 print_graph(g_hw, tiling)
                 loop_nests = lower_tiled_graph_to_nki(g_hw, tiling)
-                print(f"  +-- hw variant {hi} :: NKI kernel ---")
-                print(render_nki_kernel(g_hw, loop_nests, kernel_name=f"nki_{kname}_v{hi}"))
+                schedules = build_nki_fusion_schedule_versions(g_hw, tiling, loop_nests)
+                print(f"  +-- hw variant {hi} :: {len(schedules)} NKI kernel version(s) ---")
+                for schedule, src in render_nki_kernel_versions(
+                    g_hw,
+                    loop_nests,
+                    schedules,
+                    kernel_name=f"nki_{kname}_v{hi}",
+                ):
+                    print(f"    [schedule={schedule.name}]")
+                    print(src)
         print()
