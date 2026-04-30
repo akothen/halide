@@ -8386,7 +8386,7 @@ def _test_graph_variant_isa_emission_covers_all_variants() -> None:
     for hi, _g_hw, _tiling, _opps, counts, rendered in rendered_variants:
         assert counts["total"] >= 0, f"variant {hi}: total fusion count must be non-negative"
         assert rendered, f"variant {hi}: expected at least one rendered ISA kernel"
-        assert all("@nki.jit" in src and "nisa." in src for _, src in rendered), (
+        assert builtins.all("@nki.jit" in src and "nisa." in src for _, src in rendered), (
             f"variant {hi}: every rendered kernel must use ISA syntax"
         )
     print(
