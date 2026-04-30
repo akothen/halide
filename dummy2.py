@@ -5855,6 +5855,1062 @@ def simplify_hw_graph_variants(
 
 
 # ---------------------------------------------------------------------------
+# Symbolic tiling
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Hardware tile-size constants
+# ---------------------------------------------------------------------------
+# The partition dimension (axis 0) is always 128 for every NKI instruction.
+_TILE_PMAX: int = 128
+
+# Sentinel that marks a free dimension whose size is not fixed by hardware.
+# The value reuses the existing `tile_size.psum_fmax` class attribute (which
+# is `Ellipsis`, a unique non-int object) purely as a distinguishable sentinel;
+# its original NKI meaning (maximum free dim on PSUM) is not used here.
+# During symbolic_tiling each operator using this sentinel gets its own
+# per-operator z3.Int variable constrained to _TILE_FREE_DIM_CHOICES.
+_TILE_PSUM_FMAX: Any = tile_size.psum_fmax
+
+# Valid free-dimension tile sizes for instructions without a hardware limit.
+# Hardware supports 512, 1024 and 2048 for these ops.
+_TILE_FREE_DIM_CHOICES: tuple[int, ...] = (512, 1024, 2048)
+
+# nc_matmul-specific free-dimension limits (hardware-fixed).
+# The moving operand's free dim is capped at 512; the stationary operand's
+# free dim is capped at 128 (equal to the partition size).  The output tile
+# maps axis-0 to the stationary free dim (128) and axis-1 to the moving free
+# dim (512), so the overall output tile has t_0=128, t_1=512.
+_TILE_NC_MATMUL_MOVING_FMAX: int = 512
+_TILE_NC_MATMUL_STATIONARY_FMAX: int = 128  # equals _TILE_PMAX
+
+# nc_transpose: both partition and free dims are 128.
+_TILE_NC_TRANSPOSE_FMAX: int = 128  # equals _TILE_PMAX
+
+# SRAM capacity bound used in the block-size constraint:
+#   b_0 * t_0 * b_1 * t_1  ≤  _TILE_SRAM_CAP
+# Set to the maximum possible single-tile footprint (max free dim × partition).
+_TILE_SRAM_CAP: int = builtins.max(_TILE_FREE_DIM_CHOICES) * _TILE_PMAX  # 2048 * 128
+
+# Maps each hw op to its (t_0, t_1) hardware tile dimensions (partition × free axis).
+#
+#   t_0 = 128  for all ops  (partition dim is always fixed at 128).
+#   t_1:
+#     • nc_matmul   → 512  (moving-operand free dim limit)
+#     • nc_transpose → 128  (free dim limit equals partition)
+#     • all others  → _TILE_PSUM_FMAX sentinel; during symbolic_tiling a
+#                     per-operator symbolic variable is created and constrained
+#                     to _TILE_FREE_DIM_CHOICES = {512, 1024, 2048}.
+#
+# Ops not present in this table fall back to (_TILE_PMAX, _TILE_PSUM_FMAX).
+_HW_TILE_DIMS: dict[str, tuple[Any, Any]] = {
+    "activation":              (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "activation_reduce":       (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "dma_copy":                (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "dma_transpose":           (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "exponential":             (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "nc_matmul":               (_TILE_PMAX, _TILE_NC_MATMUL_MOVING_FMAX),
+    "nc_transpose":            (_TILE_PMAX, _TILE_NC_TRANSPOSE_FMAX),
+    "reciprocal":              (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "tensor_copy":             (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "tensor_partition_reduce": (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "tensor_reduce":           (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "tensor_scalar":           (_TILE_PMAX, _TILE_PSUM_FMAX),
+    "tensor_tensor":           (_TILE_PMAX, _TILE_PSUM_FMAX),
+}
+
+
+@dataclass
+class TilingParams:
+    """Symbolic tiling parameters for a single hardware operator node.
+
+    Attributes:
+        op_id:      Node id of the operator.
+        tile_dims:  ``(t_0, t_1)`` – hardware tile sizes.  ``t_0`` is always
+                    the concrete integer :data:`_TILE_PMAX` (128).  ``t_1`` is
+                    either a concrete integer (for ops with a fixed free-dim
+                    limit, e.g. ``nc_matmul``, ``nc_transpose``) or the
+                    :data:`_TILE_PSUM_FMAX` sentinel (for ops whose free dim
+                    is chosen from :data:`_TILE_FREE_DIM_CHOICES`).
+        block_dims: ``(b_0, b_1)`` – symbolic block-dimension variables.
+        strip_dims: ``(n_0, n_1)`` – derived strip-dimension variables
+                    (shared across non-reduction axes).
+    """
+
+    op_id: str
+    tile_dims: tuple[Any, Any]
+    block_dims: tuple[z3.ArithRef, z3.ArithRef]
+    strip_dims: tuple[z3.ArithRef, z3.ArithRef]
+
+
+@dataclass
+class GraphTiling:
+    """Symbolic tiling assignment for all hw-op nodes in a lowered nuGraph.
+
+    Attributes:
+        op_tilings:       Mapping from ``node.id`` → :class:`TilingParams`.
+        shared_strip_dims: Shared strip-dim z3 variables, keyed by axis index.
+                           Only non-reduction axes appear here.
+        ctx:              A :class:`Context` collecting all well-formedness
+                          constraints (block ≥ 1, strip formula, SRAM bound).
+    """
+
+    op_tilings: dict[str, TilingParams]
+    shared_strip_dims: dict[int, z3.ArithRef]
+    ctx: Context
+
+
+def _reduction_axes(node: Node, G: nuGraph) -> frozenset[int]:
+    """Return the set of output-tensor axes that are reduced over by ``node``.
+
+    For ``tensor_reduce`` the reduced axis is taken from the node's ``axis``
+    attribute.  ``tensor_partition_reduce`` always reduces axis 0 (the
+    partition dimension).  All other hw ops produce outputs with no reduced
+    axes.
+    """
+    op = node.op
+    if op == "tensor_reduce":
+        axis_attr = node.attrs.get("axis", 1)
+        axis = int(axis_attr[0] if isinstance(axis_attr, (list, tuple)) else axis_attr)
+        return frozenset({axis})
+    if op == "tensor_partition_reduce":
+        # Partition reduce collapses axis 0 to size 1.
+        return frozenset({0})
+    return frozenset()
+
+
+def symbolic_tiling(G: nuGraph) -> GraphTiling:
+    """Assign symbolic tiling parameters to every hw-op node in a lowered nuGraph.
+
+    Strip dimensions along non-reduction axes are unified (shared) across all
+    operators to model cross-operator data reuse on SBUF/PSUM.
+
+    Returns a :class:`GraphTiling` containing:
+
+    * per-operator :class:`TilingParams`,
+    * shared strip-dim z3 variables (one per non-reduction axis), and
+    * a :class:`Context` with all tiling well-formedness constraints.
+    """
+    with _Z3_LOCK:
+        hw_nodes = [n for n in G.nodes if n.op in frozenset(_HW_OP_NAMES)]
+
+        try:
+            sym_tensors = _graph_symbolic_tensors(G)
+        except (KeyError, z3.Z3Exception):
+            sym_tensors = {}
+
+        # Shared strip-dim variables, reused across all non-reduction axis ops.
+        shared_strip_dims: dict[int, z3.ArithRef] = {}
+        ctx = Context()
+
+        # SRAM capacity bound (concrete): max free dim × partition dim.
+        sram_cap = z3.IntVal(_TILE_SRAM_CAP)
+
+        op_tilings: dict[str, TilingParams] = {}
+
+        for node in hw_nodes:
+            tile_t0, tile_t1 = _HW_TILE_DIMS.get(
+                node.op, (_TILE_PMAX, _TILE_PSUM_FMAX)
+            )
+            # t_0 (partition axis): always the concrete integer 128.
+            t0_z3: z3.ArithRef = z3.IntVal(tile_t0)
+
+            # t_1 (free axis): concrete for nc_matmul/nc_transpose; for all
+            # other ops a per-operator symbolic variable constrained to
+            # _TILE_FREE_DIM_CHOICES = {512, 1024, 2048}.
+            if isinstance(tile_t1, int):
+                t1_z3: z3.ArithRef = z3.IntVal(tile_t1)
+            else:
+                t1_z3 = z3.Int(f"t1_{node.id}")
+                ctx.add(z3.Or(*[t1_z3 == z3.IntVal(c) for c in _TILE_FREE_DIM_CHOICES]))
+
+            red_axes = _reduction_axes(node, G)
+
+            # Per-operator symbolic block dimensions.
+            b0 = z3.Int(f"b0_{node.id}")
+            b1 = z3.Int(f"b1_{node.id}")
+
+            # Strip dimensions: shared for non-reduction axes, per-operator
+            # for reduction axes.
+            if 0 in red_axes:
+                n0: z3.ArithRef = z3.Int(f"n0_{node.id}")
+            else:
+                if 0 not in shared_strip_dims:
+                    shared_strip_dims[0] = z3.Int("strip_0")
+                n0 = shared_strip_dims[0]
+
+            if 1 in red_axes:
+                n1: z3.ArithRef = z3.Int(f"n1_{node.id}")
+            else:
+                if 1 not in shared_strip_dims:
+                    shared_strip_dims[1] = z3.Int("strip_1")
+                n1 = shared_strip_dims[1]
+
+            # Tensor shape for dimension bounds.
+            sym = sym_tensors.get(node.id)
+            if sym is not None and len(sym.shape) >= 2:
+                dim0: z3.ArithRef = sym.shape[0]
+                dim1: z3.ArithRef = sym.shape[1]
+            elif sym is not None and len(sym.shape) == 1:
+                dim0 = sym.shape[0]
+                dim1 = z3.IntVal(1)
+            else:
+                dim0 = z3.Int(f"dim0_{node.id}")
+                dim1 = z3.Int(f"dim1_{node.id}")
+
+            bt0 = b0 * t0_z3
+            bt1 = b1 * t1_z3
+
+            # n_i == ceil(dim_i / (b_i * t_i))
+            # Ceiling division: ceil(a/b) == (a + b - 1) / b for positive a, b.
+            # The z3 '/' operator on integer-sorted terms performs integer
+            # (floor) division, so (a + b - 1) / b gives ceiling division.
+            ctx.add(n0 == (dim0 + bt0 - z3.IntVal(1)) / bt0)
+            ctx.add(n1 == (dim1 + bt1 - z3.IntVal(1)) / bt1)
+
+            # Well-formedness: block and strip dimensions must be positive.
+            ctx.add(b0 >= z3.IntVal(1))
+            ctx.add(b1 >= z3.IntVal(1))
+            ctx.add(n0 >= z3.IntVal(1))
+            ctx.add(n1 >= z3.IntVal(1))
+
+            # No over-tiling: b_i * t_i <= dim_i + t_i - 1
+            ctx.add(bt0 <= dim0 + t0_z3 - z3.IntVal(1))
+            ctx.add(bt1 <= dim1 + t1_z3 - z3.IntVal(1))
+
+            # Optional SRAM capacity constraint.
+            ctx.add(bt0 * bt1 <= sram_cap)
+
+            op_tilings[node.id] = TilingParams(
+                op_id=node.id,
+                tile_dims=(tile_t0, tile_t1),
+                block_dims=(b0, b1),
+                strip_dims=(n0, n1),
+            )
+
+        return GraphTiling(
+            op_tilings=op_tilings,
+            shared_strip_dims=shared_strip_dims,
+            ctx=ctx,
+        )
+
+
+def tile_nu_graph_variants(
+    graphs: list[nuGraph],
+) -> list[tuple[nuGraph, GraphTiling]]:
+    """Apply :func:`symbolic_tiling` to each graph in a list of lowered variants."""
+    return [(G, symbolic_tiling(G)) for G in graphs]
+
+
+def print_graph_tiling(G: nuGraph, tiling: GraphTiling) -> None:
+    """Print each node annotated as ``[n0,n1,b0,b1] op [t0,t1]``."""
+    for node in G.nodes:
+        if node.id in tiling.op_tilings:
+            tp = tiling.op_tilings[node.id]
+            n0, n1 = tp.strip_dims
+            b0, b1 = tp.block_dims
+            t0, t1 = tp.tile_dims
+            print(
+                f"  [{n0},{n1},{b0},{b1}] {node.op} [{t0},{t1}]"
+                f"  (id={node.id})"
+            )
+        else:
+            print(f"  {node.op}  (id={node.id}, no tiling)")
+
+# ---------------------------------------------------------------------------
+# NKI loop-nest lowering
+# ---------------------------------------------------------------------------
+
+@dataclass
+class NKILoopNest:
+    """Loop nest lowering of a single hw-op node in the tiled graph.
+
+    Attributes:
+        node_id:         Node id of the hw op.
+        op:              NKI op name (e.g. ``"nc_matmul"``).
+        strip_dims:      ``(n0, n1)`` – symbolic loop-bound z3 expressions.
+        block_dims:      ``(b0, b1)`` – symbolic block-dimension z3 expressions.
+        tile_dims:       ``(t0, t1)`` – hardware tile sizes (int or sentinel).
+        input_ids:       Ordered list of input node ids.
+        attrs:           Op attributes dict from the graph node.
+        reduction_axes:  Set of axes that are reduced over by this op.
+    """
+
+    node_id: str
+    op: str
+    strip_dims: tuple[z3.ArithRef, z3.ArithRef]
+    block_dims: tuple[z3.ArithRef, z3.ArithRef]
+    tile_dims: tuple[Any, Any]
+    input_ids: list[str]
+    attrs: dict[str, Any]
+    reduction_axes: frozenset[int]
+
+
+@dataclass(frozen=True)
+class NKIFusionGroup:
+    """A producer/consumer chain rendered under a shared symbolic loop nest."""
+
+    node_ids: tuple[str, ...]
+    shared_axes: tuple[int, ...]
+    kind: str
+    elided_output_ids: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class NKIKernelSchedule:
+    """One candidate NKI kernel schedule built from fused node groups."""
+
+    name: str
+    kind: str
+    groups: tuple[NKIFusionGroup, ...]
+
+
+_LAYOUT_ONLY_HW_OPS: frozenset[str] = frozenset({
+    "dma_copy",
+    "dma_transpose",
+    "nc_transpose",
+    "tensor_copy",
+})
+
+
+def _z3_str(expr: Any) -> str:
+    """Render a z3 ArithRef (or plain int/sentinel) as a Python source token.
+
+    * ``z3.IntNumRef``  → decimal literal string (e.g. ``"128"``).
+    * ``z3.ArithRef``   → the z3 variable name (e.g. ``"strip_0"``).
+    * plain ``int``     → decimal literal string.
+    * anything else     → ``repr(expr)``.
+    """
+    if isinstance(expr, z3.IntNumRef):
+        return str(expr.as_long())
+    if isinstance(expr, z3.ArithRef):
+        return str(expr)
+    if isinstance(expr, int):
+        return str(expr)
+    return repr(expr)
+
+
+def _tile_extent_str(block: z3.ArithRef, tile: Any) -> str:
+    """Return a Python expression string for ``block * tile`` (tile extent)."""
+    b = _z3_str(block)
+    t = _z3_str(tile)
+    if b == "1" and t == "1":
+        return "1"
+    if b == "1":
+        return t
+    if t == "1":
+        return b
+    return f"{b} * {t}"
+
+
+def _slice_str(loop_var: str, block: z3.ArithRef, tile: Any) -> str:
+    """Return a Python slice string for one axis inside a tiled loop.
+
+    The slice is ``loop_var * extent : (loop_var + 1) * extent`` where
+    ``extent = block * tile``.
+    """
+    ext = _tile_extent_str(block, tile)
+    return f"{loop_var} * {ext} : ({loop_var} + 1) * {ext}"
+
+
+def _tile_dim_expr(node_id: str, axis: int, tile: Any) -> z3.ArithRef:
+    """Return a z3 expression for a loop nest's hardware tile dimension."""
+    if isinstance(tile, z3.ArithRef):
+        return tile
+    if isinstance(tile, int):
+        return z3.IntVal(tile)
+    if axis == 1:
+        return z3.Int(f"t1_{node_id}")
+    return z3.IntVal(_TILE_PMAX)
+
+
+def _tile_footprint_expr(loop_nest: NKILoopNest) -> z3.ArithRef:
+    """Return the symbolic SRAM footprint of one output tile."""
+    b0, b1 = loop_nest.block_dims
+    t0, t1 = loop_nest.tile_dims
+    return (
+        b0
+        * _tile_dim_expr(loop_nest.node_id, 0, t0)
+        * b1
+        * _tile_dim_expr(loop_nest.node_id, 1, t1)
+    )
+
+
+def _shared_fusable_axes(prod: NKILoopNest, cons: NKILoopNest) -> frozenset[int]:
+    """Return shared non-reduction strip axes that can anchor a fused schedule."""
+    shared: set[int] = set()
+    for axis in (0, 1):
+        if axis in prod.reduction_axes or axis in cons.reduction_axes:
+            continue
+        if _z3_str(prod.strip_dims[axis]) == _z3_str(cons.strip_dims[axis]):
+            shared.add(axis)
+    return frozenset(shared)
+
+
+def _can_fuse_edge(
+    prod: NKILoopNest,
+    cons: NKILoopNest,
+    shared_axes: tuple[int, ...],
+    hw_successors: dict[str, list[str]],
+    allow_layout_absorption: bool = False,
+) -> bool:
+    """Return True if a producer/consumer edge can be grouped under ``shared_axes``."""
+    if not shared_axes:
+        return False
+    if cons.node_id not in hw_successors.get(prod.node_id, []):
+        return False
+    if len(hw_successors.get(prod.node_id, [])) != 1:
+        return False
+    if (prod.op in _LAYOUT_ONLY_HW_OPS or cons.op in _LAYOUT_ONLY_HW_OPS) and not allow_layout_absorption:
+        return False
+    return set(shared_axes).issubset(_shared_fusable_axes(prod, cons))
+
+
+def _edge_can_elide_intermediate(
+    prod: NKILoopNest,
+    cons: NKILoopNest,
+    tiling: GraphTiling,
+    hw_successors: dict[str, list[str]],
+) -> bool:
+    """Return True if a fused 2D schedule can keep ``prod``'s result on-tile."""
+    if cons.node_id not in hw_successors.get(prod.node_id, []):
+        return False
+    if len(hw_successors.get(prod.node_id, [])) != 1:
+        return False
+    if prod.op in _LAYOUT_ONLY_HW_OPS or cons.op in _LAYOUT_ONLY_HW_OPS:
+        return False
+    prod_ext = (
+        _tile_extent_str(prod.block_dims[0], prod.tile_dims[0]),
+        _tile_extent_str(prod.block_dims[1], prod.tile_dims[1]),
+    )
+    cons_ext = (
+        _tile_extent_str(cons.block_dims[0], cons.tile_dims[0]),
+        _tile_extent_str(cons.block_dims[1], cons.tile_dims[1]),
+    )
+    if prod_ext != cons_ext:
+        return False
+    with _Z3_LOCK:
+        solver = z3.Solver()
+        solver.add(*tiling.ctx.facts)
+        pair_live = _tile_footprint_expr(prod) + _tile_footprint_expr(cons)
+        solver.add(pair_live <= z3.IntVal(_TILE_SRAM_CAP))
+        return solver.check() == z3.sat
+
+
+def _make_fusion_group(
+    node_ids: list[str],
+    shared_axes: tuple[int, ...],
+    kind: str,
+    loop_nests_by_id: dict[str, NKILoopNest],
+    tiling: GraphTiling,
+    hw_successors: dict[str, list[str]],
+) -> NKIFusionGroup:
+    """Build a fusion group and mark any fully-elidable intermediate outputs."""
+    elided: set[str] = set()
+    if tuple(shared_axes) == (0, 1):
+        # Only consecutive producer/consumer pairs inside a fully shared 2D nest
+        # can keep an intermediate tile live without writing it back to a buffer.
+        for prod_id, cons_id in zip(node_ids, node_ids[1:]):
+            prod = loop_nests_by_id[prod_id]
+            cons = loop_nests_by_id[cons_id]
+            if _edge_can_elide_intermediate(prod, cons, tiling, hw_successors):
+                elided.add(prod_id)
+    return NKIFusionGroup(
+        node_ids=tuple(node_ids),
+        shared_axes=tuple(shared_axes),
+        kind=kind,
+        elided_output_ids=frozenset(elided),
+    )
+
+
+def _build_fixed_axis_schedule(
+    name: str,
+    kind: str,
+    shared_axes: tuple[int, ...],
+    ordered_ids: list[str],
+    loop_nests_by_id: dict[str, NKILoopNest],
+    tiling: GraphTiling,
+    hw_successors: dict[str, list[str]],
+    allow_layout_absorption: bool = False,
+) -> NKIKernelSchedule:
+    """Greedily fuse maximal linear chains under a fixed shared-axis policy."""
+    assigned: set[str] = set()
+    groups: list[NKIFusionGroup] = []
+    for node_id in ordered_ids:
+        if node_id in assigned:
+            continue
+        chain = [node_id]
+        current = node_id
+        while True:
+            succs = hw_successors.get(current, [])
+            if len(succs) != 1:
+                break
+            succ_id = succs[0]
+            if succ_id in assigned:
+                break
+            if not _can_fuse_edge(
+                loop_nests_by_id[current],
+                loop_nests_by_id[succ_id],
+                shared_axes,
+                hw_successors,
+                allow_layout_absorption=allow_layout_absorption,
+            ):
+                break
+            chain.append(succ_id)
+            current = succ_id
+        assigned.update(chain)
+        group_axes = shared_axes if len(chain) > 1 else ()
+        groups.append(
+            _make_fusion_group(
+                chain,
+                group_axes,
+                kind=kind,
+                loop_nests_by_id=loop_nests_by_id,
+                tiling=tiling,
+                hw_successors=hw_successors,
+            )
+        )
+    return NKIKernelSchedule(name=name, kind=kind, groups=tuple(groups))
+
+
+def _build_maximal_chain_schedule(
+    ordered_ids: list[str],
+    loop_nests_by_id: dict[str, NKILoopNest],
+    tiling: GraphTiling,
+    hw_successors: dict[str, list[str]],
+) -> NKIKernelSchedule:
+    """Greedily fuse each linear chain using the widest shared-axis set available."""
+    assigned: set[str] = set()
+    groups: list[NKIFusionGroup] = []
+    for node_id in ordered_ids:
+        if node_id in assigned:
+            continue
+        chain = [node_id]
+        current = node_id
+        common_axes: set[int] = {0, 1}
+        saw_layout = loop_nests_by_id[node_id].op in _LAYOUT_ONLY_HW_OPS
+        while True:
+            succs = hw_successors.get(current, [])
+            if len(succs) != 1:
+                break
+            succ_id = succs[0]
+            if succ_id in assigned:
+                break
+            prod = loop_nests_by_id[current]
+            cons = loop_nests_by_id[succ_id]
+            edge_axes = set(_shared_fusable_axes(prod, cons))
+            if prod.op in _LAYOUT_ONLY_HW_OPS or cons.op in _LAYOUT_ONLY_HW_OPS:
+                saw_layout = True
+            if not edge_axes:
+                break
+            new_axes = common_axes & edge_axes
+            if not new_axes:
+                break
+            common_axes = new_axes
+            chain.append(succ_id)
+            current = succ_id
+        assigned.update(chain)
+        group_axes = tuple(sorted(common_axes)) if len(chain) > 1 else ()
+        groups.append(
+            _make_fusion_group(
+                chain,
+                group_axes,
+                kind="maximal_chain_layout" if saw_layout else "maximal_chain",
+                loop_nests_by_id=loop_nests_by_id,
+                tiling=tiling,
+                hw_successors=hw_successors,
+            )
+        )
+    return NKIKernelSchedule(name="maximal_chain", kind="maximal_chain", groups=tuple(groups))
+
+
+def build_nki_fusion_schedule_versions(
+    G: nuGraph,
+    tiling: GraphTiling,
+    loop_nests: Optional[list[NKILoopNest]] = None,
+) -> list[NKIKernelSchedule]:
+    """Return bounded multi-version fusion schedules for a tiled hw graph."""
+    if loop_nests is None:
+        loop_nests = lower_tiled_graph_to_nki(G, tiling)
+    loop_nests_by_id = {ln.node_id: ln for ln in loop_nests}
+    ordered_ids = [ln.node_id for ln in loop_nests]
+    node_by_id = {n.id: n for n in G.nodes}
+    hw_successors = {
+        nid: [succ.id for succ in G.successors(node_by_id[nid]) if succ.id in loop_nests_by_id]
+        for nid in ordered_ids
+    }
+
+    schedules: list[NKIKernelSchedule] = [
+        NKIKernelSchedule(
+            name="unfused",
+            kind="unfused",
+            groups=tuple(
+                _make_fusion_group(
+                    [nid],
+                    (),
+                    kind="unfused",
+                    loop_nests_by_id=loop_nests_by_id,
+                    tiling=tiling,
+                    hw_successors=hw_successors,
+                )
+                for nid in ordered_ids
+            ),
+        ),
+        _build_fixed_axis_schedule(
+            name="fuse_strip_0",
+            kind="shared_axis_0",
+            shared_axes=(0,),
+            ordered_ids=ordered_ids,
+            loop_nests_by_id=loop_nests_by_id,
+            tiling=tiling,
+            hw_successors=hw_successors,
+        ),
+        _build_fixed_axis_schedule(
+            name="fuse_strip_1",
+            kind="shared_axis_1",
+            shared_axes=(1,),
+            ordered_ids=ordered_ids,
+            loop_nests_by_id=loop_nests_by_id,
+            tiling=tiling,
+            hw_successors=hw_successors,
+        ),
+        _build_fixed_axis_schedule(
+            name="fuse_strip_0_1",
+            kind="shared_axes_0_1",
+            shared_axes=(0, 1),
+            ordered_ids=ordered_ids,
+            loop_nests_by_id=loop_nests_by_id,
+            tiling=tiling,
+            hw_successors=hw_successors,
+        ),
+        _build_fixed_axis_schedule(
+            name="layout_absorb",
+            kind="layout_absorb",
+            shared_axes=(0, 1),
+            ordered_ids=ordered_ids,
+            loop_nests_by_id=loop_nests_by_id,
+            tiling=tiling,
+            hw_successors=hw_successors,
+            allow_layout_absorption=True,
+        ),
+        _build_maximal_chain_schedule(
+            ordered_ids=ordered_ids,
+            loop_nests_by_id=loop_nests_by_id,
+            tiling=tiling,
+            hw_successors=hw_successors,
+        ),
+    ]
+
+    deduped: list[NKIKernelSchedule] = []
+    seen: set[tuple[Any, ...]] = set()
+    for sched in schedules:
+        signature = tuple(
+            (group.node_ids, group.shared_axes, tuple(sorted(group.elided_output_ids)))
+            for group in sched.groups
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(sched)
+    return deduped
+
+
+def _nki_call_str(
+    op: str,
+    dst_var: str,
+    input_tile_vars: list[str],
+    attrs: dict[str, Any],
+    ind: str,
+) -> str:
+    """Return the NKI API call source line(s) for a given hw op.
+
+    Parameters
+    ----------
+    op:
+        NKI op name.
+    dst_var:
+        Python identifier for the destination tile (already allocated).
+    input_tile_vars:
+        Ordered list of Python identifiers for the input tiles.
+    attrs:
+        Node attribute dict.
+    ind:
+        Indentation prefix string.
+    """
+    def _inp(i: int) -> str:
+        return input_tile_vars[i] if i < len(input_tile_vars) else "None"
+
+    if op == "nc_matmul":
+        stat = _inp(0)
+        mov = _inp(1)
+        acc = attrs.get("accumulate", None)
+        acc_str = f", accumulate={acc!r}" if acc is not None else ""
+        return f"{ind}nki.nc_matmul({dst_var}, stationary={stat}, moving={mov}{acc_str})"
+
+    if op == "nc_transpose":
+        return f"{ind}nki.nc_transpose({dst_var}, {_inp(0)})"
+
+    if op in ("dma_copy", "tensor_copy"):
+        return f"{ind}nki.{op}({dst_var}, {_inp(0)})"
+
+    if op == "dma_transpose":
+        axes = attrs.get("axes")
+        axes_str = f", axes={axes!r}" if axes is not None else ""
+        return f"{ind}nki.dma_transpose({dst_var}, {_inp(0)}{axes_str})"
+
+    if op == "activation":
+        act_op = attrs.get("op", "relu")
+        scale = attrs.get("scale", 1.0)
+        bias_idx = attrs.get("bias_input_index")
+        bias_var = f", bias={_inp(bias_idx)}" if bias_idx is not None else ""
+        return (
+            f"{ind}nki.activation({dst_var}, op={act_op!r}, "
+            f"data={_inp(0)}{bias_var}, scale={scale!r})"
+        )
+
+    if op == "activation_reduce":
+        act_op = attrs.get("op", "relu")
+        reduce_op = attrs.get("reduce_op")
+        scale = attrs.get("scale", 1.0)
+        bias_idx = attrs.get("bias_input_index")
+        bias_var = f", bias={_inp(bias_idx)}" if bias_idx is not None else ""
+        return (
+            f"{ind}nki.activation_reduce({dst_var}, op={act_op!r}, "
+            f"data={_inp(0)}, reduce_op={reduce_op!r}{bias_var}, scale={scale!r})"
+        )
+
+    if op == "exponential":
+        max_val = attrs.get("max_value", 0.0)
+        max_idx = attrs.get("max_input_index")
+        max_var = f", max_value={_inp(max_idx)}" if max_idx is not None else f", max_value={max_val!r}"
+        return f"{ind}nki.exponential({dst_var}, {_inp(0)}{max_var})"
+
+    if op == "reciprocal":
+        return f"{ind}nki.reciprocal({dst_var}, {_inp(0)})"
+
+    if op == "tensor_reduce":
+        axis = attrs.get("axis", 1)
+        red_op = attrs.get("op", "add")
+        negate = attrs.get("negate", False)
+        keepdims = attrs.get("keepdims", False)
+        return (
+            f"{ind}nki.tensor_reduce({dst_var}, op={red_op!r}, "
+            f"data={_inp(0)}, axis={axis!r}, negate={negate!r}, keepdims={keepdims!r})"
+        )
+
+    if op == "tensor_partition_reduce":
+        red_op = attrs.get("op", "add")
+        return f"{ind}nki.tensor_partition_reduce({dst_var}, op={red_op!r}, data={_inp(0)})"
+
+    if op == "tensor_scalar":
+        op0 = attrs.get("op0", "add")
+        operand0 = attrs.get("operand0", 0.0)
+        op1 = attrs.get("op1")
+        operand1 = attrs.get("operand1")
+        tail = ""
+        if op1 is not None:
+            tail = f", op1={op1!r}, operand1={operand1!r}"
+        return (
+            f"{ind}nki.tensor_scalar({dst_var}, data={_inp(0)}, "
+            f"op0={op0!r}, operand0={operand0!r}{tail})"
+        )
+
+    if op == "tensor_tensor":
+        tt_op = attrs.get("op", "add")
+        return (
+            f"{ind}nki.tensor_tensor({dst_var}, data1={_inp(0)}, "
+            f"data2={_inp(1)}, op={tt_op!r})"
+        )
+
+    # Fallback: emit a generic call with all input tiles as positional args.
+    args = ", ".join([dst_var] + input_tile_vars)
+    return f"{ind}nki.{op}({args})"
+
+
+def render_nki_loop_nest(loop_nest: NKILoopNest, indent: int = 4) -> str:
+    """Render a single :class:`NKILoopNest` as a Python source block.
+
+    The output is a series of nested ``for`` loops with a slice expression for
+    each input tile, an ``nl.ndarray`` allocation for the output tile, and the
+    NKI API call followed by a write-back to the output buffer.
+
+    Parameters
+    ----------
+    loop_nest:
+        The loop nest to render.
+    indent:
+        Base indentation (number of spaces).
+    """
+    ind0 = " " * indent
+    n0, n1 = loop_nest.strip_dims
+    b0, b1 = loop_nest.block_dims
+    t0, t1 = loop_nest.tile_dims
+    nid = loop_nest.node_id
+    op = loop_nest.op
+
+    n0s = _z3_str(n0)
+    n1s = _z3_str(n1)
+    ext0 = _tile_extent_str(b0, t0)
+    ext1 = _tile_extent_str(b1, t1)
+
+    loop_var0 = f"_i0_{nid}"
+    loop_var1 = f"_i1_{nid}"
+    slice0 = _slice_str(loop_var0, b0, t0)
+    slice1 = _slice_str(loop_var1, b1, t1)
+
+    ind1 = ind0 + "    "
+    ind2 = ind1 + "    "
+
+    lines: list[str] = []
+    lines.append(f"{ind0}# --- node {nid!r} ({op}) ---")
+
+    # Outer loop: strip dim 0
+    lines.append(f"{ind0}for {loop_var0} in range({n0s}):")
+    # Inner loop: strip dim 1
+    lines.append(f"{ind1}for {loop_var1} in range({n1s}):")
+
+    # Slice each input tile.
+    input_tile_vars: list[str] = []
+    for k, inp_id in enumerate(loop_nest.input_ids):
+        tile_var = f"_tile_in{k}_{nid}"
+        buf_name = f"buf_{inp_id}"
+        lines.append(
+            f"{ind2}{tile_var} = {buf_name}[{slice0}, {slice1}]"
+        )
+        input_tile_vars.append(tile_var)
+
+    # Allocate output tile.
+    dst_var = f"_tile_dst_{nid}"
+    lines.append(f"{ind2}{dst_var} = nl.ndarray(({ext0}, {ext1}), dtype=nl.bfloat16)")
+
+    # NKI call.
+    lines.append(_nki_call_str(op, dst_var, input_tile_vars, loop_nest.attrs, ind2))
+
+    # Write output tile back to output buffer.
+    buf_dst = f"buf_{nid}"
+    lines.append(f"{ind2}{buf_dst}[{slice0}, {slice1}] = {dst_var}")
+
+    return "\n".join(lines)
+
+
+def _render_fused_node_body(
+    loop_nest: NKILoopNest,
+    group: NKIFusionGroup,
+    loop_vars: dict[int, str],
+    inline_tiles: dict[str, str],
+    lines: list[str],
+    indent: str,
+) -> None:
+    """Append the NKI source for one node inside a fused group."""
+    local_axes = [axis for axis in (0, 1) if axis not in group.shared_axes]
+
+    def _emit(local_loop_vars: dict[int, str], current_indent: str) -> None:
+        all_loop_vars = dict(loop_vars)
+        all_loop_vars.update(local_loop_vars)
+        slice0 = _slice_str(all_loop_vars[0], loop_nest.block_dims[0], loop_nest.tile_dims[0])
+        slice1 = _slice_str(all_loop_vars[1], loop_nest.block_dims[1], loop_nest.tile_dims[1])
+
+        input_tile_vars: list[str] = []
+        for idx, inp_id in enumerate(loop_nest.input_ids):
+            inline_var = inline_tiles.get(inp_id)
+            if inline_var is not None and not local_axes and tuple(group.shared_axes) == (0, 1):
+                # Reuse a producer tile only when the entire 2D iteration space is
+                # shared by the group; otherwise local per-node loops would break
+                # the producer/consumer tile alignment.
+                input_tile_vars.append(inline_var)
+                continue
+            tile_var = f"_tile_in{idx}_{loop_nest.node_id}"
+            lines.append(f"{current_indent}{tile_var} = buf_{inp_id}[{slice0}, {slice1}]")
+            input_tile_vars.append(tile_var)
+
+        ext0 = _tile_extent_str(loop_nest.block_dims[0], loop_nest.tile_dims[0])
+        ext1 = _tile_extent_str(loop_nest.block_dims[1], loop_nest.tile_dims[1])
+        dst_var = f"_tile_dst_{loop_nest.node_id}"
+        lines.append(
+            f"{current_indent}{dst_var} = nl.ndarray(({ext0}, {ext1}), dtype=nl.bfloat16)"
+        )
+        lines.append(_nki_call_str(loop_nest.op, dst_var, input_tile_vars, loop_nest.attrs, current_indent))
+        if loop_nest.node_id in group.elided_output_ids and not local_axes:
+            inline_tiles[loop_nest.node_id] = dst_var
+        else:
+            lines.append(f"{current_indent}buf_{loop_nest.node_id}[{slice0}, {slice1}] = {dst_var}")
+
+    def _emit_with_loops(axis_idx: int, active_loop_vars: dict[int, str], current_indent: str) -> None:
+        if axis_idx >= len(local_axes):
+            _emit(active_loop_vars, current_indent)
+            return
+        axis = local_axes[axis_idx]
+        loop_var = f"_i{axis}_{loop_nest.node_id}"
+        bound = _z3_str(loop_nest.strip_dims[axis])
+        lines.append(f"{current_indent}for {loop_var} in range({bound}):")
+        next_loop_vars = dict(active_loop_vars)
+        next_loop_vars[axis] = loop_var
+        _emit_with_loops(axis_idx + 1, next_loop_vars, current_indent + "    ")
+
+    _emit_with_loops(0, {}, indent)
+
+
+def render_nki_kernel_schedule(
+    G: nuGraph,
+    loop_nests: list[NKILoopNest],
+    schedule: NKIKernelSchedule,
+    kernel_name: str = "nki_kernel",
+) -> str:
+    """Render one fusion schedule as a Python/NKI kernel string."""
+    loop_nests_by_id = {ln.node_id: ln for ln in loop_nests}
+    input_nodes = [n for n in G.nodes if n.op == "input"]
+    params = ", ".join(n.id for n in input_nodes) or "..."
+    output_node_ids = {
+        n.id for n in G.nodes
+        if not G.successors(n) and n.op != "input"
+    }
+    elided_output_ids = {
+        nid
+        for group in schedule.groups
+        for nid in group.elided_output_ids
+        if nid not in output_node_ids
+    }
+    materialized_node_ids = [
+        n.id for n in G.nodes
+        if n.op != "input" and n.id not in elided_output_ids
+    ]
+
+    lines: list[str] = []
+    lines.append(f"def {kernel_name}({params}):")
+    lines.append(f"    # Schedule kind: {schedule.kind}")
+    lines.append(f"    # Input buffers")
+    for n in input_nodes:
+        shape_str = str(n.attrs.get("shape", "..."))
+        lines.append(f"    buf_{n.id} = {n.id}  # shape={shape_str}")
+    lines.append(f"    # Materialized buffers")
+    for nid in materialized_node_ids:
+        node = next(n for n in G.nodes if n.id == nid)
+        role = "output" if nid in output_node_ids else "intermediate"
+        lines.append(
+            f"    buf_{nid} = nl.ndarray({node.shape}, dtype=nl.bfloat16)  # {role}"
+        )
+    lines.append("")
+    lines.append(f"    # Fusion groups")
+    for group in schedule.groups:
+        shared_axes = tuple(group.shared_axes)
+        axis_desc = ",".join(str(axis) for axis in shared_axes) or "none"
+        lines.append(
+            f"    # --- group kind={group.kind!r} shared_axes={axis_desc} nodes={list(group.node_ids)!r} ---"
+        )
+        shared_loop_vars: dict[int, str] = {}
+        indent = "    "
+        for axis in shared_axes:
+            loop_var = f"_g{axis}_{group.node_ids[0]}"
+            bound = _z3_str(loop_nests_by_id[group.node_ids[0]].strip_dims[axis])
+            lines.append(f"{indent}for {loop_var} in range({bound}):")
+            shared_loop_vars[axis] = loop_var
+            indent += "    "
+        inline_tiles: dict[str, str] = {}
+        for node_id in group.node_ids:
+            lines.append(f"{indent}# node {node_id!r}")
+            _render_fused_node_body(
+                loop_nest=loop_nests_by_id[node_id],
+                group=group,
+                loop_vars=shared_loop_vars,
+                inline_tiles=inline_tiles,
+                lines=lines,
+                indent=indent,
+            )
+        lines.append("")
+    if output_node_ids:
+        outs = ", ".join(f"buf_{nid}" for nid in sorted(output_node_ids))
+        lines.append(f"    return {outs}")
+    return "\n".join(lines)
+
+
+def render_nki_kernel_versions(
+    G: nuGraph,
+    loop_nests: list[NKILoopNest],
+    schedules: list[NKIKernelSchedule],
+    kernel_name: str = "nki_kernel",
+) -> list[tuple[NKIKernelSchedule, str]]:
+    """Render one kernel string per fusion schedule version."""
+    rendered: list[tuple[NKIKernelSchedule, str]] = []
+    for schedule in schedules:
+        suffix = schedule.name.replace("-", "_")
+        rendered.append(
+            (
+                schedule,
+                render_nki_kernel_schedule(
+                    G,
+                    loop_nests,
+                    schedule,
+                    kernel_name=f"{kernel_name}_{suffix}",
+                ),
+            )
+        )
+    return rendered
+
+
+def lower_tiled_graph_to_nki(
+    G: nuGraph,
+    tiling: GraphTiling,
+) -> list[NKILoopNest]:
+    """Lower each hw-op node of the tiled graph into a :class:`NKILoopNest`.
+
+    Nodes are visited in topological order.  ``input`` nodes and any
+    non-hw-op nodes are skipped.
+
+    Parameters
+    ----------
+    G:
+        A lowered (hw-only) nuGraph.
+    tiling:
+        The symbolic tiling for *G*, as returned by :func:`symbolic_tiling`.
+
+    Returns
+    -------
+    list[NKILoopNest]
+        One loop nest per hw-op node, in topological order.
+    """
+    ordered = [node for level in _build_dag_levels(G) for node in level]
+    loop_nests: list[NKILoopNest] = []
+    hw_op_set = frozenset(_HW_OP_NAMES)
+    for node in ordered:
+        if node.op not in hw_op_set:
+            continue
+        if node.id not in tiling.op_tilings:
+            continue
+        tp = tiling.op_tilings[node.id]
+        red_axes = _reduction_axes(node, G)
+        loop_nests.append(
+            NKILoopNest(
+                node_id=node.id,
+                op=node.op,
+                strip_dims=tp.strip_dims,
+                block_dims=tp.block_dims,
+                tile_dims=tp.tile_dims,
+                input_ids=list(node.inputs),
+                attrs=dict(node.attrs),
+                reduction_axes=red_axes,
+            )
+        )
+    return loop_nests
+
+
+def render_nki_kernel(
+    G: nuGraph,
+    loop_nests: list[NKILoopNest],
+    kernel_name: str = "nki_kernel",
+) -> str:
+    """Render the unfused baseline NKI kernel."""
+    schedule = NKIKernelSchedule(
+        name="unfused",
+        kind="unfused",
+        groups=tuple(
+            NKIFusionGroup(node_ids=(ln.node_id,), shared_axes=(), kind="unfused")
+            for ln in loop_nests
+        ),
+    )
+    return render_nki_kernel_schedule(G, loop_nests, schedule, kernel_name=kernel_name)
+
+
+# ---------------------------------------------------------------------------
 # Synthesizer test helpers
 # ---------------------------------------------------------------------------
 
@@ -6184,6 +7240,372 @@ def _test_matmul_1003_multi_input_synthesis() -> None:
         f"matmul node inputs={matmul_node.inputs!r} (upstream='{upstream_input}'), "
         f"{len(hw_variants)} hw variant(s) produced, first variant equivalent"
     )
+
+
+# ---------------------------------------------------------------------------
+# Symbolic tiling tests
+# ---------------------------------------------------------------------------
+
+def _test_symbolic_tiling_matmul() -> None:
+    """Build matmul graph, lower it, apply symbolic_tiling, assert shared strip dims."""
+    G = build_kernel_matmul_graph(4, 8, 16)
+    G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000)
+    assert G_hw is not None, "lower_nu_graph returned None for matmul"
+
+    tiling = symbolic_tiling(G_hw)
+
+    # All hw-op nodes with no reduction axes should reference the same
+    # Python objects for strip_0 and strip_1.
+    non_red_nodes = [
+        n for n in G_hw.nodes
+        if n.op in frozenset(_HW_OP_NAMES) and not _reduction_axes(n, G_hw)
+    ]
+    assert non_red_nodes, "Lowered matmul graph must contain non-reduction hw nodes"
+
+    if len(non_red_nodes) > 1:
+        tp_ref = tiling.op_tilings[non_red_nodes[0].id]
+        for nd in non_red_nodes[1:]:
+            tp = tiling.op_tilings[nd.id]
+            assert tp.strip_dims[0] is tp_ref.strip_dims[0], (
+                f"Non-reduction axis-0 strip dims must be the same object "
+                f"across {non_red_nodes[0].id!r} and {nd.id!r}"
+            )
+            assert tp.strip_dims[1] is tp_ref.strip_dims[1], (
+                f"Non-reduction axis-1 strip dims must be the same object "
+                f"across {non_red_nodes[0].id!r} and {nd.id!r}"
+            )
+
+    solver = z3.Solver()
+    solver.add(*tiling.ctx.facts)
+    result = solver.check()
+    assert result == z3.sat, f"symbolic_tiling matmul: context should be SAT, got {result}"
+    print(" symbolic_tiling: matmul — shared non-reduction strip dims verified, context SAT")
+
+
+def _test_symbolic_tiling_rmsnorm_matmul() -> None:
+    """Lower rmsnorm+matmul graph and verify reduction-axis strip dims are NOT shared."""
+    G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
+    G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000)
+    assert G_hw is not None, "lower_nu_graph returned None for rmsnorm_matmul"
+
+    tiling = symbolic_tiling(G_hw)
+
+    reduction_node_ids = {
+        n.id for n in G_hw.nodes
+        if n.op in frozenset(_HW_OP_NAMES) and _reduction_axes(n, G_hw)
+    }
+    non_reduction_node_ids = {
+        n.id for n in G_hw.nodes
+        if n.op in frozenset(_HW_OP_NAMES) and not _reduction_axes(n, G_hw)
+    }
+
+    # If both reduction and non-reduction nodes are present, their strip dims
+    # along the reduced axis must be distinct Python objects.
+    for rn in G_hw.nodes:
+        if rn.id not in tiling.op_tilings:
+            continue
+        red_axes = _reduction_axes(rn, G_hw)
+        if not red_axes:
+            continue
+        tp_r = tiling.op_tilings[rn.id]
+        for nn_id in non_reduction_node_ids:
+            if nn_id not in tiling.op_tilings:
+                continue
+            tp_n = tiling.op_tilings[nn_id]
+            for axis in red_axes:
+                assert tp_r.strip_dims[axis] is not tp_n.strip_dims[axis], (
+                    f"Reduction-axis {axis} strip dim of {rn.id!r} must NOT be "
+                    f"shared with non-reduction node {nn_id!r}"
+                )
+
+    solver = z3.Solver()
+    solver.add(*tiling.ctx.facts)
+    result = solver.check()
+    assert result == z3.sat, (
+        f"symbolic_tiling rmsnorm_matmul: context should be SAT, got {result}"
+    )
+    print(
+        " symbolic_tiling: rmsnorm_matmul — reduction-axis strip dims not shared, "
+        "context SAT"
+    )
+
+
+def _test_symbolic_tiling_all_kernels() -> None:
+    """Smoke-test symbolic_tiling on all build_kernel_*_graph helpers."""
+    kernel_builders: list[tuple[str, Any]] = [
+        ("matmul_red_div",        build_kernel_matmul_red_div_graph),
+        ("matmul_red_mul",        build_kernel_matmul_red_mul_graph),
+        ("rmsnorm_matmul",        build_kernel_rmsnorm_matmul_graph),
+        ("transpose_matmul",      build_kernel_transpose_matmul_graph),
+        ("matmul_transpose",      build_kernel_matmul_transpose_graph),
+        ("relu_matmul",           build_kernel_relu_matmul_graph),
+        ("silu_matmul",           build_kernel_silu_matmul_graph),
+        ("matmul",                build_kernel_matmul_graph),
+        ("rmsnorm",               build_kernel_rmsnorm_graph),
+        ("relu",                  build_kernel_relu_graph),
+        ("silu",                  build_kernel_silu_graph),
+    ]
+    for kname, builder in kernel_builders:
+        G = builder(4, 8, 16)
+        G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000)
+        if G_hw is None:
+            print(f" symbolic_tiling: {kname} — skipped (lower_nu_graph returned None)")
+            continue
+        tiling = symbolic_tiling(G_hw)
+        solver = z3.Solver()
+        solver.add(*tiling.ctx.facts)
+        result = solver.check()
+        assert result == z3.sat, (
+            f"symbolic_tiling {kname}: context should be SAT, got {result}"
+        )
+        print(
+            f" symbolic_tiling: {kname} — "
+            f"{len(tiling.op_tilings)} op(s) tiled, context SAT"
+        )
+
+
+def _test_symbolic_tiling_tile_dims() -> None:
+    """Verify that the hardware tile-size constants are correctly reflected in
+    TilingParams for nc_matmul, nc_transpose, and generic ops.
+
+    Concrete checks:
+    - Every op has t_0 == 128 (partition dim).
+    - nc_matmul has t_1 == 512 (moving-operand free dim).
+    - nc_transpose has t_1 == 128 (free dim equals partition).
+    - All other ops have t_1 as the _TILE_PSUM_FMAX sentinel (non-concrete).
+    - The solver can assign t_1 ∈ {512, 1024, 2048} for each generic op.
+    """
+    G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
+    G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000)
+    assert G_hw is not None, "lower_nu_graph returned None for rmsnorm_matmul"
+
+    tiling = symbolic_tiling(G_hw)
+
+    for node in G_hw.nodes:
+        if node.op not in frozenset(_HW_OP_NAMES):
+            continue
+        tp = tiling.op_tilings.get(node.id)
+        assert tp is not None, f"Node {node.id!r} missing from op_tilings"
+
+        t0, t1 = tp.tile_dims
+        assert t0 == _TILE_PMAX, (
+            f"{node.id} ({node.op}): expected t_0 == {_TILE_PMAX}, got {t0}"
+        )
+
+        if node.op == "nc_matmul":
+            assert t1 == _TILE_NC_MATMUL_MOVING_FMAX, (
+                f"nc_matmul {node.id}: expected t_1 == {_TILE_NC_MATMUL_MOVING_FMAX}, got {t1}"
+            )
+        elif node.op == "nc_transpose":
+            assert t1 == _TILE_NC_TRANSPOSE_FMAX, (
+                f"nc_transpose {node.id}: expected t_1 == {_TILE_NC_TRANSPOSE_FMAX}, got {t1}"
+            )
+        else:
+            # Generic op: t_1 must be the sentinel (not a concrete int).
+            assert not isinstance(t1, int), (
+                f"{node.id} ({node.op}): expected sentinel t_1, got concrete {t1!r}"
+            )
+
+    # The constraint system for generic ops must allow each valid free-dim
+    # choice.  Check that the tiling context is satisfiable overall.
+    solver = z3.Solver()
+    solver.add(*tiling.ctx.facts)
+    result = solver.check()
+    assert result == z3.sat, (
+        f"symbolic_tiling tile_dims: context should be SAT, got {result}"
+    )
+
+    # Verify that the solver model assigns t_1 ∈ {512, 1024, 2048} for a
+    # generic op (if any exist in the graph).
+    model = solver.model()
+    generic_nodes = [
+        n for n in G_hw.nodes
+        if n.op in frozenset(_HW_OP_NAMES)
+        and n.op not in {"nc_matmul", "nc_transpose"}
+    ]
+    for n in generic_nodes:
+        t1_var = z3.Int(f"t1_{n.id}")
+        val = model.eval(t1_var, model_completion=True)
+        val_int = val.as_long() if isinstance(val, z3.IntNumRef) else None
+        assert val_int in _TILE_FREE_DIM_CHOICES, (
+            f"Generic op {n.id!r} ({n.op}): solver chose t_1={val_int}, "
+            f"expected one of {_TILE_FREE_DIM_CHOICES}"
+        )
+
+    print(
+        " symbolic_tiling: tile_dims — t_0=128 for all ops, "
+        "nc_matmul t_1=512, nc_transpose t_1=128, "
+        "generic ops t_1∈{512,1024,2048} verified"
+    )
+
+
+def _test_nki_lowering_matmul() -> None:
+    """Smoke-test :func:`lower_tiled_graph_to_nki` and :func:`render_nki_kernel`
+    on a matmul graph.
+
+    Checks:
+    * :func:`lower_tiled_graph_to_nki` returns one loop nest per hw-op node.
+    * Every loop nest exposes the expected strip/block/tile fields.
+    * :func:`render_nki_kernel` returns a non-empty string containing
+      ``def nki_kernel`` and a ``for`` loop body.
+    """
+    G = build_kernel_matmul_graph(4, 8, 16)
+    G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000)
+    assert G_hw is not None, "lower_nu_graph returned None for matmul"
+
+    tiling = symbolic_tiling(G_hw)
+    loop_nests = lower_tiled_graph_to_nki(G_hw, tiling)
+
+    hw_nodes = [n for n in G_hw.nodes if n.op in frozenset(_HW_OP_NAMES)]
+    assert len(loop_nests) == len(hw_nodes), (
+        f"Expected {len(hw_nodes)} loop nests, got {len(loop_nests)}"
+    )
+
+    for ln in loop_nests:
+        assert ln.op in frozenset(_HW_OP_NAMES), f"Unexpected op {ln.op!r}"
+        assert ln.strip_dims is not None
+        assert ln.block_dims is not None
+        assert ln.tile_dims is not None
+
+    src = render_nki_kernel(G_hw, loop_nests, kernel_name="nki_kernel")
+    assert "def nki_kernel" in src, "render_nki_kernel: missing function definition"
+    assert "for " in src, "render_nki_kernel: missing for loop"
+    assert "nki." in src, "render_nki_kernel: missing NKI call"
+
+    print(
+        f" nki_lowering: matmul — {len(loop_nests)} loop nest(s) generated, "
+        "kernel rendered OK"
+    )
+
+
+def _test_nki_lowering_all_kernels() -> None:
+    """Smoke-test :func:`lower_tiled_graph_to_nki` on all build_kernel_* helpers."""
+    kernel_builders: list[tuple[str, Callable[[int, int, int], nuGraph]]] = [
+        ("matmul_red_div",   build_kernel_matmul_red_div_graph),
+        ("rmsnorm_matmul",   build_kernel_rmsnorm_matmul_graph),
+        ("transpose_matmul", build_kernel_transpose_matmul_graph),
+        ("relu_matmul",      build_kernel_relu_matmul_graph),
+        ("matmul",           build_kernel_matmul_graph),
+        ("rmsnorm",          build_kernel_rmsnorm_graph),
+        ("relu",             build_kernel_relu_graph),
+        ("softmax",          build_kernel_softmax_graph),
+    ]
+    for kname, builder in kernel_builders:
+        G = builder(4, 8, 16)
+        G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000)
+        if G_hw is None:
+            print(f" nki_lowering: {kname} — skipped (lower_nu_graph returned None)")
+            continue
+        tiling = symbolic_tiling(G_hw)
+        loop_nests = lower_tiled_graph_to_nki(G_hw, tiling)
+        src = render_nki_kernel(G_hw, loop_nests, kernel_name=f"nki_{kname}")
+        assert "def nki_" in src, f"nki_lowering {kname}: missing function definition"
+        print(
+            f" nki_lowering: {kname} — {len(loop_nests)} loop nest(s), "
+            "kernel rendered OK"
+        )
+
+
+def _test_nki_fusion_schedule_versions() -> None:
+    """Verify that bounded fusion schedule versions are emitted and renderable."""
+    G = build_kernel_rmsnorm_matmul_graph(4, 8, 16)
+    G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000)
+    assert G_hw is not None, "lower_nu_graph returned None for rmsnorm_matmul"
+
+    tiling = symbolic_tiling(G_hw)
+    loop_nests = lower_tiled_graph_to_nki(G_hw, tiling)
+    schedules = build_nki_fusion_schedule_versions(G_hw, tiling, loop_nests)
+    schedule_names = {sched.name for sched in schedules}
+
+    expected = {
+        "unfused",
+        "fuse_strip_0",
+        "fuse_strip_1",
+        "fuse_strip_0_1",
+        "maximal_chain",
+    }
+    assert expected.issubset(schedule_names), (
+        f"Expected fusion schedules {sorted(expected)!r}, got {sorted(schedule_names)!r}"
+    )
+
+    rendered = render_nki_kernel_versions(
+        G_hw,
+        loop_nests,
+        schedules,
+        kernel_name="nki_rmsnorm_matmul",
+    )
+    assert len(rendered) == len(schedules), "Expected one rendered kernel per schedule"
+    assert len(rendered) >= 6, f"Expected at least 6 kernel versions, got {len(rendered)}"
+    assert any("shared_axes=0,1" in src for _, src in rendered), (
+        "Expected at least one fully shared 2D fused kernel version"
+    )
+
+    print(
+        f" nki_fusion: rmsnorm_matmul — {len(schedules)} schedule version(s) "
+        "generated and rendered"
+    )
+
+
+def _test_nki_layout_absorption_schedule() -> None:
+    """Verify that layout-aware schedule generation fuses layout-transform chains."""
+    G = build_kernel_transpose_matmul_graph(4, 8, 16)
+    G_hw = lower_nu_graph(G, max_hw_size=2, timeout=5000)
+    assert G_hw is not None, "lower_nu_graph returned None for transpose_matmul"
+
+    tiling = symbolic_tiling(G_hw)
+    loop_nests = lower_tiled_graph_to_nki(G_hw, tiling)
+    loop_nests_by_id = {ln.node_id: ln for ln in loop_nests}
+    schedules = build_nki_fusion_schedule_versions(G_hw, tiling, loop_nests)
+
+    layout_schedule = next((sched for sched in schedules if sched.name == "layout_absorb"), None)
+    assert layout_schedule is not None, "Expected a layout_absorb schedule version"
+    assert any(
+        len(group.node_ids) > 1
+        and any(loop_nests_by_id[nid].op in _LAYOUT_ONLY_HW_OPS for nid in group.node_ids)
+        for group in layout_schedule.groups
+    ), "layout_absorb schedule should contain a fused group with a layout op"
+
+    rendered = render_nki_kernel_versions(
+        G_hw,
+        loop_nests,
+        [layout_schedule],
+        kernel_name="nki_transpose_matmul",
+    )
+    assert rendered and "layout_absorb" in rendered[0][1], (
+        "Expected layout_absorb kernel source to include the schedule marker"
+    )
+
+    print(" nki_fusion: transpose_matmul — layout-aware fused schedule rendered")
+
+
+# ---------------------------------------------------------------------------
+# Test runner
+# ---------------------------------------------------------------------------
+
+def run_all_tests() -> None:
+    """Run all in-file tests for the nuGraph synthesizer and symbolic tiling."""
+    print("\n================ RUNNING SYNTHESIZER TESTS =============")
+    _test_synthesizer_matmul_red_div()
+    _test_synthesizer_rmsnorm_matmul()
+    _test_synthesizer_transpose_matmul()
+    _test_synthesizer_matmul_transpose()
+    _test_synthesizer_relu_matmul()
+    _test_synthesizer_silu_matmul()
+    _test_synthesizer_all_variants_lowered()
+    _test_lower_nu_graph_all_variants()
+    _test_reduce_sum_lowering_no_crash()
+    _test_matmul_1003_multi_input_synthesis()
+    print("\n================ RUNNING SYMBOLIC TILING TESTS =========")
+    _test_symbolic_tiling_matmul()
+    _test_symbolic_tiling_rmsnorm_matmul()
+    _test_symbolic_tiling_all_kernels()
+    _test_symbolic_tiling_tile_dims()
+    print("\n================ RUNNING NKI LOWERING TESTS ============")
+    _test_nki_lowering_matmul()
+    _test_nki_lowering_all_kernels()
+    _test_nki_fusion_schedule_versions()
+    _test_nki_layout_absorption_schedule()
+    print("=============== ALL TESTS PASSED  =====================\n")
 
 
 def kernel_matmul_red_div(x: DummyArray, y: DummyArray, w: DummyArray) -> DummyArray:
@@ -6533,7 +7955,12 @@ def build_kernel_attention_graph(M: int, K: int, N: int) -> nuGraph:
     )
 
 
-def print_graph(G: nuGraph) -> None:
+def print_graph(G: nuGraph, tiling: Optional[GraphTiling] = None) -> None:
+    """Print a human-readable representation of *G*.
+
+    When *tiling* is provided each node is additionally annotated with its
+    symbolic tiling assignment via :func:`print_graph_tiling`.
+    """
     symbolic_shapes: dict[str, tuple[Any, ...]] = {}
     sym_shape_fallback = "None"
     try:
@@ -6549,6 +7976,8 @@ def print_graph(G: nuGraph) -> None:
             f"[{i}] id={n.id:12s} op={n.op:10s} inputs={n.inputs} "
             f"shape={_format_shape(n.shape)} sym_shape={sym_shape_str} attrs={n.attrs}"
         )
+    if tiling is not None:
+        print_graph_tiling(G, tiling)
 
 
 if __name__ == "__main__":
@@ -6620,7 +8049,19 @@ if __name__ == "__main__":
             print(f"  [synthesis failed for {kname}]")
         else:
             print(f"--- {kname} :: {len(hw_variants)} synthesized hw graph(s) ---")
-            for hi, g_hw in enumerate(hw_variants):
+            tiled_variants = tile_nu_graph_variants(hw_variants)
+            for hi, (g_hw, tiling) in enumerate(tiled_variants):
                 print(f"  +-- hw variant {hi} ---")
-                print_graph(g_hw)
+                print_graph(g_hw, tiling)
+                loop_nests = lower_tiled_graph_to_nki(g_hw, tiling)
+                schedules = build_nki_fusion_schedule_versions(g_hw, tiling, loop_nests)
+                print(f"  +-- hw variant {hi} :: {len(schedules)} NKI kernel version(s) ---")
+                for schedule, src in render_nki_kernel_versions(
+                    g_hw,
+                    loop_nests,
+                    schedules,
+                    kernel_name=f"nki_{kname}_v{hi}",
+                ):
+                    print(f"    [schedule={schedule.name}]")
+                    print(src)
         print()
