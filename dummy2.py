@@ -7102,6 +7102,8 @@ def _nisa_call_str(
     if op == "exponential":
         max_val = attrs.get("max_value", 0.0)
         max_idx = attrs.get("max_input_index")
+        # nisa.activation uses `bias` as the subtracted max-value offset for
+        # numerically stable exponentiation (exp(x - max)).
         max_str = (
             f", bias={_inp(max_idx)}" if max_idx is not None else f", bias={max_val!r}"
         )
