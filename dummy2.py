@@ -7113,7 +7113,8 @@ if __name__ == "__main__":
             print(f"  [synthesis failed for {kname}]")
         else:
             print(f"--- {kname} :: {len(hw_variants)} synthesized hw graph(s) ---")
-            for hi, g_hw in enumerate(hw_variants):
+            tiled_variants = tile_nu_graph_variants(hw_variants)
+            for hi, (g_hw, tiling) in enumerate(tiled_variants):
                 print(f"  +-- hw variant {hi} ---")
-                print_graph(g_hw)
+                print_graph(g_hw, tiling)
         print()
